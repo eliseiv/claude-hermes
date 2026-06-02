@@ -1,6 +1,14 @@
-# Deploy workflow — shared server + external Traefik via SSH (docs/07-deployment.md
-# §Процедура деплоя, ADR-017). Separate from ci.yml (lint/test/build gate): this workflow
-# only deploys. The image is BUILT ON THE SERVER (`docker compose up -d --build`), not pulled
+# MANUAL / out-of-band deploy workflow — shared server + external Traefik via SSH
+# (docs/07-deployment.md §Процедура деплоя, ADR-017).
+#
+# IMPORTANT — DEPLOY ORDERING (incident fix): the PRIMARY, automatic deploy on push to main now
+# lives as the `deploy` JOB inside .github/workflows/ci.yml, gated by `needs: [quality, test,
+# build-image]` so it CANNOT start until the whole CI suite is green. This file NO LONGER
+# triggers on push (that previously caused deploy to race / precede CI). It is `workflow_dispatch`
+# ONLY — for manual redeploys (e.g. re-run after DNS/cert settle, or redeploy current main HEAD
+# without a new commit). The deploy steps are identical to the gated job in ci.yml.
+#
+# The image is BUILT ON THE SERVER (`docker compose up -d --build`), not pulled
 # from a registry — there is no immutable registry tag in this scheme (ADR-017).
 #
 # Flow (per ADR-017): SSH to the server -> cd /opt/claude-ios -> git pull ->
@@ -28,10 +36,8 @@
 name: deploy
 
 on:
-  # Deploy on push to main...
-  push:
-    branches: [main]
-  # ...or manually from the Actions tab.
+  # MANUAL ONLY (from the Actions tab). The automatic push:main deploy is the gated `deploy` job
+  # in ci.yml — see the header. Do NOT add a `push` trigger here or deploy will again race CI.
   workflow_dispatch:
 
 # Only one deploy at a time; do NOT cancel an in-flight deploy (avoid half-applied state).

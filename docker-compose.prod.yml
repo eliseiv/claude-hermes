@@ -36,7 +36,12 @@ services:
     networks:
       - default
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      # Use the CONTAINER's own env (POSTGRES_USER/POSTGRES_DB are set in `environment:` above),
+      # NOT compose interpolation: `$$` makes Docker pass a literal `$`, so the shell INSIDE the
+      # container expands the var at runtime. Double-quotes protect values that contain shell
+      # special chars (e.g. a `<placeholder>` with `<>`), which previously broke compose-time
+      # interpolation with `Syntax error: end of file unexpected` -> false unhealthy.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 3s
       retries: 10
