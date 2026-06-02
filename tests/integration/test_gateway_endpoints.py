@@ -152,12 +152,22 @@ async def test_healthz_identical_to_health(client: AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_ready_endpoint_not_regressed(client: AsyncClient) -> None:
-    """/ready still reports dependency status without JWT (PostgreSQL up in tests -> db ok)."""
+    """/ready reports dependency status without JWT, with the documented shape.
+
+    Hermetic by design: /ready (health.py::ready) probes the GLOBAL engine via
+    get_sessionmaker() and redis_ping() — it does NOT use the get_db dependency, so the
+    testcontainer injected via app.dependency_overrides[get_db] is invisible to it. Asserting
+    db == "ok" here would depend on a live external Postgres/Redis reachable from the global
+    DATABASE_URL/REDIS, which is absent in hermetic CI -> flaky 'down'. Real readiness
+    (db/redis == "ok") is verified in tests/e2e_live/run_e2e.py against the docker-compose
+    stack where those are real. Here we only pin the contract: status code and body shape.
+    """
     r = await client.get("/ready")  # no Authorization header
     assert r.status_code in (200, 503)
     body = r.json()
     assert "db" in body and "redis" in body
-    assert body["db"] == "ok"  # the testcontainer Postgres is reachable
+    assert body["db"] in {"ok", "down"}
+    assert body["redis"] in {"ok", "down"}
 
 
 @pytest.mark.asyncio
