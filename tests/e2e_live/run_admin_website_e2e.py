@@ -108,7 +108,7 @@ def main() -> None:  # noqa: C901
         blame=None if r4.status_code in (401, 403) else "code",
     )
 
-    # ============================== WEBSITE-BUILDER LIVE (real Claude) ==============================
+    # ===== WEBSITE-BUILDER LIVE (real Claude) =====
     wuid = new_uid()
     provision_user(c, wuid)
     # Grant credits so the chat run is allowed in mode=credits.

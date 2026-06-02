@@ -31,7 +31,7 @@ async def _set_status(maker: async_sessionmaker[AsyncSession], uid: uuid.UUID, s
         await s.commit()
 
 
-# --------------------------- set → status mapping (valid / invalid / offline) ---------------------------
+# --- set → status mapping (valid / invalid / offline) ---
 @pytest.mark.asyncio
 async def test_set_valid_reports_valid_and_active_model(
     client: AsyncClient,
@@ -177,7 +177,7 @@ async def test_policy_byok_enabled_requires_enabled_and_valid(
     assert "byok_invalid" in eff_bad.json()["reasons"]
 
 
-# --------------------------- runtime 401 in /chat/run(byok) → expired + block ---------------------------
+# --- runtime 401 in /chat/run(byok) → expired + block ---
 @pytest.mark.asyncio
 async def test_runtime_401_marks_expired_and_blocks_byok(
     client: AsyncClient,

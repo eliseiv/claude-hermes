@@ -38,7 +38,8 @@ def load_env() -> dict[str, str]:
 
 
 ENV = load_env()
-PRIV_KEY = open(f"{ROOT}/.secrets/e2e/jwt_private_key.pem", "rb").read()
+with open(f"{ROOT}/.secrets/e2e/jwt_private_key.pem", "rb") as _pk:
+    PRIV_KEY = _pk.read()
 STOREKIT_SECRET = ENV["STOREKIT_TEST_SECRET"]
 BUNDLE_ID = ENV["APPSTORE_BUNDLE_ID"]
 

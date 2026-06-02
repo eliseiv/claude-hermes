@@ -119,9 +119,7 @@ async def test_patch_code_defaults_too_large_422(
     async with db_sessionmaker() as s:
         uid = await seed_user(s)
     big = {"blob": "x" * (9 * 1024)}  # serialized > 8KB
-    r = await client.patch(
-        "/v1/preferences", json={"codeDefaults": big}, headers=auth_headers(uid)
-    )
+    r = await client.patch("/v1/preferences", json={"codeDefaults": big}, headers=auth_headers(uid))
     assert r.status_code == 422
 
 

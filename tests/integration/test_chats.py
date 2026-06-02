@@ -126,7 +126,7 @@ def _user_payload(textval: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": textval}]}
 
 
-# --------------------------- GET /v1/chats: list / sort / search / isolation ---------------------------
+# --- GET /v1/chats: list / sort / search / isolation ---
 @pytest.mark.asyncio
 async def test_list_pinned_first_then_recency(
     client: AsyncClient,
@@ -167,9 +167,7 @@ async def test_list_cursor_pagination_tie_break_by_id(
     async with db_sessionmaker() as s:
         uid = await seed_user(s)
         for i in range(3):
-            sid = await _seed_session(
-                s, user_id=uid, title=f"c{i}", updated_at=same_ts
-            )
+            sid = await _seed_session(s, user_id=uid, title=f"c{i}", updated_at=same_ts)
             ids.append(sid)
         await s.commit()
 
@@ -233,7 +231,7 @@ async def test_list_owner_isolation(
     assert r.json()["items"] == []
 
 
-# --------------------------- GET /v1/chats/{id}: history / isolation / no raw id ---------------------------
+# --- GET /v1/chats/{id}: history / isolation / no raw id ---
 @pytest.mark.asyncio
 async def test_get_history_foreign_chat_404(
     client: AsyncClient,
@@ -283,7 +281,7 @@ async def test_get_history_omits_provider_tool_use_id(
     assert "toolu_SECRET123" not in blob
 
 
-# --------------------------- GET /v1/chats/{id}/steps: domain names, no raw id ---------------------------
+# --- GET /v1/chats/{id}/steps: domain names, no raw id ---
 @pytest.mark.asyncio
 async def test_steps_view_uses_domain_tool_names_no_raw_id(
     client: AsyncClient,
@@ -339,7 +337,7 @@ async def test_steps_view_foreign_chat_404(
     assert r.status_code == 404
 
 
-# --------------------------- PATCH /v1/chats/{id}: rename / pin / validation / isolation ---------------------------
+# --- PATCH /v1/chats/{id}: rename / pin / validation / isolation ---
 @pytest.mark.asyncio
 async def test_patch_rename_and_pin(
     client: AsyncClient,
@@ -386,9 +384,7 @@ async def test_patch_title_too_long_422(
         uid = await seed_user(s)
         sid = await _seed_session(s, user_id=uid)
         await s.commit()
-    r = await client.patch(
-        f"/v1/chats/{sid}", json={"title": "x" * 201}, headers=auth_headers(uid)
-    )
+    r = await client.patch(f"/v1/chats/{sid}", json={"title": "x" * 201}, headers=auth_headers(uid))
     assert r.status_code == 422
 
 
@@ -402,13 +398,11 @@ async def test_patch_foreign_chat_404(
         other = await seed_user(s)
         sid = await _seed_session(s, user_id=other)
         await s.commit()
-    r = await client.patch(
-        f"/v1/chats/{sid}", json={"isPinned": True}, headers=auth_headers(owner)
-    )
+    r = await client.patch(f"/v1/chats/{sid}", json={"isPinned": True}, headers=auth_headers(owner))
     assert r.status_code == 404
 
 
-# --------------------------- DELETE /v1/chats/{id}: cascade / idempotency / isolation ---------------------------
+# --- DELETE /v1/chats/{id}: cascade / idempotency / isolation ---
 @pytest.mark.asyncio
 async def test_delete_cascades_steps_and_tool_calls(
     client: AsyncClient,

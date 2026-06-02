@@ -75,9 +75,7 @@ async def test_patch_name_too_long_422(
 ) -> None:
     async with db_sessionmaker() as s:
         uid = await seed_user(s)
-    r = await client.patch(
-        "/v1/profile", json={"displayName": "x" * 81}, headers=auth_headers(uid)
-    )
+    r = await client.patch("/v1/profile", json={"displayName": "x" * 81}, headers=auth_headers(uid))
     assert r.status_code == 422
 
 

@@ -31,8 +31,10 @@ def _svc(
     valid: bool = True,
     outcome: KeyValidation | None = None,
 ) -> BYOKService:
-    resolved = outcome if outcome is not None else (
-        KeyValidation.valid if valid else KeyValidation.invalid
+    resolved = (
+        outcome
+        if outcome is not None
+        else (KeyValidation.valid if valid else KeyValidation.invalid)
     )
     return BYOKService(session, get_kms_client(), _FakeAnthropic(resolved), AuditService(session))  # type: ignore[arg-type]
 

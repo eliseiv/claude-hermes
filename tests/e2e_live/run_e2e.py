@@ -599,7 +599,8 @@ def main():
         r.status_code == 200
         and dj.get("status") == "blocked"
         and dj.get("blockReason") == "credits_empty",
-        f"db balance={dbal!r}; {r.status_code} status={dj.get('status')} blockReason={dj.get('blockReason')}",
+        f"db balance={dbal!r}; {r.status_code} "
+        f"status={dj.get('status')} blockReason={dj.get('blockReason')}",
         blame=None if (dj.get("blockReason") == "credits_empty") else "code",
     )
 
@@ -882,7 +883,7 @@ def main():
         f"{r.status_code} {r.text[:120]}",
     )
 
-    # ---------------- §4.5 tool_mutation audit (best-effort, if a mutating tool occurred) ----------------
+    # --- §4.5 tool_mutation audit (best-effort, if a mutating tool occurred) ---
     mut_audit = psql("select count(*) from audit_logs where event_type='tool_mutation'")
     rec(
         "E2E audit tool_mutation present (global)",
@@ -915,7 +916,7 @@ def main():
     # ---------------- §4.4 rate_limited (E2E-HTTP-5 / BLK-7) ----------------
     rl_uid = new_uid()
     codes = []
-    for i in range(40):
+    for _i in range(40):
         rr = c.post(
             "/v1/chat/run",
             headers=auth(rl_uid, device_id=f"rl-{rl_uid[:8]}"),

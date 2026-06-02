@@ -17,10 +17,10 @@ import uuid
 
 import pytest
 
+from app.byok.service import _active_model_for
 from app.chat.orchestrator import _system_prompt_for
 from app.chat.repository import derive_title
 from app.chats.cursor import ChatCursor, InvalidCursorError
-from app.byok.service import _active_model_for
 from app.preferences.service import _defaults
 from app.profile.account_id import account_id
 
@@ -94,9 +94,7 @@ def test_cursor_decode_garbage_raises() -> None:
 
 
 # --------------------------- BYOK activeModel (ADR-016) ---------------------------
-@pytest.mark.parametrize(
-    "status", ["invalid", "missing", "validating", "offline", "expired"]
-)
+@pytest.mark.parametrize("status", ["invalid", "missing", "validating", "offline", "expired"])
 def test_active_model_none_unless_valid(status: str) -> None:
     assert _active_model_for(status) is None
 

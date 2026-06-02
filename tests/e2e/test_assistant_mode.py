@@ -122,9 +122,7 @@ async def test_auto_title_from_first_user_message(
     sid = r.json()["sessionId"]
     # the new session got an auto-generated title derived from the first user message.
     async with db_sessionmaker() as s:
-        title = await s.scalar(
-            text("SELECT title FROM chat_sessions WHERE id=:s"), {"s": sid}
-        )
+        title = await s.scalar(text("SELECT title FROM chat_sessions WHERE id=:s"), {"s": sid})
     assert title is not None
     assert title != ""
     # title derives from the message content.
