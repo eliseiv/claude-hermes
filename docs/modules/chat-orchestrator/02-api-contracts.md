@@ -125,3 +125,59 @@ Backend только инициирует tool-call; исполняет клие
 
 ### blockReason enum (повтор для удобства)
 `trial_used | subscription_required | subscription_expired | credits_empty | byok_disabled | byok_invalid | rate_limited | policy_denied` (источник — [ADR-004](../../adr/ADR-004-blocked-http-200.md)).
+
+---
+
+## GET /v1/tools — каталог инструментов ([ADR-019](../../adr/ADR-019-tools-catalog-endpoint.md))
+Машиночитаемый каталог всех поддерживаемых backend tools (13). Источник — `src/app/chat/tools.py` (single source of truth: `_ARGS_BY_TOOL`, `MUTATING_TOOLS`, `SERVER_SIDE_TOOLS`, `anthropic_tool_definitions()`). Эндпоинт **не** параметризуется `assistantMode` — возвращает полный технический реестр backend (фильтрация по режиму — concern tool-loop'а, [Q-012-1](../../99-open-questions.md)).
+
+### Auth
+- **JWT-protected** (как все `/v1/*`, кроме `/v1/preview/*`): `Authorization: Bearer <JWT>` обязателен. Каталог не секретен, но единообразие gateway-auth и снижение анонимного API-surface — обоснование в [ADR-019](../../adr/ADR-019-tools-catalog-endpoint.md). Клиент к этому моменту уже имеет JWT (получен через `/v1/auth/register`, [ADR-018](../../adr/ADR-018-embedded-auth-issuer.md)).
+- Метод `GET` (read-only, кэшируемо). Per-user rate-limit как у прочих read-эндпоинтов.
+
+### Response (200)
+```json
+{
+  "tools": [
+    {
+      "name": "files.read",
+      "description": "Read a file from the user's device.",
+      "mutating": false,
+      "execution": "client",
+      "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+    },
+    {
+      "name": "site.write_file",
+      "description": "Write or overwrite a file in the website project...",
+      "mutating": true,
+      "execution": "server",
+      "inputSchema": { "type": "object", "properties": { "...": {} } }
+    }
+  ]
+}
+```
+- `name` — **доменное** имя с точкой (как в публичном iOS-контракте), НЕ anthropic-underscore (`files_read` — деталь Anthropic-транспорта, BUG-3).
+- `description` — из `descriptions` в `anthropic_tool_definitions()`.
+- `mutating` — `name ∈ MUTATING_TOOLS` (требует audit при исполнении).
+- `execution` — `"server"` если `name ∈ SERVER_SIDE_TOOLS` (`site.*`, исполняет backend, [ADR-011](../../adr/ADR-011-server-side-tools.md)); иначе `"client"` (исполняет iOS).
+- `inputSchema` — JSON Schema args (`_ARGS_BY_TOOL[name].model_json_schema()`).
+- Порядок — детерминированный (по `_ARGS_BY_TOOL`).
+
+### Полный список (13)
+| name | execution | mutating |
+|---|---|---|
+| files.read | client | нет |
+| files.write | client | **да** |
+| files.list | client | нет |
+| files.mkdir | client | **да** |
+| calendar.read | client | нет |
+| calendar.create_events | client | **да** |
+| reminders.read | client | нет |
+| reminders.create | client | **да** |
+| site.write_file | **server** | **да** |
+| site.preview | **server** | нет |
+| site.list | **server** | нет |
+| site.read | **server** | нет |
+| site.delete | **server** | **да** |
+
+**Коды:** `200`; `401` нет/невалидный JWT; `429` rate-limit.

@@ -49,10 +49,9 @@ class BYOKResponse(StrictModel):
     byokEnabled: bool = Field(description="Включён ли режим BYOK для пользователя.")
     keyStatus: Literal["valid", "invalid", "missing", "validating", "offline", "expired"] = Field(
         description=(
-            "Статус ключа (ADR-016): `missing` (не задан), `validating` (проверяется), "
-            "`valid` (рабочий), `invalid` (401), `offline` (сетевая ошибка валидации), "
-            "`expired` (был valid, отозван/истёк). Старые клиенты трактуют новые статусы как "
-            "«не valid»."
+            "Статус ключа: `missing` (не задан), `validating` (проверяется), `valid` "
+            "(рабочий), `invalid` (401), `offline` (сетевая ошибка валидации), `expired` "
+            "(был valid, отозван/истёк)."
         ),
     )
     activeModel: str | None = Field(

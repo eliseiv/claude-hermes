@@ -28,7 +28,7 @@ def _has_sensitive_keys(value: Any) -> bool:
 
 class PreferencesResponse(StrictModel):
     defaultAssistantMode: Literal["chat", "code"] = Field(
-        description="Дефолтный тип ассистента (chat|code). Ортогонален режиму оплаты (ADR-012)."
+        description="Дефолтный тип ассистента (chat|code). Ортогонален режиму оплаты."
     )
     notificationsEnabled: bool = Field(description="Включены ли уведомления (toggle).")
     codeDefaults: dict[str, Any] = Field(

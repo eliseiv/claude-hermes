@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.admin.service import AdminService
 from app.api_gateway.auth import AuthenticatedUser, get_jwt_verifier
 from app.audit.service import AuditService
+from app.auth.issuer import TokenIssuer
+from app.auth.service import AuthService
 from app.byok.kms import get_kms_client
 from app.byok.service import BYOKService
 from app.chat.anthropic_client import get_anthropic_client
@@ -97,6 +99,21 @@ def require_owner(body_user_id: uuid.UUID, current: AuthenticatedUser) -> None:
     """userId in the body must equal sub (403 otherwise) — 05-security.md."""
     if body_user_id != current.user_id:
         raise ForbiddenError("userId does not match authenticated subject")
+
+
+_token_issuer_singleton: TokenIssuer | None = None
+
+
+def get_token_issuer() -> TokenIssuer:
+    """Process-wide TokenIssuer (RS256). Reads the key pair once from the cached settings."""
+    global _token_issuer_singleton
+    if _token_issuer_singleton is None:
+        _token_issuer_singleton = TokenIssuer(get_settings())
+    return _token_issuer_singleton
+
+
+def get_auth_service(session: DbSession) -> AuthService:
+    return AuthService(session, get_token_issuer(), get_settings())
 
 
 def get_audit(session: DbSession) -> AuditService:

@@ -88,6 +88,26 @@ async def enforce_admin_limits(*, ip: str | None) -> bool:
         return True
 
 
+async def enforce_auth_limits(*, ip: str | None) -> bool:
+    """Per-IP rate limit on /v1/auth/* (ADR-018 §6). Auth endpoints are public (no JWT), so the
+    only throttle is per source IP. When the client IP cannot be resolved, a single shared bucket
+    is used so the surface is never fully unlimited. Window is the shared rate_limit_window_seconds.
+    """
+    settings = get_settings()
+    client = get_redis()
+    bucket = ip or "unknown"
+    try:
+        return await _allow(
+            client,
+            f"rl:auth:{bucket}",
+            settings.auth_rate_limit_per_ip,
+            settings.rate_limit_window_seconds,
+        )
+    except redis.RedisError as exc:
+        log_event(logger, logging.WARNING, "rate_limit_redis_unavailable", error=str(exc))
+        return True
+
+
 async def enforce_other_limits(*, user_id: uuid.UUID) -> bool:
     settings = get_settings()
     client = get_redis()

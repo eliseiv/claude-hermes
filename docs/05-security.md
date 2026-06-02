@@ -1,12 +1,17 @@
 # 05 — Security
 
 ## Аутентификация
-- Все endpoint (кроме health/metrics) требуют **JWT Bearer** в заголовке `Authorization`.
-- Алгоритм подписи: **RS256** (асимметрия; публичный ключ в сервисе, приватный — у издателя токенов / auth-сервиса Apple Sign-In flow).
-- Claims (минимум): `sub` = userId (UUID), `exp`, `iat`, `device_id`.
+- Все endpoint (кроме health/metrics, `/v1/auth/*`, `/v1/preview/*`) требуют **JWT Bearer** в заголовке `Authorization`.
+- Алгоритм подписи: **RS256** (асимметрия; публичный ключ в сервисе для verify, приватный — секрет для подписи).
+- Claims (минимум): `sub` = userId (UUID), `exp`, `iat`, `device_id`, `iss`, `aud`; заголовок `kid`.
 - Проверка: подпись, `exp`, `iss`, `aud`. Просроченный/невалидный → `401`.
 - `userId` в теле запроса должен совпадать с `sub` токена; иначе `403` (запрет действий за другого пользователя).
-- Конкретный issuer/JWKS endpoint — [Q-005-1](99-open-questions.md), отложен (решение пользователя). Auth работает на любом валидном RS256-источнике через `JWT_JWKS_URL` (или `JWT_PUBLIC_KEY`) + `JWT_ISSUER`/`JWT_AUDIENCE`. **Реальный issuer (свой auth / Apple Sign-In / Firebase) — обязателен до публичного запуска (must-configure-before-launch, [07-deployment.md prod-checklist](07-deployment.md#prod-readiness-checklist-must-configure-before-launch)).** Не блокирует подготовку инфры/staging.
+- **Issuer — встроенный в backend ([ADR-018](adr/ADR-018-embedded-auth-issuer.md), закрывает [Q-005-1](99-open-questions.md)):** backend САМ выпускает токены (`/v1/auth/*`, модуль [auth](modules/auth/README.md)) и САМ их верифицирует существующим `JwtVerifier` — self-consistent (один config-набор ключей; `iss=https://broadnova.shop`, `aud=claude-ios`). Первичная аутентификация — **device-based** (анонимная: `deviceId` → `userId`); email/пароль и Apple Sign-In — опциональное расширение, не MVP ([Q-018-2](99-open-questions.md)). Verify-only режим внешнего issuer (`JWT_JWKS_URL`) сохраняется как опция для будущего апгрейда. **Приватный ключ подписи должен быть сконфигурирован до публичного запуска (must-configure-before-launch, [07-deployment.md prod-checklist](07-deployment.md#prod-readiness-checklist-must-configure-before-launch));** без него issuer-эндпоинты отдают `503`.
+
+### Выпуск токенов (встроенный issuer, [ADR-018](adr/ADR-018-embedded-auth-issuer.md))
+- `/v1/auth/register|token|refresh|jwks` — **без** пользовательского JWT (точка его получения); защита — per-IP rate-limit (`AUTH_RATE_LIMIT_PER_IP`, дефолт 10/min).
+- Access-token: RS256 JWT, TTL 1ч (`AUTH_ACCESS_TTL_SECONDS`). Refresh-token: opaque, TTL 30д (`AUTH_REFRESH_TTL_SECONDS`), хранится как `sha256`-хэш, single-use rotation + reuse-детект → ревокация цепочки.
+- `register` создаёт `users` явно (eager provisioning); lazy-provisioning ([ADR-007](adr/ADR-007-lazy-user-provisioning.md)) остаётся fallback; `trial_used`/policy не затронуты. Детали — [modules/auth/05-security.md](modules/auth/05-security.md).
 
 ## Модель идентичности и провижининг пользователей
 См. [ADR-007](adr/ADR-007-lazy-user-provisioning.md).
@@ -34,10 +39,19 @@
 - `X-Admin-Token` — в redaction allowlist (никогда не логируется).
 
 ## Секреты и ключи
-- Сервисный Anthropic API key, KMS credentials, JWT signing keys, App Store credentials, **`ADMIN_API_SECRET`** (+ опц. `ADMIN_API_SECRET_PREV`), **`PREVIEW_URL_SECRET`** — только через **env / secret manager**, никогда в коде/репозитории/образе.
-- Все перечисленные секреты **взаимно не пересекаются** (отдельные значения): пользовательские JWT-ключи, KMS, Anthropic, `ADMIN_API_SECRET`, `PREVIEW_URL_SECRET` — независимы; компрометация одного не даёт доступа к домену другого.
+- Сервисный Anthropic API key, KMS credentials, **JWT signing keys (приватный RS256-ключ — секрет; публичный — для verify, не секрет)**, App Store credentials, **`ADMIN_API_SECRET`** (+ опц. `ADMIN_API_SECRET_PREV`), **`PREVIEW_URL_SECRET`** — только через **env / secret manager**, никогда в коде/репозитории/образе.
+- Все перечисленные секреты **взаимно не пересекаются** (отдельные значения): JWT signing key, KMS, Anthropic, `ADMIN_API_SECRET`, `PREVIEW_URL_SECRET` — независимы; компрометация одного не даёт доступа к домену другого.
 - `.env` в `.gitignore`; в prod — секрет-менеджер (конкретный — [Q-002-1](99-open-questions.md), дефолт: облачный KMS + Secrets Manager того же провайдера).
-- Запрет логировать любые секреты, BYOK plaintext, JWT, StoreKit payload целиком.
+- Запрет логировать любые секреты, BYOK plaintext, JWT (выпущенный access-token), refresh-token, приватный ключ подписи, StoreKit payload целиком.
+
+### JWT-ключи: PEM-в-env (встроенный issuer, [ADR-018](adr/ADR-018-embedded-auth-issuer.md))
+Многострочный PEM плохо переносится через `.env`. Поддержаны **оба** механизма, приоритет у файла-пути:
+| Переменная | Назначение | Приоритет |
+|---|---|---|
+| `JWT_PRIVATE_KEY_PATH` / `JWT_PUBLIC_KEY_PATH` | путь к PEM-файлу (prod-рекомендация: mount секрета) | выше |
+| `JWT_PRIVATE_KEY` / `JWT_PUBLIC_KEY` | PEM-строка в env с **`\n`-экранированием** (литералы `\n` → переводы строк при загрузке) | ниже |
+- Резолв: `*_PATH` (read file) > строковое значение (разэкранирование `\\n`→`\n`). `JWT_PUBLIC_KEY` уже существовал; добавляются `JWT_PRIVATE_KEY`, `*_PATH`-варианты, `JWT_KID`.
+- Приватный ключ — **секрет** (redaction, не в образе); публичный — для verify и `GET /v1/auth/jwks`. Issuer и `JwtVerifier` берут пару из одного config (self-consistent). Нет приватного → issuer-эндпоинты `503`, verify-only режим продолжает работать.
 
 ## BYOK — шифрование at-rest (envelope encryption)
 См. [ADR-003](adr/ADR-003-byok-envelope-encryption.md).
@@ -127,3 +141,7 @@
 | XSS / доступ к API-origin из preview-контента | Sandbox CSP, `nosniff`, без cookies/credentials, рекомендация отдельного поддомена ([Q-010-3](99-open-questions.md)). |
 | Path-traversal в превью | Нормализация `path`, запрет `..`/абсолютных, lookup по `(project_id, path)` в БД. |
 | Запись в чужой проект моделью | `userId`/`external_project_id` server-side tools берут из контекста сессии, не из args (ADR-011). |
+| Утечка приватного ключа подписи JWT | Секрет-менеджер/mounted-файл, redaction, не в образе; ротация через `kid`/JWKS (future) (ADR-018). |
+| Массовая анонимная регистрация (Sybil/abuse) | Per-IP rate-limit на `/v1/auth/*`; App Attest/DeviceCheck — post-MVP ([Q-018-1](99-open-questions.md)). |
+| Кража refresh-token | Single-use rotation + reuse-детект → ревокация цепочки устройства; hashed-store, не plaintext (ADR-018). |
+| Подмена чужого `userId` при register | `userId` назначает backend (uuid4/find-by-device); `register`/`token` не принимают `userId` в теле (ADR-018). |

@@ -1,6 +1,6 @@
 # 03 — Data Model
 
-PostgreSQL 16. **17 таблиц** (9 базовых + `projects`/`site_files` website-builder + 6 расширения Figma-gap: `user_preferences`, `workspace_projects`, `workspace_files`, `snippets`, `attachments`, `device_push_tokens`). UUID v4 (`gen_random_uuid()` из `pgcrypto`). Все timestamp — `timestamptz`, UTC. Деньги/кредиты — целочисленные (минимальная неделимая единица), без float.
+PostgreSQL 16. **19 таблиц** (9 базовых + `projects`/`site_files` website-builder + 6 расширения Figma-gap: `user_preferences`, `workspace_projects`, `workspace_files`, `snippets`, `attachments`, `device_push_tokens` + 2 встроенного auth-issuer: `auth_devices`, `auth_refresh_tokens`, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)). UUID v4 (`gen_random_uuid()` из `pgcrypto`). Все timestamp — `timestamptz`, UTC. Деньги/кредиты — целочисленные (минимальная неделимая единица), без float.
 
 > Расширение (2026-06-02, Figma-gap, см. [figma-gap-analysis.md](figma-gap-analysis.md)): новые таблицы и колонки спроектированы как expand-only миграции (`0004`+). Затронутые ADR: [ADR-012](adr/ADR-012-assistant-mode-vs-billing-mode.md) (`assistant_mode`), [ADR-013](adr/ADR-013-workspace-projects-vs-website-builder.md) (workspaces), [ADR-014](adr/ADR-014-multimodal-attachments.md) (attachments), [ADR-015](adr/ADR-015-consumable-token-iap.md) (consumable IAP — без новой таблицы).
 
@@ -28,6 +28,8 @@ erDiagram
     chat_sessions ||--o{ attachments : "may attach"
     workspace_projects ||--o{ chat_sessions : groups
     users ||--o{ device_push_tokens : registers
+    users ||--o{ auth_devices : "identified by"
+    auth_devices ||--o{ auth_refresh_tokens : issues
 
     users { uuid id PK }
     subscriptions { uuid user_id FK }
@@ -46,6 +48,8 @@ erDiagram
     snippets { uuid id PK }
     attachments { uuid id PK }
     device_push_tokens { uuid id PK }
+    auth_devices { text device_id PK }
+    auth_refresh_tokens { uuid id PK }
 ```
 
 ## Enum-типы
@@ -342,6 +346,41 @@ CREATE UNIQUE INDEX ux_push_tokens_user_device ON device_push_tokens (user_id, d
 CREATE INDEX ix_push_tokens_user ON device_push_tokens (user_id);
 ```
 > Регистрация APNs-токена устройства. Один токен на `(user_id, device_id)` (upsert при перерегистрации). **Само отправление push** (APNs-клиент, триггеры) — вне scope этого прохода, вынесено в [TD-011](100-known-tech-debt.md): на старте только хранение настройки (`user_preferences.notifications_enabled`) и регистрация токена. См. [modules/notifications/00-overview.md](modules/notifications/00-overview.md).
+
+---
+
+## Таблицы встроенного auth-issuer (миграция `0005`, expand-only, [ADR-018](adr/ADR-018-embedded-auth-issuer.md))
+
+### 18. auth_devices (модуль `auth`)
+```sql
+CREATE TABLE auth_devices (
+    device_id    TEXT PRIMARY KEY,                                  -- стабильный id устройства (клиент или сгенерированный backend)
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_auth_devices_user ON auth_devices (user_id);
+```
+> Маппинг `deviceId → userId` (device-based identity, find-or-create). `device_id` — PK (одно устройство = одна идентичность). Гонка одновременной регистрации одного `deviceId` разрешается `ON CONFLICT (device_id) DO NOTHING` + повторное чтение. `register` провижинит родительскую `users`-строку явно ([ADR-007](adr/ADR-007-lazy-user-provisioning.md), [ADR-018](adr/ADR-018-embedded-auth-issuer.md)).
+
+### 19. auth_refresh_tokens (модуль `auth`)
+```sql
+CREATE TABLE auth_refresh_tokens (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id   TEXT NOT NULL REFERENCES auth_devices(device_id) ON DELETE CASCADE,
+    token_hash  TEXT NOT NULL,                       -- sha256(opaque refresh token), НЕ plaintext
+    expires_at  TIMESTAMPTZ NOT NULL,
+    used_at     TIMESTAMPTZ,                          -- single-use rotation
+    revoked_at  TIMESTAMPTZ,                          -- ревокация цепочки (reuse-детект/logout)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX ux_refresh_token_hash ON auth_refresh_tokens (token_hash);
+CREATE INDEX ix_refresh_user_device ON auth_refresh_tokens (user_id, device_id);
+```
+> Opaque refresh-token — **только** хэш в БД (никогда plaintext). Валиден ⟺ `used_at IS NULL AND revoked_at IS NULL AND expires_at > now()`. Single-use rotation + reuse-детект → ревокация всей цепочки устройства. Очистка истёкших/использованных строк — [TD-013](100-known-tech-debt.md) (не блокер MVP). Детали — [modules/auth/04-data-model.md](modules/auth/04-data-model.md), [modules/auth/05-security.md](modules/auth/05-security.md).
+
+> `users` для встроенного issuer **не меняется**: идентичность по-прежнему `users.id ≡ sub` (UUID, теперь выдаёт **встроенный** issuer вместо внешнего; [ADR-018](adr/ADR-018-embedded-auth-issuer.md) закрывает [Q-005-1](99-open-questions.md)). Endpoint регистрации **появляется** (`POST /v1/auth/register`) — это не противоречит [ADR-007](adr/ADR-007-lazy-user-provisioning.md): register провижинит `users` явно, lazy-provisioning остаётся fallback.
 
 ## Инварианты
 - `wallets.balance >= 0` — БД CHECK + проверка в Wallet (двойная защита).

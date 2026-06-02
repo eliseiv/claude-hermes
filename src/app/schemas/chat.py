@@ -25,15 +25,15 @@ class ChatRunRequest(StrictModel):
     message: str = Field(min_length=1, description="Текст сообщения пользователя.")
     mode: Literal["credits", "byok"] = Field(
         description=(
-            "Режим тарификации (billing_mode): `credits` (кредиты подписки) или `byok` "
-            "(свой ключ Anthropic). НЕ путать с `assistantMode` (тип ассистента, ADR-012)."
+            "Режим тарификации: `credits` (кредиты подписки) или `byok` (свой ключ Anthropic). "
+            "Не путать с `assistantMode` (тип ассистента)."
         ),
     )
     assistantMode: Literal["chat", "code"] | None = Field(
         default=None,
         description=(
-            "Тип ассистента (ADR-012): `chat` или `code`. Опционально; при отсутствии берётся "
-            "дефолт из настроек пользователя, затем `chat`. Фиксируется при создании сессии. "
+            "Тип ассистента: `chat` или `code`. Опционально; при отсутствии берётся дефолт из "
+            "настроек пользователя, затем `chat`. Фиксируется при создании сессии. "
             "Ортогонален `mode` (оплата)."
         ),
     )
@@ -105,7 +105,7 @@ class ToolCallSchema(StrictModel):
 
 
 _BLOCK_REASON_DOC = (
-    "Причина бизнес-блокировки (присутствует только при `status=blocked`, ADR-004). Значения:\n\n"
+    "Причина бизнес-блокировки (присутствует только при `status=blocked`). Значения:\n\n"
     "- `trial_used` — бесплатная пробная генерация использована, подписки нет. "
     "UI: предложить оформить подписку.\n"
     "- `subscription_required` — действие требует активной подписки, её нет. "

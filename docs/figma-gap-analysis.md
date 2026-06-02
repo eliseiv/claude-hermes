@@ -2,7 +2,7 @@
 
 Дата: 2026-06-02. Источник: 15 экранов Figma (прочитаны main chat, выжимка передана architect). Это **расширение** реализованного backend, не bootstrap.
 
-> **Статус расширения (2026-06-02):** **Спринт 1 реализован** (chats / profile / preferences / расширение BYOK-статусов / `assistantMode`), offline-сьют 681/681 зелёный, production-ready. **Token Purchase реализован (MVP)** — перенесён из Спринта 3. **Спринты 2/3 (остаток: workspaces, snippets, attachments, notifications) — спроектированы, ожидают реализации** (код не написан). Открытые вопросы пользователя: **Q-015-1 — Closed (вариант B: покупка токенов требует активной подписки)**; Q-016-1, Q-016-2 — **ждут ответа пользователя**.
+> **Статус расширения (2026-06-02):** **Спринт 1 реализован** (chats / profile / preferences / расширение BYOK-статусов / `assistantMode`). **Token Purchase реализован (MVP)** — перенесён из Спринта 3. **Встроенный auth-issuer реализован** (`/v1/auth/register|token|refresh`, `GET /v1/auth/jwks`, device-based, миграция `0005`) — **[Q-005-1](99-open-questions.md) закрыт реализацией**. **Каталог инструментов `GET /v1/tools` реализован** ([ADR-019](adr/ADR-019-tools-catalog-endpoint.md)). Offline-сьют **775/775 зелёный**, production-ready. **Спринты 2/3 (остаток: workspaces, snippets, attachments, notifications) — спроектированы, ожидают реализации** (код не написан). Открытые вопросы пользователя: **Q-015-1 — Closed (вариант B: покупка токенов требует активной подписки)**; Q-016-1, Q-016-2 — **ждут ответа пользователя**.
 
 Легенда статуса:
 - ✅ **Покрыто** — контракт/модель уже есть, изменений не требуется.
@@ -50,6 +50,8 @@
 | **Snippets (Code-режим)** | 🔴 | **snippets** (новый), `snippets` | — | **2** |
 | **Мультимодальный ввод (фото/файлы → Claude vision)** | 🔴 | **attachments** (новый), `attachments`; расширение `/chat/run` | ADR-014 | **3** |
 | **Покупка токенов (consumable IAP)** | 🔴 | **token-purchase** (новый), reuse ledger/Wallet | ADR-015 | **3** |
+| **Аутентификация / выпуск JWT (онбординг устройства)** | ✅ **реализовано** | **auth** (новый), `auth_devices`/`auth_refresh_tokens` (миграция `0005`) | ADR-018 (закрывает Q-005-1) | **—** |
+| **Каталог инструментов (`GET /v1/tools`)** | ✅ **реализовано** | chat-orchestrator (`src/app/chat/tools.py`) | ADR-019 | **—** |
 | **Notifications (toggle + push device-token)** | 🟡/🔴 | **notifications** (новый, хранение); отправка push → TD-011 | — | **3** |
 | **Actions (Plan Week, …) + Choose style** | ⏳ Q-016-1 | дефолт: клиентские пресеты (backend не нужен) | — | — |
 | **Web search (toggle)** | ⏳ Q-016-2 | НЕ реализуем до выбора провайдера | — | — |

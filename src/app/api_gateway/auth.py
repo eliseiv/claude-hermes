@@ -35,7 +35,9 @@ class JwtVerifier:
         self._issuer = settings.jwt_issuer or None
         self._audience = settings.jwt_audience or None
         self._jwks_url = settings.jwt_jwks_url or None
-        self._public_key = settings.jwt_public_key or None
+        # Resolve the public key with file-path priority over the \n-escaped string (ADR-018 §7).
+        # verify() logic itself is unchanged; this only broadens how the key is sourced.
+        self._public_key = settings.resolve_public_key() or None
         # PyJWKClient keeps a per-kid cache internally, so token rotation / multiple kids
         # each resolve their own signing key. lifespan bounds how long a JWKS fetch is reused.
         self._jwks_client: PyJWKClient | None = (

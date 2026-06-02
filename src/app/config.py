@@ -47,6 +47,24 @@ class Settings(BaseSettings):
     jwt_public_key: str = Field(default="", alias="JWT_PUBLIC_KEY")
     jwks_cache_ttl_seconds: int = Field(default=300, alias="JWT_JWKS_CACHE_TTL")
 
+    # --- Embedded auth-issuer (ADR-018, modules/auth) ---
+    # Private signing key (RS256). SECRET: never in repo/image/logs (redaction). Provided as a
+    # PEM file path (preferred in prod: mounted secret) or as a PEM string with \n-escaping in
+    # env. Path takes priority. Absent => issuer endpoints return 503 (verify-only still works).
+    jwt_private_key: str = Field(default="", alias="JWT_PRIVATE_KEY")
+    jwt_private_key_path: str = Field(default="", alias="JWT_PRIVATE_KEY_PATH")
+    # Public key file path (alongside the existing PEM-string JWT_PUBLIC_KEY; path takes priority).
+    jwt_public_key_path: str = Field(default="", alias="JWT_PUBLIC_KEY_PATH")
+    # Key id placed in the JWT header / JWKS (key rotation groundwork, not MVP).
+    jwt_kid: str = Field(default="", alias="JWT_KID")
+    # Access-token TTL 1h, refresh-token TTL 30d (ADR-018 §5).
+    auth_access_ttl_seconds: int = Field(default=3600, alias="AUTH_ACCESS_TTL_SECONDS")
+    auth_refresh_ttl_seconds: int = Field(default=2592000, alias="AUTH_REFRESH_TTL_SECONDS")
+    # Per-IP rate limit on /v1/auth/* (anti-abuse mass registration).
+    auth_rate_limit_per_ip: int = Field(default=10, alias="AUTH_RATE_LIMIT_PER_IP")
+    # Toggle GET /v1/auth/jwks (public, non-secret). Default true.
+    auth_jwks_enabled: bool = Field(default=True, alias="AUTH_JWKS_ENABLED")
+
     # --- KMS (envelope encryption, ADR-003, Q-002-1) ---
     kms_key_id: str = Field(default="", alias="KMS_KEY_ID")
     # Local fallback master key (base64, 32 bytes) for non-cloud envs; prod uses real KMS.
@@ -177,6 +195,30 @@ class Settings(BaseSettings):
                 continue
             products[key] = value
         return products
+
+    @staticmethod
+    def _resolve_pem(path_value: str, string_value: str) -> str:
+        """Resolve a PEM key: file path takes priority over the \\n-escaped string (ADR-018 §7).
+
+        When a path is set it is read from disk verbatim (recommended prod: mounted secret, no
+        escaping). Otherwise the env string value has literal ``\\n`` sequences turned into real
+        newlines so a single-line .env value yields a valid multi-line PEM. Empty when neither is
+        configured. Never logs the key material (redaction covers ``*key*``).
+        """
+        if path_value:
+            with open(path_value, encoding="utf-8") as handle:
+                return handle.read()
+        if string_value:
+            return string_value.replace("\\n", "\n")
+        return ""
+
+    def resolve_private_key(self) -> str:
+        """Private RS256 signing key PEM, or '' if the issuer is not configured (=> 503)."""
+        return self._resolve_pem(self.jwt_private_key_path, self.jwt_private_key)
+
+    def resolve_public_key(self) -> str:
+        """Public RS256 verification key PEM (used by JwtVerifier and the JWKS endpoint)."""
+        return self._resolve_pem(self.jwt_public_key_path, self.jwt_public_key)
 
     def trusted_proxy_networks(self) -> tuple[_IpNetwork, ...]:
         """Parse TRUSTED_PROXY_IPS (comma-separated IPs/CIDRs) into networks.

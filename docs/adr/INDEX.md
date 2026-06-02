@@ -21,6 +21,8 @@
 | [ADR-015](ADR-015-consumable-token-iap.md) | Покупка токенов: consumable StoreKit IAP → идемпотентный grant кредитов (отдельно от подписки) | Accepted | 2026-06-02 |
 | [ADR-016](ADR-016-extended-byok-statuses.md) | Расширенные BYOK-статусы (`validating`/`offline`/`expired`) + активная модель в ответе, обратная совместимость | Accepted | 2026-06-02 |
 | [ADR-017](ADR-017-shared-server-traefik-deploy.md) | Deploy-топология: общий сервер за внешним Traefik + GitHub Actions SSH (ревизует TD-005 VPS+Caddy) | Accepted | 2026-06-02 |
+| [ADR-018](ADR-018-embedded-auth-issuer.md) | Встроенный auth-issuer в backend (device-based identity, RS256, refresh-rotation) — закрывает Q-005-1 | Accepted | 2026-06-02 |
+| [ADR-019](ADR-019-tools-catalog-endpoint.md) | Каталог инструментов `GET /v1/tools` (JWT-protected, источник — chat/tools.py) | Accepted | 2026-06-02 |
 
 ## Ревизии
 

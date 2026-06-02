@@ -31,13 +31,10 @@ router = APIRouter(prefix="/v1/tokens", tags=["Tokens"], dependencies=[Depends(b
     response_model=TokenPurchaseResponse,
     summary="Купить пакет токенов",
     description=(
-        "Принимает подписанную StoreKit consumable-транзакцию (JWS), проверяет её подпись и "
-        "начисляет кредиты по серверному маппингу `productId → credits` (`TOKEN_PRODUCTS`). "
-        "Идемпотентно по `transactionId`: повторная отправка той же транзакции не начислит "
-        "повторно (`creditsAdded=0`). Неизвестный `productId` или поддельная транзакция → "
-        "`422`. Поле `transaction` не логируется (redaction). Требует активной подписки "
-        "(Q-015-1=B, ADR-015): без неё — `403 {code: subscription_required}`, начисление не "
-        "выполняется."
+        "Покупка пакета токенов через StoreKit. Начисляет кредиты по `productId`. Повторная "
+        "отправка той же транзакции не начисляет повторно (`creditsAdded=0`). Неизвестный "
+        "`productId` или поддельная транзакция — `422`. Требует активной подписки, иначе "
+        "`403 {code: subscription_required}`. Поле `transaction` не логируется."
     ),
 )
 async def purchase_tokens(
@@ -62,9 +59,8 @@ async def purchase_tokens(
     response_model=TokenProductsResponse,
     summary="Каталог пакетов токенов",
     description=(
-        "Возвращает серверный маппинг пакетов токенов (`productId → credits`) из "
-        "`TOKEN_PRODUCTS`. Цены отображает клиент из StoreKit; backend отдаёт только число "
-        "кредитов на пакет."
+        "Возвращает пакеты токенов: `productId` и число кредитов. Цены отображает клиент из "
+        "StoreKit."
     ),
 )
 async def list_token_products(

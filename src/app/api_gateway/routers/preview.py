@@ -47,7 +47,7 @@ def _not_found() -> Response:
     summary="Превью сгенерированного сайта (signed URL)",
     description=(
         "Отдаёт файл проекта по подписанной ссылке. Без JWT — авторизация в подписи (HMAC+TTL). "
-        "Изоляция владельца, защита от path-traversal, sandbox-заголовки безопасности (ADR-010)."
+        "Изоляция владельца, защита от path-traversal, sandbox-заголовки безопасности."
     ),
     responses={
         200: {"description": "Содержимое файла с content-type из site_files."},

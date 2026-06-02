@@ -85,3 +85,14 @@ class RateLimitedError(AppError):
 class UpstreamError(AppError):
     status_code = 502
     code = "upstream_error"
+
+
+class ServiceUnavailableError(AppError):
+    """A required dependency/feature is not configured (e.g. auth issuer has no private key).
+
+    503 service_unavailable: used by the embedded auth-issuer endpoints when no private signing
+    key is configured (ADR-018 §7); verify-only mode keeps working on the public key.
+    """
+
+    status_code = 503
+    code = "service_unavailable"

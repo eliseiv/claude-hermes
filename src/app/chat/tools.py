@@ -61,8 +61,9 @@ ALL_TOOL_NAMES = frozenset(
 
 # BUG-3: Anthropic Messages API requires tool.name to match ^[a-zA-Z0-9_-]{1,128}$ — a dot is
 # rejected with 400 (→ backend 502). The public iOS contract (TZ §5) uses dotted domain names and
-# must NOT change. We therefore keep a static, bidirectional name map (8 fixed pairs) that is the
-# single source of truth for name correspondence. It is applied ONLY at the Anthropic transport
+# must NOT change. We therefore keep a static, bidirectional name map (13 fixed pairs, incl.
+# server-side site.*) that is the single source of truth for name correspondence. It is applied
+# ONLY at the Anthropic transport
 # boundary: forward (domain→anthropic) when building tools[].name for messages.create, reverse
 # (anthropic→domain) when parsing a tool_use block from Claude. Everywhere else — DB
 # (tool_calls.tool_name), audit, API responses (toolCall.name), arg/result typing — stays domain.
@@ -246,6 +247,33 @@ _ARGS_BY_TOOL: dict[str, type[_StrictModel]] = {
 }
 
 
+# Human-readable tool descriptions — single source of truth for both the Anthropic tool
+# definitions and the GET /v1/tools catalog (ADR-019).
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    TOOL_FILES_READ: "Read a file from the user's device.",
+    TOOL_FILES_WRITE: "Write a file on the user's device.",
+    TOOL_FILES_LIST: "List files/directories on the user's device.",
+    TOOL_FILES_MKDIR: "Create a directory on the user's device.",
+    TOOL_CALENDAR_READ: "Read calendar events in a date range.",
+    TOOL_CALENDAR_CREATE: "Create calendar events.",
+    TOOL_REMINDERS_READ: "Read reminders.",
+    TOOL_REMINDERS_CREATE: "Create reminders.",
+    TOOL_SITE_WRITE_FILE: (
+        "Write or overwrite a file in the website project. Path is relative to the project "
+        "root. Use encoding 'utf8' for text (HTML/CSS/JS) and 'base64' for binary assets "
+        "(images/fonts). The project is the current chat session's project (no project id "
+        "needed)."
+    ),
+    TOOL_SITE_PREVIEW: (
+        "Get a temporary signed preview URL for the current website project. Optional 'entry' "
+        "selects the start file (default index.html)."
+    ),
+    TOOL_SITE_LIST: "List the files of the current website project.",
+    TOOL_SITE_READ: "Read a file from the current website project by relative path.",
+    TOOL_SITE_DELETE: "Delete a file from the current website project by relative path.",
+}
+
+
 def validate_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Validate Claude-produced tool args against the strict schema. Raises ValueError."""
     model = _ARGS_BY_TOOL.get(tool_name)
@@ -254,42 +282,46 @@ def validate_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     return model.model_validate(args).model_dump()
 
 
+def tool_input_schema(tool_name: str) -> dict[str, Any]:
+    """JSON Schema of a tool's args (``model_json_schema()`` of its model), title stripped."""
+    schema = _ARGS_BY_TOOL[tool_name].model_json_schema()
+    schema.pop("title", None)
+    return schema
+
+
+def tool_catalog() -> list[dict[str, Any]]:
+    """Machine-readable catalog of all backend tools for GET /v1/tools (ADR-019).
+
+    Single source of truth: iterates ``_ARGS_BY_TOOL`` (deterministic order). Each entry carries
+    the dotted domain ``name`` (NOT the anthropic-underscore transport name), description,
+    ``mutating`` (name in MUTATING_TOOLS), ``execution`` ("server" for SERVER_SIDE_TOOLS else
+    "client") and ``inputSchema`` (the args JSON Schema).
+    """
+    catalog: list[dict[str, Any]] = []
+    for name in _ARGS_BY_TOOL:
+        catalog.append(
+            {
+                "name": name,
+                "description": TOOL_DESCRIPTIONS[name],
+                "mutating": name in MUTATING_TOOLS,
+                "execution": "server" if name in SERVER_SIDE_TOOLS else "client",
+                "inputSchema": tool_input_schema(name),
+            }
+        )
+    return catalog
+
+
 def anthropic_tool_definitions() -> list[dict[str, Any]]:
     """Tool definitions for the Anthropic messages API (input_schema per tool)."""
     definitions: list[dict[str, Any]] = []
-    descriptions = {
-        TOOL_FILES_READ: "Read a file from the user's device.",
-        TOOL_FILES_WRITE: "Write a file on the user's device.",
-        TOOL_FILES_LIST: "List files/directories on the user's device.",
-        TOOL_FILES_MKDIR: "Create a directory on the user's device.",
-        TOOL_CALENDAR_READ: "Read calendar events in a date range.",
-        TOOL_CALENDAR_CREATE: "Create calendar events.",
-        TOOL_REMINDERS_READ: "Read reminders.",
-        TOOL_REMINDERS_CREATE: "Create reminders.",
-        TOOL_SITE_WRITE_FILE: (
-            "Write or overwrite a file in the website project. Path is relative to the project "
-            "root. Use encoding 'utf8' for text (HTML/CSS/JS) and 'base64' for binary assets "
-            "(images/fonts). The project is the current chat session's project (no project id "
-            "needed)."
-        ),
-        TOOL_SITE_PREVIEW: (
-            "Get a temporary signed preview URL for the current website project. Optional 'entry' "
-            "selects the start file (default index.html)."
-        ),
-        TOOL_SITE_LIST: "List the files of the current website project.",
-        TOOL_SITE_READ: "Read a file from the current website project by relative path.",
-        TOOL_SITE_DELETE: "Delete a file from the current website project by relative path.",
-    }
-    for name, model in _ARGS_BY_TOOL.items():
-        schema = model.model_json_schema()
-        schema.pop("title", None)
+    for name in _ARGS_BY_TOOL:
         definitions.append(
             {
                 # BUG-3 forward map: Anthropic requires underscore names; iOS-facing names stay
                 # dotted. `name` here is the domain name; emit the anthropic-name transport-side.
                 "name": to_anthropic_tool_name(name),
-                "description": descriptions[name],
-                "input_schema": schema,
+                "description": TOOL_DESCRIPTIONS[name],
+                "input_schema": tool_input_schema(name),
             }
         )
     return definitions

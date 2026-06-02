@@ -50,30 +50,36 @@ _BLOCK_REASONS = (
     "policy_denied",
 )
 
-# Expected tag order per R4 (matches openapi_tags declaration order in app.main:
-# Chat, Policy, Wallet, Subscription, BYOK, Health, Admin/Preview routers — ADR-009/010 — then
-# the figma-gap Sprint-1 modules Chats/Profile/Preferences appended in declaration order).
+# Expected tag order per R4 — kept in lock-step with the openapi_tags declaration order in
+# app.main (_OPENAPI_TAGS). Verified against main.py: the embedded auth-issuer (ADR-018) prepends
+# `Auth`, the tools-catalog (ADR-019) inserts `Tools` after `Chat`, and `Health` is appended last
+# by the health router. Tokens (consumable IAP, ADR-015) sits between Subscription and BYOK.
 _TAG_ORDER = [
+    "Auth",
     "Chat",
+    "Tools",
     "Policy",
     "Wallet",
     "Subscription",
-    # Tokens (consumable IAP, ADR-015) is declared right after Subscription in app.main's
-    # openapi_tags — the billing-adjacent grouping. Keep this list in lock-step with that order.
     "Tokens",
     "BYOK",
-    "Health",
     "Admin",
     "Preview",
     "Chats",
     "Profile",
     "Preferences",
+    "Health",
 ]
 
 # Endpoint -> expected single tag (R4 table).
 _ENDPOINT_TAG = {
+    ("/v1/auth/register", "post"): "Auth",
+    ("/v1/auth/token", "post"): "Auth",
+    ("/v1/auth/refresh", "post"): "Auth",
+    ("/v1/auth/jwks", "get"): "Auth",
     ("/v1/chat/run", "post"): "Chat",
     ("/v1/chat/tool-result", "post"): "Chat",
+    ("/v1/tools", "get"): "Tools",
     ("/v1/policy/effective", "get"): "Policy",
     ("/v1/wallet", "get"): "Wallet",
     ("/v1/wallet/consume", "post"): "Wallet",
@@ -88,6 +94,20 @@ _ENDPOINT_TAG = {
 
 # Public service endpoints that must NOT carry a security requirement.
 _PUBLIC_PATHS = {"/health", "/ready", "/metrics"}
+
+# Public auth-issuer endpoints (ADR-018 §2): obtaining the token => no user JWT requirement.
+_AUTH_PUBLIC_PATHS = {
+    ("/v1/auth/register", "post"),
+    ("/v1/auth/token", "post"),
+    ("/v1/auth/refresh", "post"),
+    ("/v1/auth/jwks", "get"),
+}
+
+# Admin endpoints (ADR-009): authorized by the isolated adminToken scheme, NOT bearerAuth.
+_ADMIN_PATHS = {
+    ("/v1/admin/wallet/grant", "post"),
+    ("/v1/admin/wallet/{userId}", "get"),
+}
 
 
 # --------------------------- app/openapi builders ---------------------------
@@ -204,9 +224,27 @@ def test_security_scheme_has_russian_description(openapi_schema: dict[str, Any])
     assert "userId" in desc  # explains the 403 contract
 
 
+def test_admin_token_security_scheme_declared(openapi_schema: dict[str, Any]) -> None:
+    # ADR-009: the isolated admin authorization is reflected as the `adminToken` apiKey-in-header
+    # scheme so Swagger shows the lock for /v1/admin/* — alongside bearerAuth.
+    schemes = openapi_schema["components"]["securitySchemes"]
+    assert "bearerAuth" in schemes
+    assert "adminToken" in schemes
+    admin = schemes["adminToken"]
+    assert admin["type"] == "apiKey"
+    assert admin["in"] == "header"
+    assert admin["name"] == "X-Admin-Token"
+
+
 @pytest.mark.parametrize(
     ("path", "method"),
-    [(p, m) for (p, m), tag in _ENDPOINT_TAG.items() if p.startswith("/v1/")],
+    # bearerAuth covers user /v1/* endpoints EXCEPT the public auth-issuer routes (ADR-018) and the
+    # admin routes (adminToken, ADR-009). /v1/tools (ADR-019) is bearer-protected like other reads.
+    [
+        (p, m)
+        for (p, m), tag in _ENDPOINT_TAG.items()
+        if p.startswith("/v1/") and (p, m) not in _AUTH_PUBLIC_PATHS
+    ],
 )
 def test_v1_endpoints_require_bearer_auth(
     openapi_schema: dict[str, Any], path: str, method: str
@@ -215,6 +253,34 @@ def test_v1_endpoints_require_bearer_auth(
     assert op.get("security") == [
         {"bearerAuth": []}
     ], f"{method.upper()} {path} security != [{{'bearerAuth': []}}]: {op.get('security')}"
+
+
+def test_tools_endpoint_requires_bearer_auth(openapi_schema: dict[str, Any]) -> None:
+    # ADR-019: GET /v1/tools is JWT-protected like all /v1/* reads.
+    op = _operation(openapi_schema, "/v1/tools", "get")
+    assert op.get("security") == [{"bearerAuth": []}], op.get("security")
+
+
+@pytest.mark.parametrize(("path", "method"), sorted(_AUTH_PUBLIC_PATHS))
+def test_auth_endpoints_have_no_security(
+    openapi_schema: dict[str, Any], path: str, method: str
+) -> None:
+    # ADR-018 §2: /v1/auth/* are public (this is where the token is obtained) — no lock icon.
+    op = _operation(openapi_schema, path, method)
+    assert not op.get(
+        "security"
+    ), f"{method.upper()} {path} must be public, got {op.get('security')}"
+
+
+@pytest.mark.parametrize(("path", "method"), sorted(_ADMIN_PATHS))
+def test_admin_endpoints_require_admin_token_only(
+    openapi_schema: dict[str, Any], path: str, method: str
+) -> None:
+    # ADR-009: /v1/admin/* authorize via adminToken ONLY; the user JWT is not an auth factor.
+    op = _operation(openapi_schema, path, method)
+    assert op.get("security") == [
+        {"adminToken": []}
+    ], f"{method.upper()} {path} security != [{{'adminToken': []}}]: {op.get('security')}"
 
 
 @pytest.mark.parametrize("path", sorted(_PUBLIC_PATHS))

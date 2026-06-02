@@ -59,12 +59,12 @@ flowchart TB
     end
 ```
 
-## Модули (17 + наблюдаемость)
-> 9 базовых/реализованных (1–9) + 8 расширения Figma-gap (10–17, спроектированы — backend по спринтам, см. [figma-gap-analysis.md](figma-gap-analysis.md)).
+## Модули (18 + наблюдаемость)
+> 9 базовых/реализованных (1–9) + 8 расширения Figma-gap (10–17, спроектированы — backend по спринтам, см. [figma-gap-analysis.md](figma-gap-analysis.md)) + Auth (18, встроенный issuer — спроектирован, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)).
 
 | # | Модуль | Ответственность | Документация |
 |---|---|---|---|
-| 1 | **API Gateway** | Auth (JWT), ленивый провижининг `users` по `sub` ([ADR-007](adr/ADR-007-lazy-user-provisioning.md)), rate limit, валидация запросов, size-лимиты, correlation id, маршрутизация на use-cases. Размещает admin-роуты (`require_admin`) и публичный preview-роут (signed URL). | [modules/api-gateway](modules/api-gateway/README.md) |
+| 1 | **API Gateway** | Auth (verify JWT), ленивый провижининг `users` по `sub` ([ADR-007](adr/ADR-007-lazy-user-provisioning.md)), rate limit, валидация запросов, size-лимиты, correlation id, маршрутизация на use-cases. Размещает admin-роуты (`require_admin`), публичный preview-роут (signed URL) и auth-роуты выпуска токенов (модуль 18). | [modules/api-gateway](modules/api-gateway/README.md) |
 | 2 | **Chat Orchestrator** | Вызовы Claude (messages API + prompt caching), управление tool-loop state, формирование `status` ответа. | [modules/chat-orchestrator](modules/chat-orchestrator/README.md) |
 | 3 | **Policy Engine** | Чистая функция решения доступа на основе подписки/trial/кредитов/BYOK. Источник истины бизнес-правил. | [modules/policy-engine](modules/policy-engine/README.md) |
 | 4 | **Wallet / Ledger** | Баланс кредитов, атомарные идемпотентные списания, история транзакций. | [modules/wallet-ledger](modules/wallet-ledger/README.md) |
@@ -81,6 +81,7 @@ flowchart TB
 | 15 | **Attachments** | Мультимодальные вложения (vision/document), двухшаговая модель upload→ссылка ([ADR-014](adr/ADR-014-multimodal-attachments.md)). | [modules/attachments](modules/attachments/README.md) |
 | 16 | **Token Purchase** | Consumable StoreKit IAP → идемпотентный grant кредитов ([ADR-015](adr/ADR-015-consumable-token-iap.md)), отдельно от подписки. | [modules/token-purchase](modules/token-purchase/README.md) |
 | 17 | **Notifications** | Toggle (в preferences) + регистрация APNs device-токена. Отправка push → [TD-011](100-known-tech-debt.md). | [modules/notifications](modules/notifications/README.md) |
+| 18 | **Auth** | **Встроенный issuer** ([ADR-018](adr/ADR-018-embedded-auth-issuer.md), закрывает [Q-005-1](99-open-questions.md)): выпуск RS256 JWT (`/v1/auth/register|token|refresh`, `jwks`), device-based identity, refresh-rotation. Верификация — существующим `JwtVerifier` (API Gateway). | [modules/auth](modules/auth/README.md) |
 | — | **Observability** | Cross-cutting: метрики, структурированные логи с correlation id, трейсы, алерты. | этот документ + [05-security.md](05-security.md) |
 
 > **Расширение Figma-gap (2026-06-02):** модули 10–17 добавлены по результатам [figma-gap-analysis.md](figma-gap-analysis.md). Это внутренние пакеты монолита (не сервисы). Биллинг/policy/tool-loop инварианты сохранены. Терминология: `assistant_mode` (тип ассистента chat/code) ≠ `billing_mode` (= `chat_sessions.mode`, оплата credits/byok) — [ADR-012](adr/ADR-012-assistant-mode-vs-billing-mode.md); workspace-проекты ≠ website-builder `projects` — [ADR-013](adr/ADR-013-workspace-projects-vs-website-builder.md).

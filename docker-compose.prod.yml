@@ -96,6 +96,17 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # Embedded auth-issuer (ADR-018 §7) signs/verifies RS256 JWTs and reads its key PEMs
+    # from FILE PATHS (prod-recommended over `\n`-escaped env strings):
+    #   JWT_PRIVATE_KEY_PATH=/app/.secrets/jwt_private.pem  (SECRET — never in the image)
+    #   JWT_PUBLIC_KEY_PATH=/app/.secrets/jwt_public.pem
+    # The keys are NOT baked into the image (.dockerignore excludes .secrets/ + *.pem; that
+    # only affects the BUILD context — this is a RUNTIME bind mount, so it is unaffected).
+    # `./.secrets` resolves against the compose project dir (/opt/claude-ios on the server),
+    # where the operator placed the RSA pair; `.secrets/` is gitignored so `git pull` keeps it.
+    # READ-ONLY (`:ro`) — the container only reads the keys, never writes them.
+    volumes:
+      - ./.secrets:/app/.secrets:ro
     # api binds inside the container to 0.0.0.0:8000 (Dockerfile CMD / Gunicorn).
     # NO `ports:` mapping — we MUST NOT publish 80/443 or any host port (ADR-017 req. 1:
     # conflict with Traefik). Only `expose` the internal 8000 so Traefik can reach it over

@@ -24,8 +24,8 @@ router = APIRouter(tags=["Health"])
     "/healthz",
     summary="Liveness-проверка (алиас /health)",
     description=(
-        "Алиас `GET /health` для healthcheck внешнего Traefik и smoke (ADR-017, GW-8). "
-        'Публичный, без JWT. Всегда `200 {status: "ok"}`.'
+        "Алиас `GET /health` для healthcheck и smoke. Публичный, без JWT. "
+        'Всегда `200 {status: "ok"}`.'
     ),
 )
 async def health() -> dict[str, str]:
