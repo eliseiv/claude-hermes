@@ -7,16 +7,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.deps import CurrentUser, get_preferences_service
 from app.errors import RateLimitedError
 from app.preferences.service import PreferencesService
 from app.schemas.preferences import PreferencesPatchRequest, PreferencesResponse
 
-router = APIRouter(
-    prefix="/v1/preferences", tags=["Preferences"], dependencies=[Depends(bearer_scheme)]
-)
+router = APIRouter(prefix="/v1/preferences", tags=["Preferences"])
 
 
 async def _rate_limit(user_id: uuid.UUID) -> None:

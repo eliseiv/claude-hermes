@@ -7,7 +7,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.byok.service import BYOKService
 from app.deps import CurrentUser, get_byok_service, require_owner
@@ -19,12 +18,14 @@ from app.schemas.byok import (
     BYOKToggleRequest,
 )
 
-router = APIRouter(prefix="/v1/byok", tags=["BYOK"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/byok", tags=["BYOK"])
 
 _SET_REQUEST_EXAMPLES = {
     "set_key": {
         "summary": "Сохранить ключ Anthropic",
-        "description": "Поле `apiKey` — плейсхолдер; реальный ключ не логируется (redaction).",
+        "description": (
+            "Поле `apiKey` в примере — плейсхолдер; передайте реальный ключ. Не логируется."
+        ),
         "value": {
             "userId": "11111111-2222-3333-4444-555555555555",
             "apiKey": "sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx",
@@ -54,9 +55,8 @@ async def _rate_limit(user_id: uuid.UUID) -> None:
     response_model=BYOKResponse,
     summary="Сохранить ключ BYOK",
     description=(
-        "Сохраняет собственный ключ Anthropic пользователя (зашифрованным) и проверяет его "
-        "валидность. Возвращает `keyStatus` (`valid`/`invalid`). Сам ключ никогда не логируется "
-        "(redaction)."
+        "Сохраняет собственный ключ Anthropic (зашифрованным) и проверяет его валидность. "
+        "Возвращает `keyStatus` (`valid`/`invalid`)."
     ),
     responses={200: {"content": {"application/json": {"examples": _SET_RESPONSE_EXAMPLES}}}},
 )

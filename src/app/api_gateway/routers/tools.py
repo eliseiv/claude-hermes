@@ -6,16 +6,15 @@ JWT-protected like all /v1/* (CurrentUser). Returns the full backend tool regist
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.chat.tools import tool_catalog
 from app.deps import CurrentUser
 from app.errors import RateLimitedError
 from app.schemas.tools import ToolsResponse
 
-router = APIRouter(prefix="/v1/tools", tags=["Tools"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/tools", tags=["Tools"])
 
 
 @router.get(

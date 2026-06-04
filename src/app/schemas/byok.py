@@ -17,9 +17,7 @@ class BYOKSetRequest(StrictModel):
     )
     apiKey: str = Field(
         min_length=1,
-        description=(
-            "Ключ Anthropic пользователя. Хранится зашифрованным; не логируется (redaction)."
-        ),
+        description="Ключ Anthropic пользователя. Хранится зашифрованным. Не логируется.",
     )
 
     @field_validator("apiKey")

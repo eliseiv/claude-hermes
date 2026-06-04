@@ -7,14 +7,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.deps import CurrentUser, get_profile_service
 from app.errors import RateLimitedError
 from app.profile.service import ProfileService, ProfileView
 from app.schemas.profile import ProfileResponse, ProfileUpdateRequest
 
-router = APIRouter(prefix="/v1/profile", tags=["Profile"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/profile", tags=["Profile"])
 
 
 async def _rate_limit(user_id: uuid.UUID) -> None:

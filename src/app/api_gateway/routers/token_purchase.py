@@ -10,7 +10,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.config import get_settings
 from app.deps import CurrentUser, get_token_purchase_service, require_owner
@@ -23,7 +22,7 @@ from app.schemas.token_purchase import (
 )
 from app.token_purchase.service import TokenPurchaseService
 
-router = APIRouter(prefix="/v1/tokens", tags=["Tokens"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/tokens", tags=["Tokens"])
 
 
 @router.post(
@@ -31,10 +30,10 @@ router = APIRouter(prefix="/v1/tokens", tags=["Tokens"], dependencies=[Depends(b
     response_model=TokenPurchaseResponse,
     summary="Купить пакет токенов",
     description=(
-        "Покупка пакета токенов через StoreKit. Начисляет кредиты по `productId`. Повторная "
-        "отправка той же транзакции не начисляет повторно (`creditsAdded=0`). Неизвестный "
-        "`productId` или поддельная транзакция — `422`. Требует активной подписки, иначе "
-        "`403 {code: subscription_required}`. Поле `transaction` не логируется."
+        "Пришлите подписанную StoreKit-транзакцию в поле `transaction`. Начисляет кредиты по "
+        "`productId`. Повторная отправка той же транзакции не начисляет дважды "
+        "(`creditsAdded=0`). Неизвестный `productId` или поддельная транзакция — `422`. "
+        "Требует активной подписки, иначе `403 {code: subscription_required}`."
     ),
 )
 async def purchase_tokens(

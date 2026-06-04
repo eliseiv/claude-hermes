@@ -16,10 +16,7 @@ class TokenPurchaseRequest(StrictModel):
     # Signed StoreKit consumable JWS transaction (compact JWS). Never logged (redaction).
     transaction: str = Field(
         min_length=1,
-        description=(
-            "Подписанная StoreKit consumable-транзакция (compact JWS). Не логируется "
-            "(redaction)."
-        ),
+        description="Подписанная StoreKit-транзакция покупки.",
     )
 
 

@@ -26,11 +26,7 @@ AttachmentMediaType = Literal[
 
 
 class AttachmentIn(StrictModel):
-    """Inline base64 attachment (ADR-020). Only base64 — URL sources are forbidden (anti-SSRF).
-
-    Class/mediaType consistency and magic-byte/size/page guards are enforced in the orchestrator
-    (chat/attachments.py) after parsing, since they need the decoded content and config limits.
-    """
+    """Вложение в base64. Только inline base64 — ссылки (URL) не принимаются."""
 
     type: Literal["image", "document", "text"] = Field(
         description="Класс вложения: `image` (фото), `document` (PDF) или `text` (текстовый файл)."
@@ -59,12 +55,9 @@ class ChatRunRequest(StrictModel):
     projectId: str | None = Field(
         default=None,
         description=(
-            "Идентификатор проекта website-builder (опционально, ADR-022). Основной поток — "
-            "«чистый чат» без проекта: при отсутствии `projectId` сессия создаётся с "
-            "`project_id = NULL` и server-side `site.*` tools НЕ предлагаются модели. Если задан "
-            "— website-builder доступен (в набор tools входят `site.*`). Фиксируется при создании "
-            "сессии (как `mode`/`assistantMode`); при resume берётся из сессии, поле запроса "
-            "игнорируется. Если присутствует — должен быть непустой строкой."
+            "Идентификатор проекта. Опционален: без него создаётся чат без проекта. Если "
+            "указан — должен быть непустой строкой. Фиксируется при создании сессии; при "
+            "продолжении берётся из сессии, поле запроса игнорируется."
         ),
     )
     sessionId: uuid.UUID | None = Field(
@@ -89,9 +82,9 @@ class ChatRunRequest(StrictModel):
     attachments: list[AttachmentIn] | None = Field(
         default=None,
         description=(
-            "Inline base64-вложения (фото/PDF/текст), отправляемые модели в первом сообщении "
-            "(ADR-020). Опционально. Лимиты числа/размера и проверка MIME по содержимому — на "
-            "сервере. Только base64, URL запрещены. В `/v1/chat/tool-result` не принимаются."
+            "Вложения в base64 (фото/PDF/текст), отправляемые модели только в первом "
+            "сообщении. Опционально. Только base64, URL запрещены. В `/v1/chat/tool-result` не "
+            "принимаются."
         ),
     )
     context: dict[str, Any] | None = Field(

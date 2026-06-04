@@ -64,29 +64,19 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
 
 
 _API_DESCRIPTION = """\
-Backend-оркестратор Claude для iOS-приложения: принимает запросы от приложения, проверяет
-права доступа, ходит в Anthropic Messages API и ведёт биллинг.
+Backend-оркестратор Claude для iOS-приложения.
 
-### Как авторизоваться
-Все `/v1/*` endpoint требуют заголовок `Authorization: Bearer <JWT>` (RS256). В claim `sub`
-лежит `userId`; поле `userId` в теле запроса обязано совпадать с `sub`, иначе вернётся `403`.
-Нажмите **Authorize** и введите `Bearer <JWT>` один раз — он применится ко всем вызовам.
-Служебные endpoint (`/health`, `/ready`, `/metrics`) JWT не требуют.
+### Авторизация
+Все `/v1/*` требуют заголовок `Authorization: Bearer <accessToken>` — access-токен в формате
+JWT (RS256). В claim `sub` лежит
+`userId`; поле `userId` в теле запроса обязано совпадать с `sub`, иначе `403`. Получите токен
+через `POST /v1/auth/register`, нажмите **Authorize** и вставьте `accessToken` — он применится
+ко всем вызовам. Endpoint `/health`, `/ready`, `/metrics` токен не требуют.
 
-### Правила доступа (бизнес)
-Сначала одна бесплатная пробная генерация (trial). Дальше — либо активная подписка с
-кредитами (1 кредит = 1 сообщение), либо собственный ключ Anthropic (BYOK). Эффективные
-права для UI отдаёт `GET /v1/policy/effective`.
-
-### Важно: блокировки приходят с HTTP 200
-Бизнес-блокировка генерации — это **успешный** ответ `200 OK` с телом
-`{status: "blocked", blockReason}`, а **не** ошибка 4xx. Технические ошибки —
-4xx/5xx со стандартным `{error: {code, message, requestId}}`. Перечень значений `blockReason`
-и их трактовку для UI см. в описании поля `blockReason` (endpoint Chat).
-
-### Как получить токен
-Вызовите `POST /v1/auth/register` (без авторизации), скопируйте `accessToken`, нажмите
-**Authorize** и вставьте его — он применится ко всем защищённым `/v1/*`.
+### Блокировки приходят с HTTP 200
+Бизнес-блокировка генерации — это успешный ответ `200` с телом
+`{status: "blocked", blockReason}`, а не ошибка. Технические ошибки — `4xx`/`5xx` с телом
+`{error: {code, message, requestId}}`. Значения `blockReason` см. в описании одноимённого поля.
 """
 
 _OPENAPI_TAGS = [

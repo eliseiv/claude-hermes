@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.deps import CurrentUser, DbSession
 from app.policy.loader import effective
 from app.schemas.policy import EffectivePolicyResponse
 
-router = APIRouter(prefix="/v1/policy", tags=["Policy"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/policy", tags=["Policy"])
 
 
 @router.get(

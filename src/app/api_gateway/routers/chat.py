@@ -6,7 +6,6 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, Header, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_chat_limits
 from app.chat.orchestrator import ChatOrchestrator, ChatRunOut
 from app.deps import (
@@ -24,7 +23,7 @@ from app.schemas.chat import (
     ToolCallSchema,
 )
 
-router = APIRouter(prefix="/v1/chat", tags=["Chat"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/chat", tags=["Chat"])
 
 # --- Согласованные id для end-to-end tool-loop примеров (run -> tool_call -> tool-result) ---
 _SESSION_ID = "3f1c2a7e-9b54-4d2e-8a11-6c0d5e7f1a23"
@@ -80,11 +79,8 @@ _RUN_RESPONSE_EXAMPLES = {
 
 _RUN_REQUEST_EXAMPLES = {
     "clean_chat": {
-        "summary": "Чистый чат без projectId (ADR-022)",
-        "description": (
-            "Основной поток — чат-агрегатор без website-builder. `projectId` не указан → сессия "
-            "создаётся без проекта, server-side `site.*` модели не предлагаются."
-        ),
+        "summary": "Чистый чат без projectId",
+        "description": "Без `projectId` сессия создаётся без проекта.",
         "value": {
             "userId": "11111111-2222-3333-4444-555555555555",
             "message": "Объясни, как работает async/await в Python.",
@@ -189,15 +185,11 @@ def _to_response(out: ChatRunOut) -> ChatResponse:
     response_model=ChatResponse,
     summary="Запустить шаг диалога",
     description=(
-        "Принимает сообщение пользователя, проверяет права доступа и обращается к модели. "
-        "Возвращает одно из трёх состояний `ChatResponse`: `assistant_message` (готовый ответ), "
-        "`tool_call` (нужно выполнить инструмент на устройстве и прислать результат в "
-        "`/v1/chat/tool-result`) или `blocked`.\n\n"
-        "**Блокировки по бизнес-правилам возвращаются с HTTP 200 и полем `blockReason` "
-        "(машиночитаемо).** Технические ошибки — 4xx/5xx. Заголовок `X-Device-Id` опционален — "
-        "override `device_id` для per-device rate limit; при отсутствии заголовка `device_id` "
-        "берётся из JWT-claim, а если пусто и там — per-device лимит просто не применяется "
-        "(per-user и per-IP остаются)."
+        "Принимает сообщение пользователя и возвращает одно из трёх состояний: "
+        "`assistant_message` (готовый ответ), `tool_call` (выполните инструмент на устройстве "
+        "и пришлите результат в `/v1/chat/tool-result`) или `blocked`. "
+        "Блокировки приходят с HTTP 200 и полем `blockReason`; технические ошибки — `4xx`/`5xx`. "
+        "Необязательный заголовок `X-Device-Id` задаёт устройство для rate limit."
     ),
     responses={
         200: {"content": {"application/json": {"examples": _RUN_RESPONSE_EXAMPLES}}},
@@ -235,12 +227,10 @@ async def chat_run(
     response_model=ChatResponse,
     summary="Передать результат инструмента",
     description=(
-        "Продолжение tool-loop: клиент исполнил инструмент из предыдущего `tool_call` и "
-        "присылает его результат (поле `result`) либо ошибку исполнения (поле `error`) — ровно "
-        "одно из двух. `toolCallId` должен совпадать с `toolCall.id` из `/v1/chat/run`. Обычно "
-        "возвращает `assistant_message`, но может снова запросить `tool_call`.\n\n"
-        "**Блокировки по бизнес-правилам возвращаются с HTTP 200 и полем `blockReason`.** "
-        "Технические ошибки — 4xx/5xx."
+        "Пришлите результат инструмента из предыдущего `tool_call`: ровно одно из полей "
+        "`result` или `error`. `toolCallId` обязан совпадать с `toolCall.id` из `/v1/chat/run`. "
+        "Обычно возвращает `assistant_message`, может снова запросить `tool_call`. "
+        "Блокировки приходят с HTTP 200 и полем `blockReason`; технические ошибки — `4xx`/`5xx`."
     ),
     responses={
         200: {"content": {"application/json": {"examples": _TOOL_RESULT_RESPONSE_EXAMPLES}}},

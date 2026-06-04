@@ -7,7 +7,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.chats.service import ChatsService
 from app.deps import CurrentUser, get_chats_service
@@ -24,7 +23,7 @@ from app.schemas.chats import (
     StepsViewStepSchema,
 )
 
-router = APIRouter(prefix="/v1/chats", tags=["Chats"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/chats", tags=["Chats"])
 
 _LIST_LIMIT_DEFAULT = 30
 _LIST_LIMIT_MAX = 100
@@ -111,8 +110,8 @@ async def get_chat(
     response_model=StepsViewResponse,
     summary="Steps-view чата",
     description=(
-        "Агрегированные шаги message-шага (tool-calls/reasoning) для UI («N steps»). По "
-        "умолчанию — последний message-шаг. Только доменные имена инструментов, без raw id."
+        "Агрегированные шаги message-шага (tool-calls/reasoning) для UI. По умолчанию — "
+        "последний message-шаг."
     ),
 )
 async def get_chat_steps(

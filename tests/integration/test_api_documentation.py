@@ -296,6 +296,93 @@ def test_no_global_security_applied(openapi_schema: dict[str, Any]) -> None:
 
 
 # ============================================================================
+# 2b. No duplicate auth PARAMETERS (regression guard for the dedup fix).
+#     Auth headers (Authorization / X-Admin-Token) must surface ONLY as
+#     securitySchemes, NEVER as operation `parameters`. Before the fix the
+#     routers declared Header()/Depends() that emitted a duplicate header param
+#     in Swagger alongside the Authorize lock. SecurityBase schemes
+#     (bearer_scheme / admin_scheme) replaced that, so the schema must now be
+#     free of those header parameters on EVERY operation. (src/app/deps.py,
+#     src/app/api_gateway/auth.py, src/app/api_gateway/openapi_security.py.)
+# ============================================================================
+# Header param names (lower-cased) that are auth and must NOT appear as parameters —
+# they belong exclusively to components.securitySchemes (bearerAuth / adminToken).
+_FORBIDDEN_AUTH_PARAM_NAMES = {"authorization", "x-admin-token"}
+
+
+def _all_operations(schema: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    """Every (path, method, operation) in the document for exhaustive scanning."""
+    ops: list[tuple[str, str, dict[str, Any]]] = []
+    for path, item in schema.get("paths", {}).items():
+        for method, operation in item.items():
+            if method in {"get", "post", "put", "patch", "delete", "options", "head"}:
+                ops.append((path, method, operation))
+    return ops
+
+
+def _header_param_names(operation: dict[str, Any]) -> list[str]:
+    """Lower-cased names of all `in: header` parameters declared on the operation."""
+    return [
+        str(p.get("name", "")).lower()
+        for p in operation.get("parameters", [])
+        if p.get("in") == "header"
+    ]
+
+
+def test_no_operation_declares_auth_header_as_parameter(openapi_schema: dict[str, Any]) -> None:
+    # MAIN regression guard: no operation anywhere may carry `authorization` or `X-Admin-Token`
+    # as a parameter (case-insensitive). They are securitySchemes only — a parameter here means
+    # the duplicate-auth-field bug regressed.
+    offenders: list[str] = []
+    for path, method, operation in _all_operations(openapi_schema):
+        dup = set(_header_param_names(operation)) & _FORBIDDEN_AUTH_PARAM_NAMES
+        if dup:
+            offenders.append(f"{method.upper()} {path}: {sorted(dup)}")
+    assert not offenders, "auth headers leaked into operation parameters (dup-auth regressed): " + (
+        "; ".join(offenders)
+    )
+
+
+def test_authorization_not_a_parameter_on_protected_endpoints(
+    openapi_schema: dict[str, Any],
+) -> None:
+    # Spot-check the JWT-protected operations specifically: the lock comes from `security`,
+    # never from an `authorization` header parameter.
+    for path, method in _ENDPOINT_TAG:
+        if not path.startswith("/v1/") or (path, method) in _AUTH_PUBLIC_PATHS:
+            continue
+        op = _operation(openapi_schema, path, method)
+        assert "authorization" not in _header_param_names(
+            op
+        ), f"{method.upper()} {path} must not declare an `authorization` parameter"
+
+
+def test_admin_token_not_a_parameter_on_admin_endpoints(openapi_schema: dict[str, Any]) -> None:
+    # /v1/admin/* authorize via the adminToken securityScheme; X-Admin-Token must NOT be a param.
+    for path, method in _ADMIN_PATHS:
+        op = _operation(openapi_schema, path, method)
+        assert "x-admin-token" not in _header_param_names(
+            op
+        ), f"{method.upper()} {path} must not declare an `X-Admin-Token` parameter"
+
+
+# ============================================================================
+# 2c. Legitimate header params survive the dedup (must NOT be over-pruned).
+#     X-Device-Id is a real Header() on the chat endpoints (rate-limit device
+#     scoping); removing auth params must leave it intact. (routers/chat.py.)
+# ============================================================================
+@pytest.mark.parametrize("path", ["/v1/chat/run", "/v1/chat/tool-result"])
+def test_x_device_id_header_param_preserved_on_chat(
+    openapi_schema: dict[str, Any], path: str
+) -> None:
+    op = _operation(openapi_schema, path, "post")
+    names = _header_param_names(op)
+    assert "x-device-id" in names, f"{path} lost its legitimate X-Device-Id header param: {names}"
+    # And it is genuinely a parameter, not an auth one.
+    assert "x-device-id" not in _FORBIDDEN_AUTH_PARAM_NAMES
+
+
+# ============================================================================
 # 3. Real JWT verification regression (R2) — CRITICAL
 #    auto_error=False on HTTPBearer must NOT short-circuit get_current_user.
 # ============================================================================

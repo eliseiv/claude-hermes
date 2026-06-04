@@ -14,7 +14,6 @@ from fastapi import APIRouter, Body, Depends, Path, Request
 
 from app.admin.service import AdminService
 from app.api_gateway.auth import require_admin
-from app.api_gateway.openapi_security import admin_scheme
 from app.api_gateway.rate_limit import enforce_admin_limits
 from app.config import get_settings
 from app.deps import client_ip, get_admin_service
@@ -27,12 +26,14 @@ from app.schemas.admin import (
 )
 
 # require_admin guards every route here; the user JWT is not an authorization factor (ADR-009).
-# admin_scheme (auto_error=False) only reflects the adminToken security scheme into OpenAPI so
-# the Swagger UI lock/Authorize works — it does NOT perform the check (that stays in require_admin).
+# require_admin depends on admin_scheme (APIKeyHeader, auto_error=False), a SecurityBase: that
+# transitively reflects the adminToken security scheme into OpenAPI (Swagger lock/Authorize)
+# WITHOUT emitting a duplicate X-Admin-Token header parameter. The real check stays in
+# require_admin (auto_error=False keeps the scheme from raising before the constant-time compare).
 router = APIRouter(
     prefix="/v1/admin",
     tags=["Admin"],
-    dependencies=[Depends(require_admin), Depends(admin_scheme)],
+    dependencies=[Depends(require_admin)],
 )
 
 

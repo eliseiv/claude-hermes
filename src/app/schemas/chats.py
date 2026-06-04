@@ -23,7 +23,7 @@ class ChatListItemSchema(StrictModel):
     isPinned: bool = Field(description="Закреплён ли чат.")
     workspaceProjectId: uuid.UUID | None = Field(
         default=None,
-        description="Привязка к рабочему пространству (Спринт 2; сейчас всегда null).",
+        description="Привязка к рабочему пространству (или null).",
     )
     updatedAt: datetime.datetime = Field(description="Время последнего обновления (ISO8601).")
 
@@ -37,9 +37,9 @@ class ChatListResponse(StrictModel):
 
 class ChatStepSchema(StrictModel):
     id: uuid.UUID = Field(description="Идентификатор шага.")
-    messageStepId: uuid.UUID = Field(description="Идентификатор message-шага (биллинг-ключ).")
+    messageStepId: uuid.UUID = Field(description="Идентификатор message-шага.")
     role: Literal["user", "assistant", "tool"] = Field(description="Роль шага.")
-    payload: dict[str, Any] = Field(description="Content-блоки шага (без raw provider id).")
+    payload: dict[str, Any] = Field(description="Content-блоки шага.")
     usage: dict[str, Any] | None = Field(
         default=None, description="Потребление токенов (для assistant-шагов)."
     )
@@ -50,7 +50,7 @@ class ChatHistoryResponse(StrictModel):
     id: uuid.UUID = Field(description="Идентификатор чата.")
     title: str | None = Field(default=None, description="Заголовок чата.")
     assistantMode: Literal["chat", "code"] = Field(description="Тип ассистента (chat|code).")
-    mode: Literal["credits", "byok"] = Field(description="Режим оплаты сессии (billing_mode).")
+    mode: Literal["credits", "byok"] = Field(description="Режим оплаты сессии.")
     steps: list[ChatStepSchema] = Field(description="Упорядоченные шаги чата.")
 
 

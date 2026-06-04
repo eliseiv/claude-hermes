@@ -4,10 +4,13 @@ Declares two security schemes so Swagger UI shows the lock icon and the Authoriz
 - ``bearerAuth`` (HTTP Bearer JWT) — user `/v1/*` endpoints.
 - ``adminToken`` (apiKey header ``X-Admin-Token``) — `/v1/admin/*` endpoints.
 
-This is documentation only: actual auth verification stays in `app.api_gateway.auth` /
-`app.deps.get_current_user` (JWT) and `require_admin` (admin). ``auto_error=False`` ensures
-these dependencies never raise and never short-circuit the real check — they only contribute
-the security scheme to OpenAPI.
+Both schemes are ``SecurityBase`` instances and are consumed as dependencies *inside*
+`app.deps.get_current_user` (reads the Bearer credentials) and `app.api_gateway.auth.require_admin`
+(reads the ``X-Admin-Token`` value). Being SecurityBase, they contribute the security scheme to
+each protected operation's OpenAPI ``security`` (lock icon / Authorize) WITHOUT adding a duplicate
+``authorization`` / ``X-Admin-Token`` *parameter* to the operation. Actual auth verification still
+lives in those dependencies: ``auto_error=False`` keeps the schemes from raising on a
+missing/malformed header, so the real 401/constant-time checks decide the outcome unchanged.
 """
 
 from __future__ import annotations

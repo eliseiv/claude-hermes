@@ -6,7 +6,6 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.config import get_settings
 from app.deps import CurrentUser, get_wallet_service, require_owner
@@ -19,7 +18,7 @@ from app.schemas.wallet import (
 )
 from app.wallet.service import WalletService
 
-router = APIRouter(prefix="/v1/wallet", tags=["Wallet"], dependencies=[Depends(bearer_scheme)])
+router = APIRouter(prefix="/v1/wallet", tags=["Wallet"])
 
 _CONSUME_REQUEST_EXAMPLES = {
     "debit_one": {

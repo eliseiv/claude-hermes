@@ -7,12 +7,14 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import Depends, Header, Request
+from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import AdminService
 from app.api_gateway.auth import AuthenticatedUser, get_jwt_verifier
+from app.api_gateway.openapi_security import bearer_scheme
 from app.audit.service import AuditService
 from app.auth.issuer import TokenIssuer
 from app.auth.service import AuthService
@@ -73,7 +75,7 @@ async def provision_user(session: AsyncSession, user_id: uuid.UUID) -> None:
 
 async def get_current_user(
     session: Annotated[AsyncSession, Depends(get_db)],
-    authorization: Annotated[str | None, Header()] = None,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
 ) -> AuthenticatedUser:
     """Authenticate the request and lazily provision the user (ADR-007).
 
@@ -81,7 +83,16 @@ async def get_current_user(
     provisioning here uniformly covers every write endpoint without per-flow duplication.
     Provisioning happens only *after* full JWT verification (an invalid/expired token raises
     401 before any row is created) and *before* the subject is used downstream.
+
+    The credentials come from ``bearer_scheme`` (HTTPBearer, ``auto_error=False``), which is a
+    ``SecurityBase``: it contributes the ``bearerAuth`` security scheme to OpenAPI (lock icon /
+    Authorize button) *without* adding a separate ``authorization`` header parameter to every
+    operation. ``auto_error=False`` keeps the scheme from raising on a missing/malformed header
+    — the real 401 stays in ``verify_bearer_token`` so behaviour is unchanged (08-api-doc R2).
     """
+    # Re-assemble the canonical "Bearer <token>" string so verify_bearer_token keeps its public
+    # signature (a Header-shaped value) and its 401 semantics (missing/non-Bearer/invalid token).
+    authorization = f"Bearer {credentials.credentials}" if credentials is not None else None
     user = verify_bearer_token(authorization)
     set_user_id(str(user.user_id))
     # FastAPI caches `get_db` per request, so `session` is the exact session the service

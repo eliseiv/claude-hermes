@@ -6,16 +6,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
 
-from app.api_gateway.openapi_security import bearer_scheme
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.deps import CurrentUser, get_subscription_service, require_owner
 from app.errors import RateLimitedError
 from app.schemas.subscription import SubscriptionSyncRequest, SubscriptionSyncResponse
 from app.subscription.service import SubscriptionService
 
-router = APIRouter(
-    prefix="/v1/subscription", tags=["Subscription"], dependencies=[Depends(bearer_scheme)]
-)
+router = APIRouter(prefix="/v1/subscription", tags=["Subscription"])
 
 
 @router.post(
@@ -23,9 +20,8 @@ router = APIRouter(
     response_model=SubscriptionSyncResponse,
     summary="Синхронизировать подписку",
     description=(
-        "Принимает подписанную StoreKit-транзакцию (JWS), проверяет её подпись и обновляет "
-        "состояние подписки пользователя. При активации/продлении начисляет кредиты периода. "
-        "Поле `transaction` не логируется."
+        "Пришлите подписанную StoreKit-транзакцию в поле `transaction`. Обновляет состояние "
+        "подписки; при активации или продлении начисляет кредиты периода."
     ),
 )
 async def subscription_sync(

@@ -17,7 +17,7 @@ class SubscriptionSyncRequest(StrictModel):
     # Signed StoreKit JWS transaction (compact JWS string). Never logged (redaction).
     transaction: str = Field(
         min_length=1,
-        description="Подписанная StoreKit-транзакция (compact JWS). Не логируется (redaction).",
+        description="Подписанная StoreKit-транзакция.",
     )
 
 

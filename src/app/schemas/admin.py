@@ -20,18 +20,18 @@ class AdminGrantRequest(StrictModel):
     idempotencyKey: str = Field(
         min_length=1,
         max_length=128,
-        description="Ключ идемпотентности начисления (передаётся в WalletService.grant).",
+        description="Ключ идемпотентности начисления.",
     )
     reason: str = Field(
         min_length=1,
         max_length=512,
-        description="Причина начисления (обязательна; пишется в audit и ledger meta).",
+        description="Причина начисления (обязательна).",
     )
 
 
 class AdminGrantResponse(StrictModel):
     newBalance: int = Field(description="Баланс кредитов после начисления.")
-    ledgerTxId: uuid.UUID = Field(description="Идентификатор транзакции реестра (type=credit).")
+    ledgerTxId: uuid.UUID = Field(description="Идентификатор транзакции реестра.")
     idempotentReplay: bool = Field(
         description="true, если ключ уже использовался с тем же payload (повтор без начисления)."
     )

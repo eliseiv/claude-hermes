@@ -16,9 +16,10 @@ from typing import Annotated
 
 import httpx
 import jwt
-from fastapi import Header
+from fastapi import Depends
 from jwt import PyJWKClient
 
+from app.api_gateway.openapi_security import admin_scheme
 from app.config import get_settings
 from app.errors import UnauthorizedError
 
@@ -112,7 +113,7 @@ def _admin_token_matches(presented: str) -> bool:
 
 
 async def require_admin(
-    x_admin_token: Annotated[str | None, Header(alias="X-Admin-Token")] = None,
+    x_admin_token: Annotated[str | None, Depends(admin_scheme)] = None,
 ) -> None:
     """Authorize an admin request via the isolated X-Admin-Token (ADR-009).
 
@@ -121,6 +122,12 @@ async def require_admin(
     ``sub``/identity — the actor is recorded as ``admin`` in audit. A missing or mismatching
     token raises 401 without revealing the reason. The secret is never logged (redaction
     allowlist covers X-Admin-Token, ADR-009 §6).
+
+    The token value comes from ``admin_scheme`` (APIKeyHeader on ``X-Admin-Token``,
+    ``auto_error=False``): a ``SecurityBase`` that contributes the ``adminToken`` security
+    scheme to OpenAPI (lock / Authorize) *without* emitting a duplicate ``X-Admin-Token`` header
+    parameter on the operation. ``auto_error=False`` keeps it from raising before our
+    constant-time check, so the 401-on-missing/mismatch behaviour is unchanged (ADR-009).
     """
     if x_admin_token is None or not _admin_token_matches(x_admin_token):
         raise UnauthorizedError("invalid admin token")
