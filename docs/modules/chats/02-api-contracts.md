@@ -57,6 +57,7 @@
 ```
 - `steps` — упорядочены по `chat_steps.seq` (монотонный порядок вставки, [ADR-021](../../adr/ADR-021-deterministic-step-order-and-block-normalization.md)), **НЕ** по `created_at` (равен для шагов одной транзакции). `createdAt` отдаётся как информационный timestamp каждого шага.
 - `payload` — content-блоки (assistant text / tool_use / tool_result), как в `chat_steps.payload`.
+- **Синк с ответом генерации ([ADR-023](../../adr/ADR-023-sync-ids-in-chat-response.md)):** `steps[].id` (= `chat_steps.id`) и `steps[].messageStepId` (= `chat_steps.message_step_id`) — те же значения, что отдаёт `ChatResponse.stepId` / `ChatResponse.messageStepId` ([chat-orchestrator/02-api-contracts.md](../chat-orchestrator/02-api-contracts.md#response-200)) для соответствующего шага/хода. Клиент склеивает оптимистично отрисованный шаг с серверной историей по `id` (точный шаг) и группирует tool-loop-раунды хода по `messageStepId`.
 
 ## GET /v1/chats/{id}/steps
 Steps-view для UI («N steps»): агрегированные шаги последнего (или указанного) message-шага — tool-calls и assistant-reasoning.

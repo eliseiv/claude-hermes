@@ -182,6 +182,9 @@ class ChatResponse(StrictModel):
     - `status=assistant_message`: есть `assistantMessage`, `usage`; нет `toolCall`, `blockReason`.
     - `status=tool_call`: есть `toolCall`, `usage`; нет `assistantMessage`, `blockReason`.
     - `status=blocked`: есть `blockReason`; нет `assistantMessage`, `toolCall`, `usage`.
+
+    `messageStepId`/`stepId` присутствуют при `assistant_message`/`tool_call` и `null` при
+    `blocked` (шаг/ход не создаются).
     """
 
     status: Literal["assistant_message", "tool_call", "blocked"] = Field(
@@ -189,6 +192,21 @@ class ChatResponse(StrictModel):
     )
     sessionId: uuid.UUID = Field(
         description="Идентификатор сессии диалога (для последующих вызовов)."
+    )
+    messageStepId: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Идентификатор хода для синхронизации с историей чата. Один на сообщение, "
+            "общий для всех раундов tool-loop. Совпадает с `messageStepId` шагов хода в "
+            "`GET /v1/chats/{id}`. `null` при `status=blocked`."
+        ),
+    )
+    stepId: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Идентификатор конкретного шага, который представляет этот ответ. Совпадает с "
+            "`id` соответствующего шага в `GET /v1/chats/{id}`. `null` при `status=blocked`."
+        ),
     )
     assistantMessage: str | None = Field(
         default=None, description="Текст ответа ассистента (только при `status=assistant_message`)."

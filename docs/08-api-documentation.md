@@ -110,11 +110,13 @@ OpenAPI-тексты (`summary`, `description` эндпоинтов, `Field(desc
 ### Дискриминация ответа `/chat/run` и `/chat/tool-result`
 
 Ответ — одна модель `ChatResponse` (`src/app/schemas/chat.py`) с тремя взаимоисключающими состояниями по полю `status`. Документация обязана сделать варианты очевидными:
-- `status=assistant_message`: присутствуют `assistantMessage`, `usage`; нет `toolCall`, `blockReason`.
-- `status=tool_call`: присутствуют `toolCall`, `usage`; нет `assistantMessage`, `blockReason`.
-- `status=blocked`: присутствует `blockReason`; нет `assistantMessage`, `toolCall`, `usage`.
+- `status=assistant_message`: присутствуют `assistantMessage`, `usage`, `messageStepId`, `stepId`; нет `toolCall`, `blockReason`.
+- `status=tool_call`: присутствуют `toolCall`, `usage`, `messageStepId`, `stepId`; нет `assistantMessage`, `blockReason`.
+- `status=blocked`: присутствует `blockReason`; `messageStepId`/`stepId` = `null`; нет `assistantMessage`, `toolCall`, `usage`.
 
-Способ (на усмотрение `backend`, любой даёт читаемый результат): либо описать инвариант в `description` модели + три именованных примера `openapi_examples` (`assistant_message`, `tool_call`, `blocked`), либо ввести discriminated-union response с тремя под-моделями. **Обязательный минимум** — три именованных примера ответа на каждый из двух chat-endpoint. Менять wire-формат (имена/типы полей) запрещено — это сломает контракт.
+`messageStepId`/`stepId` ([ADR-023](adr/ADR-023-sync-ids-in-chat-response.md), nullable) — идентификаторы синхронизации с историей чата: дословно совпадают с `steps[].messageStepId` / `steps[].id` из `GET /v1/chats/{id}` (модуль chats). В `description` поля `stepId` указать: «id шага этого ответа, совпадает со `steps[].id` в истории»; `messageStepId`: «ключ хода (стабилен через tool-loop), совпадает со `steps[].messageStepId`». При `blocked` оба `null` (шаг/ход не создаются — блок до генерации).
+
+Способ (на усмотрение `backend`, любой даёт читаемый результат): либо описать инвариант в `description` модели + три именованных примера `openapi_examples` (`assistant_message`, `tool_call`, `blocked`), либо ввести discriminated-union response с тремя под-моделями. **Обязательный минимум** — три именованных примера ответа на каждый из двух chat-endpoint; примеры `assistant_message`/`tool_call` должны нести непустые `messageStepId`/`stepId`, пример `blocked` — `null`. Менять wire-формат существующих полей (имена/типы) запрещено; `messageStepId`/`stepId` — **аддитивные** nullable-поля (обратносовместимо).
 
 ## R4. Теги и группировка
 

@@ -26,6 +26,7 @@
 | [ADR-020](ADR-020-inline-base64-attachments-mvp.md) | Мультимодальный ввод: inline base64-вложения в `/chat/run` (MVP); заменяет транспорт ADR-014 | Accepted | 2026-06-03 |
 | [ADR-021](ADR-021-deterministic-step-order-and-block-normalization.md) | Детерминированный порядок шагов сессии (монотонный `chat_steps.seq`) + нормализация content-блоков перед персистом (BUG-5) | Accepted | 2026-06-04 |
 | [ADR-022](ADR-022-optional-project-and-tool-gating.md) | Опциональный `projectId` в `/v1/chat/run` + гейтинг `site.*` по наличию проекта (website-builder — опциональная фича; «чистый чат» без проекта) | Accepted | 2026-06-04 |
+| [ADR-023](ADR-023-sync-ids-in-chat-response.md) | Идентификаторы синхронизации в `ChatResponse` (`messageStepId` + `stepId`, nullable при blocked) — склейка ответа генерации с историей чата | Accepted | 2026-06-05 |
 
 ## Ревизии
 

@@ -45,6 +45,7 @@
 | [adr/ADR-019-tools-catalog-endpoint.md](adr/ADR-019-tools-catalog-endpoint.md) | Каталог инструментов `GET /v1/tools` (JWT-protected) |
 | [adr/ADR-020-inline-base64-attachments-mvp.md](adr/ADR-020-inline-base64-attachments-mvp.md) | Мультимодальный ввод: inline base64-вложения в `/chat/run` (MVP); заменяет транспорт ADR-014 |
 | [adr/ADR-021-deterministic-step-order-and-block-normalization.md](adr/ADR-021-deterministic-step-order-and-block-normalization.md) | Детерминированный порядок шагов (`chat_steps.seq`) + нормализация content-блоков (BUG-5) |
+| [adr/ADR-023-sync-ids-in-chat-response.md](adr/ADR-023-sync-ids-in-chat-response.md) | Id синхронизации в `ChatResponse` (`messageStepId` + `stepId`, nullable при blocked) — склейка ответа генерации с историей чата |
 
 ### Модули
 | Модуль | Каталог | Статус |

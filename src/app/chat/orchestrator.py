@@ -99,6 +99,12 @@ class ChatRunOut:
     tool_call: ToolCallOut | None = None
     block_reason: str | None = None
     usage: dict[str, Any] | None = None
+    # ADR-023: sync ids for chat history. message_step_id = the turn (one per user message-step,
+    # reused across tool-rounds/re-entry); step_id = the id of the persisted assistant/tool step
+    # this response represents (= ChatStep.id = ChatStepSchema.id). Both None for blocked (no step
+    # / turn is created — policy blocks before generation).
+    message_step_id: uuid.UUID | None = None
+    step_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -278,7 +284,7 @@ class ChatOrchestrator:
         # Idempotent replay: already completed → return the saved next step.
         if tool_call.status == "completed":
             saved = await self._deps.repo.next_step_after(session_id, message_step_id, tool_call_id)
-            return self._render_saved_step(session_id, saved)
+            return self._render_saved_step(session_id, message_step_id, saved)
 
         # Atomic pending → completed/errored.
         status = "errored" if error is not None else "completed"
@@ -288,7 +294,7 @@ class ChatOrchestrator:
         if not transitioned:
             # Concurrent completion won the race → behave idempotently.
             saved = await self._deps.repo.next_step_after(session_id, message_step_id, tool_call_id)
-            return self._render_saved_step(session_id, saved)
+            return self._render_saved_step(session_id, message_step_id, saved)
 
         # Persist the tool_result as a tool step. (result size limit is enforced at the
         # schema layer; result content is opaque per-tool and forwarded to Claude as-is.)
@@ -575,7 +581,10 @@ class ChatOrchestrator:
     ) -> ChatRunOut:
         # Final assistant_message. The assistant-step + billing (debit or trial flip) + audit are
         # committed together as one short transaction (atomicity per MAJOR-4 / CRITICAL-1).
-        await self._deps.repo.add_step(
+        # ADR-023: capture the persisted assistant step's id → ChatResponse.stepId. It is the same
+        # ChatStep.id that GET /v1/chats/{id} renders as ChatStepSchema.id for this step (sync
+        # invariant).
+        assistant_step = await self._deps.repo.add_step(
             session_id=session_id,
             message_step_id=message_step_id,
             role="assistant",
@@ -627,6 +636,8 @@ class ChatOrchestrator:
             session_id=session_id,
             assistant_message=result.text,
             usage=usage,
+            message_step_id=message_step_id,
+            step_id=assistant_step.id,
         )
 
     async def _handle_tool_use(
@@ -651,8 +662,10 @@ class ChatOrchestrator:
         If the turn contains any client-side tool, client_out is set (hand off to iOS). If the turn
         is purely server-side, client_out is None and the orchestrator continues the loop.
         """
-        # Persist the assistant tool_use step (no debit on tool-rounds).
-        await self._deps.repo.add_step(
+        # Persist the assistant tool_use step (no debit on tool-rounds). ADR-023: this is the
+        # step-of-record for a status=tool_call response — ChatResponse.stepId = its ChatStep.id
+        # (the history step whose payload carries the tool_use block). NOT toolCall.id.
+        assistant_step = await self._deps.repo.add_step(
             session_id=session_id,
             message_step_id=message_step_id,
             role="assistant",
@@ -726,6 +739,8 @@ class ChatOrchestrator:
                     session_id=session_id,
                     tool_call=first_client_out,
                     usage=usage,
+                    message_step_id=message_step_id,
+                    step_id=assistant_step.id,
                 )
             )
         # Purely server-side turn → continue the loop (no hand-off to iOS).
@@ -807,7 +822,12 @@ class ChatOrchestrator:
             session_id=session_id,
         )
 
-    def _render_saved_step(self, session_id: uuid.UUID, step: ChatStep | None) -> ChatRunOut:
+    def _render_saved_step(
+        self,
+        session_id: uuid.UUID,
+        message_step_id: uuid.UUID,
+        step: ChatStep | None,
+    ) -> ChatRunOut:
         if step is None:
             # Nothing generated yet for this step (e.g. concurrent in-flight) → treat as not found.
             raise NotFoundError("no completed step for tool result")
@@ -815,11 +835,15 @@ class ChatOrchestrator:
         for block in step.payload.get("content", []):
             if block.get("type") == "text":
                 text += block.get("text", "")
+        # ADR-023: idempotent replay returns the same sync ids as the original response — the turn
+        # (message_step_id, stable across re-entry) and the saved step's own id.
         return ChatRunOut(
             status="assistant_message",
             session_id=session_id,
             assistant_message=text,
             usage=step.usage,
+            message_step_id=message_step_id,
+            step_id=step.id,
         )
 
 

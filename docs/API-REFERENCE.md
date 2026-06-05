@@ -151,10 +151,14 @@
 |---|---|---|
 | `status` | `assistant_message` \| `tool_call` \| `blocked` | исход шага |
 | `sessionId` | string (uuid) | сессия (новая или переданная) |
+| `messageStepId` | string (uuid) \| null | ключ **хода** (один на сообщение, переиспользуется во всех tool-раундах); `null` при `blocked`. Совпадает с `steps[].messageStepId` в истории. ([ADR-023](adr/ADR-023-sync-ids-in-chat-response.md)) |
+| `stepId` | string (uuid) \| null | id **конкретного** assistant/tool-шага этого ответа; `null` при `blocked`. Совпадает с `steps[].id` в истории `GET /v1/chats/{id}`. ([ADR-023](adr/ADR-023-sync-ids-in-chat-response.md)) |
 | `assistantMessage` | string, опц. | присутствует при `assistant_message` |
-| `toolCall` | object `{ id, name, args }`, опц. | присутствует при `tool_call`; `id` — публичный UUID для последующего `/chat/tool-result` |
+| `toolCall` | object `{ id, name, args }`, опц. | присутствует при `tool_call`; `id` — публичный UUID для последующего `/chat/tool-result` (≠ `stepId`) |
 | `blockReason` | enum, опц. | присутствует при `blocked` (см. [раздел 12](#12-blockreason--справочник)) |
 | `usage` | object `{ inputTokens, outputTokens, model }` | при `assistant_message`/`tool_call`; нет при `blocked` |
+
+> **Синхронизация с историей чата ([ADR-023](adr/ADR-023-sync-ids-in-chat-response.md)).** `messageStepId`/`stepId` дают клиенту ключ для склейки ответа генерации с шагами `GET /v1/chats/{id}` → `steps[]`: `stepId` = точный шаг (`steps[].id`), `messageStepId` = ход для группировки tool-loop-раундов (`steps[].messageStepId`). При `status=blocked` шаг/ход не создаются (блок до генерации) → оба `null`. На `/v1/chat/tool-result` `messageStepId` стабилен в пределах хода (равен исходному `/chat/run`), `stepId` — id нового шага этого ответа.
 
 Значения `status`:
 - **`assistant_message`** — финальный текстовый ответ Claude. На этом шаге списывается 1 кредит (для `mode=credits`).

@@ -28,6 +28,11 @@ router = APIRouter(prefix="/v1/chat", tags=["Chat"])
 # --- Согласованные id для end-to-end tool-loop примеров (run -> tool_call -> tool-result) ---
 _SESSION_ID = "3f1c2a7e-9b54-4d2e-8a11-6c0d5e7f1a23"
 _TOOL_CALL_ID = "a7b9c1d2-3e4f-5061-7283-94a5b6c7d8e9"
+# Один messageStepId на весь ход (стабилен через tool-loop); stepId — у каждого шага свой.
+_MESSAGE_STEP_ID = "b1e2d3c4-5f60-4718-9a2b-3c4d5e6f7081"
+_STEP_ID_TOOL_CALL = "c2f3e4d5-6071-4829-ab3c-4d5e6f708192"
+_STEP_ID_FINAL = "d3041526-7182-493a-bc4d-5e6f708192a3"
+_STEP_ID_TOOL_RESULT_FINAL = "e4152637-8293-4a4b-cd5e-6f708192a3b4"
 
 # Tiny valid base64-encoded 1x1 PNG for the Swagger attachment example (not a real photo).
 _EXAMPLE_PNG_B64 = (
@@ -41,6 +46,8 @@ _RUN_RESPONSE_EXAMPLES = {
         "value": {
             "status": "assistant_message",
             "sessionId": _SESSION_ID,
+            "messageStepId": _MESSAGE_STEP_ID,
+            "stepId": _STEP_ID_FINAL,
             "assistantMessage": "Конечно! Вот краткое содержание вашего файла…",
             "usage": {"inputTokens": 1240, "outputTokens": 320},
         },
@@ -55,6 +62,8 @@ _RUN_RESPONSE_EXAMPLES = {
         "value": {
             "status": "tool_call",
             "sessionId": _SESSION_ID,
+            "messageStepId": _MESSAGE_STEP_ID,
+            "stepId": _STEP_ID_TOOL_CALL,
             "toolCall": {
                 "id": _TOOL_CALL_ID,
                 "name": "files.read",
@@ -72,6 +81,8 @@ _RUN_RESPONSE_EXAMPLES = {
         "value": {
             "status": "blocked",
             "sessionId": _SESSION_ID,
+            "messageStepId": None,
+            "stepId": None,
             "blockReason": "credits_empty",
         },
     },
@@ -130,6 +141,8 @@ _TOOL_RESULT_RESPONSE_EXAMPLES = {
         "value": {
             "status": "assistant_message",
             "sessionId": _SESSION_ID,
+            "messageStepId": _MESSAGE_STEP_ID,
+            "stepId": _STEP_ID_TOOL_RESULT_FINAL,
             "assistantMessage": "В файле notes.md перечислены задачи на неделю…",
             "usage": {"inputTokens": 1500, "outputTokens": 210},
         },
@@ -173,6 +186,8 @@ def _to_response(out: ChatRunOut) -> ChatResponse:
     return ChatResponse(
         status=out.status,
         sessionId=out.session_id,
+        messageStepId=out.message_step_id,
+        stepId=out.step_id,
         assistantMessage=out.assistant_message,
         toolCall=tool_call,
         blockReason=out.block_reason,
