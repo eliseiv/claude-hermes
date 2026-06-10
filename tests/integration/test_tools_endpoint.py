@@ -2,7 +2,8 @@
 
 JWT-protected like all /v1/* reads. Uses the shared hermetic `client` (real PG container, faked
 external clients, rate limits forced open). Verifies the auth gate (401 without token) and the
-response contract (13 tools; dotted domain names; mutating/execution flags; inputSchema present).
+response contract (14 tools — ADR-026 added time.now; dotted domain names; mutating/execution
+flags; inputSchema present).
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ _EXPECTED_NAMES = {
     "site.list",
     "site.read",
     "site.delete",
+    "time.now",
 }
 _MUTATING = {
     "files.write",
@@ -53,7 +55,7 @@ async def test_tools_broken_bearer_401(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tools_returns_thirteen_with_token(
+async def test_tools_returns_fourteen_with_token(
     client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
     async with db_sessionmaker() as s:
@@ -61,7 +63,7 @@ async def test_tools_returns_thirteen_with_token(
     r = await client.get("/v1/tools", headers=auth_headers(uid))
     assert r.status_code == 200, r.text
     tools = r.json()["tools"]
-    assert len(tools) == 13
+    assert len(tools) == 14
     assert {t["name"] for t in tools} == _EXPECTED_NAMES
 
 
@@ -79,7 +81,8 @@ async def test_tools_descriptor_contract(
         assert "." in name and "_" not in name.split(".")[0]
         assert set(tool.keys()) == {"name", "description", "mutating", "execution", "inputSchema"}
         assert tool["mutating"] is (name in _MUTATING), name
-        expected_exec = "server" if name.startswith("site.") else "client"
+        # ADR-026: server-side == site.* (project-scoped) OR time.now (global); else client.
+        expected_exec = "server" if name.startswith("site.") or name == "time.now" else "client"
         assert tool["execution"] == expected_exec, (name, tool["execution"])
         assert isinstance(tool["inputSchema"], dict) and tool["inputSchema"].get("type") == "object"
         assert tool["description"]
@@ -93,4 +96,4 @@ async def test_tools_user_mismatch_in_token_still_serves_own_catalog(
     # token for an unprovisioned subject still gets a 200 (lazy provisioning, ADR-007).
     r = await client.get("/v1/tools", headers=auth_headers(uuid.uuid4()))
     assert r.status_code == 200
-    assert len(r.json()["tools"]) == 13
+    assert len(r.json()["tools"]) == 14

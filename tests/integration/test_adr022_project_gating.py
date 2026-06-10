@@ -129,7 +129,9 @@ async def test_no_project_session_does_not_offer_site_tools_on_run(
     assert "files.read" in offered
     assert "calendar.read" in offered
     assert "reminders.read" in offered
-    assert len(offered) == 8
+    # ADR-026: time.now (global server-side) is offered even without a project.
+    assert "time.now" in offered
+    assert len(offered) == 9  # 8 client-side + time.now
 
 
 @pytest.mark.asyncio
@@ -149,7 +151,8 @@ async def test_project_session_offers_full_13_tools_on_run(
     )
     offered = _offered_domain_tools(fake_anthropic.calls[0])
     assert offered >= SERVER_SIDE_TOOLS  # site.* present
-    assert len(offered) == 13
+    assert "time.now" in offered  # ADR-026: global server-side, always offered
+    assert len(offered) == 14  # 8 client-side + 5 site.* + time.now
 
 
 @pytest.mark.asyncio

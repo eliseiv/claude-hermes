@@ -48,6 +48,7 @@
 | [adr/ADR-023-sync-ids-in-chat-response.md](adr/ADR-023-sync-ids-in-chat-response.md) | Id синхронизации в `ChatResponse` (`messageStepId` + `stepId`, nullable при blocked) — склейка ответа генерации с историей чата |
 | [adr/ADR-024-history-payload-domain-normalization.md](adr/ADR-024-history-payload-domain-normalization.md) | Доменная нормализация payload истории `GET /v1/chats/{id}` (dot-имя + domain id) + `assistantMessage` при `tool_call` |
 | [adr/ADR-025-parallel-tool-calls-and-max-tokens-truncation.md](adr/ADR-025-parallel-tool-calls-and-max-tokens-truncation.md) | Параллельные client-side tool-вызовы (`toolCalls[]` + батч `/chat/tool-result`, барьер хода) + обрезка по `max_tokens` (`blockReason=max_tokens`, дефолт `ANTHROPIC_MAX_TOKENS=16000`) |
+| [adr/ADR-026-global-server-side-tools-and-time-now.md](adr/ADR-026-global-server-side-tools-and-time-now.md) | Project-independent (global) server-side tools (`GLOBAL_SERVER_SIDE_TOOLS`) + инструмент `time.now` (UTC всегда + локальное по опц. IANA `tz`); работает без проекта, не мутирует, без новых списаний; статичная generic-инструкция в промт (prompt cache не ломается) |
 
 ### Модули
 | Модуль | Каталог | Статус |

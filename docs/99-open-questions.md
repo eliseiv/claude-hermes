@@ -107,6 +107,15 @@
 
 **Cross-ref:** [ADR-017 §Мульти-инстанс](adr/ADR-017-shared-server-traefik-deploy.md), [07-deployment.md §Мульти-инстанс](07-deployment.md#мульти-инстанс--клонирование-сервиса), [07-deployment.md §CI/CD INSTANCES-loop](07-deployment.md#cicd-контракт-instances-loop-мульти-инстанс), [ADR-018](adr/ADR-018-embedded-auth-issuer.md) (per-instance JWT keypair).
 
+## Открытые вопросы инструмента `time.now` (2026-06-10, [ADR-026](adr/ADR-026-global-server-side-tools-and-time-now.md))
+
+| ID | Вопрос | Статус | Принятый дефолт (если есть) | Блокирует backend? |
+|---|---|---|---|---|
+| Q-026-1 | Лимит длины аргумента `tz` инструмента `time.now` и дефолтная таймзона сервиса. | **Closed (2026-06-10, дефолты)** | **Лимит длины `tz` ≤ 64 символа** (длиннее любого валидного IANA-имени; вне лимита → tool-result error `invalid_timezone`, не падение хода). **Дефолтная tz — UTC** (при отсутствии `tz` результат только в UTC; локального представления нет). Реализовано: `TIME_NOW_TZ_MAX_LENGTH = 64` (проверка в handler `GlobalToolHandlers`, не pydantic `max_length` — чтобы over-limit деградировал к tool-result error, а не 422 хода); дефолт UTC. | Нет |
+
+### Q-026-1 — лимит длины `tz` и дефолтная таймзона (Closed 2026-06-10)
+Аргумент `tz` инструмента `time.now` ([ADR-026 §6](adr/ADR-026-global-server-side-tools-and-time-now.md)) — опциональный IANA-имя зоны. **Закрыт принятием дефолтов (реализованы):** длина `≤ 64` (`TIME_NOW_TZ_MAX_LENGTH = 64`, проверка в handler `GlobalToolHandlers`, не pydantic — over-limit → tool-result error, не 422 хода; защита от мусорного/раздутого ввода до резолва `zoneinfo`); дефолтная зона сервиса — **UTC** (без `tz` модель получает UTC-набор `utc`/`unix`/`weekday`; локальное `local`/`timezone` — только при явном валидном `tz`). Невалидный/длинный `tz` → tool-result error `invalid_timezone`, ход продолжается. [TD-019](100-known-tech-debt.md) (tz-база в prod-образе) — **Resolved** (зависимость `tzdata` добавлена), `tz` в prod работает; UTC работает всегда независимо.
+
 ## Блокеры (для orchestrator)
 - ~~**Q-015-1 (покупка токенов × policy)**~~ — **Closed (2026-06-02, вариант б):** покупка токенов требует активной подписки (`403 subscription_required` до grant), [ADR-002](adr/ADR-002-access-policy-state-machine.md) без изменений. Требует backend-доработки: policy-guard перед `WalletService.grant` в token-purchase. См. [ADR-015 §Доступность](adr/ADR-015-consumable-token-iap.md).
 - **Q-016-2 (web search)** — блокирует **только** фичу веб-поиска: нет выбора провайдера → нет контракта server-side tool. Остальное расширение не блокирует.

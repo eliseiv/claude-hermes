@@ -29,6 +29,7 @@
 | [ADR-023](ADR-023-sync-ids-in-chat-response.md) | Идентификаторы синхронизации в `ChatResponse` (`messageStepId` + `stepId`, nullable при blocked) — склейка ответа генерации с историей чата | Accepted | 2026-06-05 |
 | [ADR-024](ADR-024-history-payload-domain-normalization.md) | Нормализация content-блоков истории `GET /v1/chats/{id}` `steps[].payload` к доменному виду (dot-имя + domain id) при отдаче — хранение/реплей не меняются | Accepted | 2026-06-10 |
 | [ADR-025](ADR-025-parallel-tool-calls-and-max-tokens-truncation.md) | Параллельные client-side tool-вызовы (`toolCalls[]` в `ChatResponse` + батч `/chat/tool-result`, барьер хода) + обработка обрезки по `max_tokens` (`blockReason=max_tokens`, дефолт `ANTHROPIC_MAX_TOKENS=16000`) | Accepted | 2026-06-10 |
+| [ADR-026](ADR-026-global-server-side-tools-and-time-now.md) | Project-independent (global) server-side tools (`GLOBAL_SERVER_SIDE_TOOLS`, отдельно от project-scoped `site.*`) + инструмент `time.now` (UTC всегда + локальное по опц. IANA `tz`); работает без проекта, не мутирует, без новых списаний; статичная generic-инструкция в промт (кэш не ломается) | Accepted | 2026-06-10 |
 
 ## Ревизии
 

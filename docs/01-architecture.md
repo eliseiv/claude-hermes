@@ -152,15 +152,16 @@ sequenceDiagram
     O-->>C: 200 {status, ...}
 ```
 
-## Tool-calling протокол: client-side vs server-side ([ADR-011](adr/ADR-011-server-side-tools.md))
-Два класса tools, различаются по доменному имени (статический реестр):
+## Tool-calling протокол: client-side vs server-side ([ADR-011](adr/ADR-011-server-side-tools.md), [ADR-026](adr/ADR-026-global-server-side-tools-and-time-now.md))
+Три класса tools, различаются по доменному имени (статические реестры):
 - **client-side** — `files.*`, `calendar.*`, `reminders.*`: backend **только инициирует** tool-call (`status=tool_call`),
   исполняет **iOS-клиент** локально и возвращает `tool_result` через `/v1/chat/tool-result`. Backend сам не исполняет.
-- **server-side** — `site.*` (website-builder): исполняет **backend** немедленно в tool-loop (пишет в своё хранилище),
-  формирует `tool_result` сам и продолжает цикл к Anthropic **без round-trip к iOS**. Server-side tool-call **НЕ** отдаётся
+- **server-side, project-scoped** — `site.*` (website-builder, `SERVER_SIDE_TOOLS`): исполняет **backend** немедленно в tool-loop (пишет в своё хранилище),
+  формирует `tool_result` сам и продолжает цикл к Anthropic **без round-trip к iOS**. **Требует проекта** ([ADR-022](adr/ADR-022-optional-project-and-tool-gating.md): только при `project_id IS NOT NULL`). Server-side tool-call **НЕ** отдаётся
   клиенту как `status=tool_call`. Guard на число server-side раундов (`MAX_SERVER_TOOL_ROUNDS`, дефолт 16).
-- Все мутирующие действия (`files.write`, `files.mkdir`, `calendar.create_events`, `reminders.create`, **`site.write_file`, `site.delete`**) имеют audit-запись.
-- Список tools и строго типизированные схемы args/result — [modules/chat-orchestrator/02-api-contracts.md](modules/chat-orchestrator/02-api-contracts.md) (client-side) и [modules/website-builder/02-api-contracts.md](modules/website-builder/02-api-contracts.md) (server-side `site.*`).
+- **server-side, global** — `time.now` (`GLOBAL_SERVER_SIDE_TOOLS`, [ADR-026](adr/ADR-026-global-server-side-tools-and-time-now.md)): исполняет **backend** в tool-loop (как `site.*`), но **БЕЗ проекта** — предлагается Claude **всегда** (включая «чистый чат»). Маршрутизируется до project-scoped ветки, без `external_project_id`. Решает репорт «модель не знает текущую дату» (UTC + опц. локальное время по IANA `tz`). Не мутирующий.
+- Все мутирующие действия (`files.write`, `files.mkdir`, `calendar.create_events`, `reminders.create`, **`site.write_file`, `site.delete`**) имеют audit-запись. `time.now` — read-only, не мутирующий.
+- Список tools и строго типизированные схемы args/result — [modules/chat-orchestrator/02-api-contracts.md](modules/chat-orchestrator/02-api-contracts.md) (client-side + `time.now`) и [modules/website-builder/02-api-contracts.md](modules/website-builder/02-api-contracts.md) (server-side `site.*`).
 
 ## Наблюдаемость
 Cross-cutting слой, реализуется в API Gateway middleware + утилитах модулей.

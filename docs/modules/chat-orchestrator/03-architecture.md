@@ -102,6 +102,36 @@ Claude в одном assistant-ходе может вернуть **нескол
 
 **Инвариант:** в «чистом чате» (`project_id IS NULL`) ни один `site.*` не предлагается и не исполняется → нет резолва проекта → IDOR по проекту невозможен по построению (усиление IDOR-guard [ADR-011](../../adr/ADR-011-server-side-tools.md)). Биллинг/policy от наличия `project_id` не зависят (1 кредит = 1 сообщение).
 
+> **`time.now` под этот гейт НЕ подпадает.** `time.now` — **global** server-side tool ([ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md), `GLOBAL_SERVER_SIDE_TOOLS`), а не project-scoped `SERVER_SIDE_TOOLS`. Флаг `include_server_side` (= «есть проект») гейтит **только** `site.*`; `time.now` предлагается Claude **всегда** (включая `project_id IS NULL`). См. [§Global server-side tools и `time.now`](#global-server-side-tools-и-timenow-adr-026).
+
+## Global server-side tools и `time.now` (ADR-026)
+
+Сервис — чат-агрегатор; основной flow — «чистый чат» **без проекта** ([ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md)). Модели нужен инструмент текущей даты/времени, доступный **всегда** (репорт iOS: «модель отвечает 2024 год», т.к. системный промт статичен и не несёт даты). Существующий server-side класс `site.*` ([ADR-011](../../adr/ADR-011-server-side-tools.md)) для этого непригоден: он project-scoped (`assert external_project_id is not None`, предлагается только при `project_id IS NOT NULL`). Вводится **новый класс — server-side global** ([ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md)).
+
+**Три класса инструментов:**
+
+| Класс | Реестр | Исполнитель | Проект | Предлагается |
+|---|---|---|---|---|
+| client-side | `files.*`/`calendar.*`/`reminders.*` | iOS (round-trip) | — | по `assistant_mode` ([Q-012-1](../../99-open-questions.md)) |
+| server-side, project-scoped | `SERVER_SIDE_TOOLS` (`site.*`) | backend в loop | **да** | только при `project_id IS NOT NULL` |
+| **server-side, global** | `GLOBAL_SERVER_SIDE_TOOLS` (`time.now`) | backend в loop | **нет** | **ВСЕГДА** |
+
+**Нормативный контракт маршрутизации (`_handle_tool_use`):**
+1. Реестры `SERVER_SIDE_TOOLS` и `GLOBAL_SERVER_SIDE_TOOLS` **не пересекаются** (инвариант). Совокупность server-side = их объединение; остальное — client-side.
+2. Для каждого `tool_use`-блока ветка global проверяется **ДО** project-scoped:
+   - `tool_name ∈ GLOBAL_SERVER_SIDE_TOOLS` → исполнить немедленно через global-handler **без** `external_project_id` и **без** опоры на `has_project`; персистировать tool-шаг (`role="tool"`, `providerToolUseId`), записать `tool_call_completed` audit; продолжить loop к Anthropic. В `toolCalls[]` наружу **НЕ** отдавать.
+   - иначе `tool_name ∈ SERVER_SIDE_TOOLS` → как [ADR-011](../../adr/ADR-011-server-side-tools.md)/[ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md): `assert external_project_id is not None`, исполнить через `SiteToolHandlers` (project-scoped).
+   - иначе client-side → собрать в `toolCalls[]`, hand-off к iOS.
+3. `assert external_project_id is not None` ([ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md) §guard) применяется **только** к project-scoped `SERVER_SIDE_TOOLS`. Global server-side tools проходят мимо guard'а — для них «нет проекта» не аномалия, а штатный режим.
+4. `anthropic_tool_definitions(include_server_side=...)`: флаг гейтит **только** `SERVER_SIDE_TOOLS`; `GLOBAL_SERVER_SIDE_TOOLS` под фильтр не попадают (предлагаются всегда). Ось B (`assistant_mode`, [Q-012-1](../../99-open-questions.md)) на `time.now` **не** действует — utility-tool полезен в обоих режимах.
+5. Барьер хода ([ADR-025](../../adr/ADR-025-parallel-tool-calls-and-max-tokens-truncation.md)) учитывает **только client-side** вызовы. Global server-side (как `site.*`) исполнены немедленно — в барьер не входят.
+
+**Executor (рекомендация [ADR-026 §5](../../adr/ADR-026-global-server-side-tools-and-time-now.md)).** Отдельный `GlobalToolHandlers` (`src/app/chat/global_tools.py`), **не зависящий** от `WebsiteService`/`SiteToolHandlers`/проекта; возвращает `ToolExecution` (тот же контракт, что `SiteToolHandlers`); время берёт через инъектируемый `Clock` (детерминизм qa). Регистрируется в `_Deps` рядом с `site_tools`.
+
+**`time.now` — контракт результата/ошибок:** [02-api-contracts.md §`time.now`](02-api-contracts.md#timenow--server-side-global-tool-adr-026) (UTC всегда `utc`/`unix`/`weekday`; при валидном `tz` — `local`/`timezone`; невалидный `tz` → tool-result error `invalid_timezone`, ход не падает). Не мутирующий → нет `tool_mutation` audit. Биллинг неизменен ([ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)).
+
+**Системный промт (оба режима, статичен).** В `_SYSTEM_PROMPT_CHAT` и `_SYSTEM_PROMPT_CODE` добавляется одинаковая **статичная** EN-инструкция (дата НЕ вписывается): *«You do not have built-in knowledge of the current date or time. If the user's request depends on the current date, time, or day of the week, call the `time.now` tool to get it; do not guess.»* Поскольку строка статична (без даты), системный промт остаётся стабильным → **prompt cache (`cache_control: ephemeral`) не инвалидируется** ([ADR-026 §7](../../adr/ADR-026-global-server-side-tools-and-time-now.md), [§Prompt caching](#prompt-caching)). Дата приходит только в tool-result, вне кэшируемого префикса.
+
 ## Согласованность tool_use.id в истории Anthropic (BUG-4)
 
 **Проблема.** Anthropic Messages API требует, чтобы при continuation `tool_result.tool_use_id` **точно** совпадал с `tool_use.id` соответствующего блока предыдущего assistant-хода в `messages`. Реальный Anthropic `tool_use.id` имеет формат `toolu_01...` (произвольная строка, **не** UUID). Ранее backend генерировал доменный `toolCallId` из id ответа: `uuid.UUID(id) if _is_uuid(id) else uuid.uuid4()`. Для реального Claude id не-UUID → подставлялся свежий `uuid4`. При этом `chat_steps.payload` реплеился дословно (raw `toolu_...`), а `tool_result.tool_use_id` строился из доменного `uuid4` → **рассогласование** → Anthropic `400` → backend `502`. Continuation ломался в production; unit-тесты не ловили, т.к. fake-клиент отдавал UUID-образный id.

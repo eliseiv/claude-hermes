@@ -136,16 +136,51 @@
   - continuation-виток к Anthropic выполняется **один раз** на закрытие барьера хода (дополнительно защищён `messageStepId`-идемпотентностью дебита, [ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)).
 - `result` валидируется по схеме соответствующего tool (см. ниже); несоответствие → `422`.
 
-## Классы tools: client-side vs server-side ([ADR-011](../../adr/ADR-011-server-side-tools.md))
+## Классы tools: client-side vs server-side ([ADR-011](../../adr/ADR-011-server-side-tools.md), [ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md))
+Три класса инструментов ([ADR-026 §1](../../adr/ADR-026-global-server-side-tools-and-time-now.md)):
 - **client-side** (`files.*`, `calendar.*`, `reminders.*`) — исполняет **iOS-клиент**: backend отдаёт `status=tool_call`,
   ждёт `tool_result` через `/v1/chat/tool-result`. Описаны в этом документе.
-- **server-side** (`site.*`, website-builder) — исполняет **backend** немедленно в tool-loop, формирует `tool_result` сам
-  и продолжает к Anthropic **без** round-trip к iOS; **НЕ** отдаётся клиенту как `status=tool_call`. Схемы и поведение —
+- **server-side, project-scoped** (`site.*`, website-builder, `SERVER_SIDE_TOOLS`) — исполняет **backend** немедленно в tool-loop, формирует `tool_result` сам
+  и продолжает к Anthropic **без** round-trip к iOS; **НЕ** отдаётся клиенту как `status=tool_call`. **Требует проекта.** Схемы и поведение —
   [modules/website-builder/02-api-contracts.md](../website-builder/02-api-contracts.md), [ADR-011](../../adr/ADR-011-server-side-tools.md).
-- Orchestrator различает класс по доменному имени (статический реестр `SERVER_SIDE_TOOLS = {site.*}`). domain↔anthropic
-  mapping (точка→подчёркивание) расширяется server-side именами (`site.write_file ↔ site_write_file`, …). Guard на число
-  server-side раундов — `MAX_SERVER_TOOL_ROUNDS` (дефолт 16).
-- **Гейтинг по наличию проекта ([ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md)):** `site.*` (`SERVER_SIDE_TOOLS`) предлагаются Claude **только** когда у сессии есть `project_id` (создана с `projectId`). В «чистом чате» (`chat_sessions.project_id IS NULL`) `site.*` в tool-набор **не включаются** — Claude их не видит и не вызывает. См. [03-architecture.md §Гейтинг tools](03-architecture.md#гейтинг-site-tools-по-наличию-проекта-adr-022).
+- **server-side, global** (`time.now`, `GLOBAL_SERVER_SIDE_TOOLS`, [ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md)) — исполняет **backend** немедленно в tool-loop (как `site.*`), но **НЕ требует проекта** и предлагается Claude **всегда** (включая «чистый чат» без проекта). В `toolCalls[]` наружу **НЕ** попадает. Контракт — [§`time.now`](#timenow--server-side-global-tool-adr-026) ниже.
+- Orchestrator различает класс по доменному имени (статические реестры `SERVER_SIDE_TOOLS = {site.*}`, `GLOBAL_SERVER_SIDE_TOOLS = {time.now}`, непересекающиеся). domain↔anthropic
+  mapping (точка→подчёркивание) расширяется server-side именами (`site.write_file ↔ site_write_file`, `time.now ↔ time_now`, …). Guard на число
+  server-side раундов — `MAX_SERVER_TOOL_ROUNDS` (дефолт 16) — общий для project-scoped и global server-side раундов.
+- **Гейтинг по наличию проекта ([ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md)):** `site.*` (`SERVER_SIDE_TOOLS`) предлагаются Claude **только** когда у сессии есть `project_id` (создана с `projectId`). В «чистом чате» (`chat_sessions.project_id IS NULL`) `site.*` в tool-набор **не включаются** — Claude их не видит и не вызывает. **`time.now` (`GLOBAL_SERVER_SIDE_TOOLS`) под этот гейт НЕ подпадает** — предлагается всегда ([ADR-026 §3](../../adr/ADR-026-global-server-side-tools-and-time-now.md)). См. [03-architecture.md §Гейтинг tools](03-architecture.md#гейтинг-site-tools-по-наличию-проекта-adr-022).
+
+## `time.now` — server-side global tool ([ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md))
+Инструмент текущей даты/времени. Исполняет **backend** в tool-loop (без round-trip к iOS, как `site.*`), но **БЕЗ проекта** — доступен в любом ходе, включая основной flow чат-агрегатора ([ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md)). Решает репорт «модель отвечает 2024 год»: системный промт статичен и не несёт даты, модель получает время только из результата `time.now`. Не мутирующий (нет `tool_mutation` audit). В `toolCalls[]` наружу не отдаётся (исполнен на бэке).
+
+### Args (`TimeNowArgs`, Pydantic v2, `extra="forbid"`)
+```json
+{ "tz": "Europe/Moscow" }
+```
+- `tz` (опц., `str | None`, default `null`) — IANA-имя зоны (напр. `Europe/Moscow`, `America/New_York`). Лимит длины `≤ 64` символа ([Q-026-1](../../99-open-questions.md)). При отсутствии → результат только в UTC.
+- `extra="forbid"`: любой иной ключ → ошибка валидации args.
+
+### Result
+```json
+{
+  "utc": "2026-06-10T14:23:05.123456+00:00",
+  "unix": 1781446985,
+  "weekday": "Wednesday",
+  "timezone": "Europe/Moscow",
+  "local": "2026-06-10T17:23:05.123456+03:00"
+}
+```
+- `utc` — **всегда**: текущее UTC, ISO8601 (RFC3339) с offset `+00:00`.
+- `unix` — **всегда**: целочисленный Unix timestamp (секунды, UTC).
+- `weekday` — **всегда**: английское имя дня недели по UTC-дате (`Monday`..`Sunday`).
+- `timezone` — **только** при заданном валидном `tz`: нормализованное IANA-имя.
+- `local` — **только** при заданном валидном `tz`: ISO8601 с локальным offset.
+- Без `tz` → `timezone`/`local` **опущены** (только UTC-набор).
+
+### Ошибки и инварианты
+- **Невалидный/неизвестный `tz`** (не парсится `zoneinfo` / `ZoneInfoNotFoundError` / длина > 64) → **tool-result error** `{"error":{"code":"invalid_timezone","message":"..."}}` (через `ToolExecution.error`), **НЕ** падение хода (не `422`, не `502`). Claude получает машиночитаемую ошибку и может повторить без `tz`/с корректной зоной; ход продолжается.
+- **UTC-набор от tz-базы не зависит** (вычисляется от `datetime.UTC`) и доступен всегда. Локальное время по `tz` требует tz-базы в образе — обеспечена pure-Python зависимостью `tzdata` ([TD-019](../../100-known-tech-debt.md) **Resolved 2026-06-10**, вариант A); `tz` в prod работает. Невалидная/мусорная зона по-прежнему деградирует к tool-result error `invalid_timezone` (резолв ловит `ZoneInfoNotFoundError`/`ValueError`/`OSError`).
+- **Биллинг:** раунд `time.now` не добавляет списаний — 1 кредит = 1 сообщение ([ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)); списание один раз на финальном `assistant_message`.
+- **Clock-провайдер:** время берётся через инъектируемый `Clock` (детерминизм qa, [ADR-026 §8](../../adr/ADR-026-global-server-side-tools-and-time-now.md), [06-testing-strategy.md](../../06-testing-strategy.md)), не прямой `datetime.now()`.
 
 ## Tools (backend ↔ iOS, client-side) — строго типизированные схемы
 Backend только инициирует tool-call; исполняет клиент. Все мутирующие tools (`files.write`, `files.mkdir`, `calendar.create_events`, `reminders.create`) → audit-запись. Server-side `site.write_file`/`site.delete` также мутирующие (audit) — см. website-builder.
@@ -196,7 +231,7 @@ Backend только инициирует tool-call; исполняет клие
 ---
 
 ## GET /v1/tools — каталог инструментов ([ADR-019](../../adr/ADR-019-tools-catalog-endpoint.md))
-Машиночитаемый каталог всех поддерживаемых backend tools (13). Источник — `src/app/chat/tools.py` (single source of truth: `_ARGS_BY_TOOL`, `MUTATING_TOOLS`, `SERVER_SIDE_TOOLS`, `anthropic_tool_definitions()`). Эндпоинт **не** параметризуется ни `assistantMode`, ни наличием проекта — возвращает полный технический реестр backend (включая `site.*`). Runtime-фильтрация tool-набора, предлагаемого Claude (гейтинг `site.*` по наличию `project_id`, [ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md); фильтрация по режиму, [Q-012-1](../../99-open-questions.md)), — concern tool-loop'а, а не каталога.
+Машиночитаемый каталог всех поддерживаемых backend tools (**14**, включая `time.now`, [ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md)). Источник — `src/app/chat/tools.py` (single source of truth: `_ARGS_BY_TOOL`, `MUTATING_TOOLS`, `SERVER_SIDE_TOOLS`, `GLOBAL_SERVER_SIDE_TOOLS`, `anthropic_tool_definitions()`). Эндпоинт **не** параметризуется ни `assistantMode`, ни наличием проекта — возвращает полный технический реестр backend (включая `site.*` и `time.now`). Runtime-фильтрация tool-набора, предлагаемого Claude (гейтинг `site.*` по наличию `project_id`, [ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md); фильтрация по режиму, [Q-012-1](../../99-open-questions.md)), — concern tool-loop'а, а не каталога. `time.now` предлагается всегда и в каталоге всегда присутствует.
 
 ### Auth
 - **JWT-protected** (как все `/v1/*`, кроме `/v1/preview/*`): `Authorization: Bearer <JWT>` обязателен. Каталог не секретен, но единообразие gateway-auth и снижение анонимного API-surface — обоснование в [ADR-019](../../adr/ADR-019-tools-catalog-endpoint.md). Клиент к этому моменту уже имеет JWT (получен через `/v1/auth/register`, [ADR-018](../../adr/ADR-018-embedded-auth-issuer.md)).
@@ -226,11 +261,11 @@ Backend только инициирует tool-call; исполняет клие
 - `name` — **доменное** имя с точкой (как в публичном iOS-контракте), НЕ anthropic-underscore (`files_read` — деталь Anthropic-транспорта, BUG-3).
 - `description` — из `descriptions` в `anthropic_tool_definitions()`.
 - `mutating` — `name ∈ MUTATING_TOOLS` (требует audit при исполнении).
-- `execution` — `"server"` если `name ∈ SERVER_SIDE_TOOLS` (`site.*`, исполняет backend, [ADR-011](../../adr/ADR-011-server-side-tools.md)); иначе `"client"` (исполняет iOS).
+- `execution` — `"server"` если `name ∈ SERVER_SIDE_TOOLS ∪ GLOBAL_SERVER_SIDE_TOOLS` (`site.*` — [ADR-011](../../adr/ADR-011-server-side-tools.md); `time.now` — [ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md); исполняет backend); иначе `"client"` (исполняет iOS).
 - `inputSchema` — JSON Schema args (`_ARGS_BY_TOOL[name].model_json_schema()`).
 - Порядок — детерминированный (по `_ARGS_BY_TOOL`).
 
-### Полный список (13)
+### Полный список (14)
 | name | execution | mutating |
 |---|---|---|
 | files.read | client | нет |
@@ -246,5 +281,8 @@ Backend только инициирует tool-call; исполняет клие
 | site.list | **server** | нет |
 | site.read | **server** | нет |
 | site.delete | **server** | **да** |
+| time.now | **server** (global, [ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md)) | нет |
+
+> `time.now` — единственный **global** server-side tool ([ADR-026](../../adr/ADR-026-global-server-side-tools-and-time-now.md)): `execution=server`, но в отличие от `site.*` **не требует проекта** и предлагается Claude всегда. domain↔anthropic: `time.now ↔ time_now`.
 
 **Коды:** `200`; `401` нет/невалидный JWT; `429` rate-limit.

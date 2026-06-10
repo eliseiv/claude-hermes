@@ -60,10 +60,10 @@ def _domain_names(*, include_server_side: bool) -> set[str]:
     return {to_domain_tool_name(d["name"]) for d in defs}
 
 
-def test_definitions_with_project_include_full_set_of_13() -> None:
+def test_definitions_with_project_include_full_set_of_14() -> None:
     names = _domain_names(include_server_side=True)
     assert names == set(ALL_TOOL_NAMES)
-    assert len(names) == 13
+    assert len(names) == 14  # ADR-026: +time.now
     # site.* present.
     assert names >= SERVER_SIDE_TOOLS
 
@@ -72,9 +72,10 @@ def test_definitions_without_project_exclude_site_tools() -> None:
     names = _domain_names(include_server_side=False)
     # No site.* at all.
     assert names.isdisjoint(SERVER_SIDE_TOOLS)
-    # Exactly the client-side complement (13 - 5 = 8).
+    # Exactly the complement of project-scoped site.* (ADR-026: time.now stays — global, not gated).
     assert names == set(ALL_TOOL_NAMES) - set(SERVER_SIDE_TOOLS)
-    assert len(names) == 8
+    assert len(names) == 9  # 8 client-side + time.now (14 - 5 site.*)
+    assert "time.now" in names
 
 
 def test_definitions_without_project_keep_all_client_side_tools() -> None:

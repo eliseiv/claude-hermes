@@ -21,6 +21,7 @@ from app.auth.service import AuthService
 from app.byok.kms import get_kms_client
 from app.byok.service import BYOKService
 from app.chat.anthropic_client import get_anthropic_client
+from app.chat.global_tools import GlobalToolHandlers, SystemClock
 from app.chat.orchestrator import ChatOrchestrator
 from app.chat.repository import ChatRepository
 from app.chats.repository import ChatsRepository
@@ -184,6 +185,9 @@ def get_orchestrator(session: DbSession) -> ChatOrchestrator:
         audit=audit,
         anthropic_client=get_anthropic_client(),
         site_tools=SiteToolHandlers(session, website, audit),
+        # ADR-026: global server-side tools (time.now) with the default SystemClock. Project-
+        # independent — no WebsiteService/session-context, wired alongside site_tools.
+        global_tools=GlobalToolHandlers(clock=SystemClock()),
         preferences=PreferencesService(session),
     )
 

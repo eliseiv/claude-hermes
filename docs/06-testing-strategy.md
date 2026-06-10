@@ -44,6 +44,26 @@
 | Вложения в `/chat/run` принимаются; `/chat/tool-result` их не принимает (`extra='forbid'`) | unit |
 | **E2E (реальный Anthropic):** image + PDF + text в одном сообщении → корректный assistant_message; подтверждает wire-совместимость `document`-блока на SDK 0.39.0 ([TD-016](100-known-tech-debt.md)). **Статус: обязателен, но пока НЕ выполнен — org Anthropic отключена (generation blocked); прогон обязателен сразу после восстановления org. До прогона live-совместимость PDF `document`-блока остаётся неподтверждённой (TD-016 открыт).** | e2e (`@pytest.mark.external`) |
 
+## Тест-кейсы инструмента `time.now` ([ADR-026](adr/ADR-026-global-server-side-tools-and-time-now.md))
+
+**Контракт Clock для qa (детерминизм).** `time.now` берёт время через инъектируемый `Clock` (Protocol с `now() -> datetime` timezone-aware UTC; дефолт `SystemClock`). Тесты подают `FixedClock(fixed_dt)` в `GlobalToolHandlers` → результат полностью детерминирован; **прямой `datetime.now()` в коде `time.now` запрещён** (иначе тест недетерминирован). qa проверяет точный JSON-шейп при фиксированном `fixed_dt`.
+
+| Тест | Уровень |
+|---|---|
+| Без `tz`: result = `{utc, unix, weekday}` (ISO8601 `+00:00`, целочисленный unix, верный день недели по `fixed_dt`); полей `local`/`timezone` НЕТ | unit |
+| С валидным `tz` (`Europe/Moscow`): дополнительно `local` (ISO8601 с offset зоны) + `timezone` (нормализованное имя); `utc`/`unix`/`weekday` соответствуют `fixed_dt` | unit |
+| Невалидный/неизвестный `tz` (`Mars/Phobos`, мусор) → `ToolExecution.error(code="invalid_timezone")`, НЕ исключение/падение хода; ход продолжается | unit |
+| `tz` длиннее лимита (`> 64`, [Q-026-1](99-open-questions.md)) → `invalid_timezone` (до резолва `zoneinfo`) | unit |
+| Args `extra=forbid`: лишний ключ в args → ошибка валидации (как у прочих tools) | unit |
+| Детерминизм: `FixedClock` → одинаковый результат при повторных вызовах; `SystemClock` (дефолт) даёт текущее время | unit |
+| Маршрутизация global server-side: `time.now` исполняется в tool-loop **без проекта** (`project_id IS NULL`) — `_external_project_id` НЕ вызывается, `assert external_project_id is not None` не срабатывает; в `toolCalls[]` наружу НЕ попадает; loop продолжается к Anthropic | integration |
+| `anthropic_tool_definitions(include_server_side=False)` (нет проекта) содержит `time.now`, НЕ содержит `site.*`; `GET /v1/tools` → 14 tools, `time.now`: `execution=server`, `mutating=false` | unit+integration |
+| Биллинг: сообщение с раундом(ами) `time.now` = 1 кредит (mode=credits) — server-side раунд не добавляет списаний | integration |
+| Системный промт (chat и code) содержит статичную time.now-инструкцию; промт стабилен между запросами (prompt cache не инвалидируется — дата НЕ в промте) | unit |
+| **E2E (реальный Anthropic):** запрос «какое сегодня число / какой день недели» в «чистом чате» без проекта → Claude вызывает `time.now`, отдаёт верную дату (не «2024») | e2e (`@pytest.mark.external`) |
+
+> **tzdata-зависимость ([TD-019](100-known-tech-debt.md) Resolved 2026-06-10).** Тесты локального времени (`tz` → `local`/`timezone`) требуют tz-базы в тестовом окружении. tz-база обеспечена pure-Python зависимостью `tzdata` (`pyproject.toml`/`uv.lock`), входящей и в dev-, и в prod-окружение → валидный `tz` резолвится в тестах и в prod. UTC-кейсы tz-базы не требуют.
+
 ## Политика моков
 - **PostgreSQL и Redis — реальные** (testcontainers). Не мокать БД.
 - **Anthropic API, App Store Server API, KMS** — мокаются (respx / fakes). Реальные вызовы только в отдельном `@pytest.mark.external` наборе (вне CI по умолчанию).

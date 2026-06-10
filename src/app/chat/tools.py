@@ -34,7 +34,13 @@ TOOL_SITE_LIST = "site.list"
 TOOL_SITE_READ = "site.read"
 TOOL_SITE_DELETE = "site.delete"
 
-# Tools whose execution lives entirely on the backend (no status=tool_call to iOS, ADR-011 §1).
+# Global server-side tool (time.now, ADR-026): executed by the backend, like site.*, but
+# project-INDEPENDENT — offered to Claude ALWAYS (including «чистый чат» with no project) and
+# routed before the project-scoped branch (no external_project_id, no has_project guard).
+TOOL_TIME_NOW = "time.now"
+
+# Project-scoped server-side tools (site.*, ADR-011/022): executed by the backend in the
+# tool-loop; offered to Claude ONLY when the session has a project (project_id IS NOT NULL).
 SERVER_SIDE_TOOLS = frozenset(
     {
         TOOL_SITE_WRITE_FILE,
@@ -44,6 +50,12 @@ SERVER_SIDE_TOOLS = frozenset(
         TOOL_SITE_DELETE,
     }
 )
+
+# Global (project-independent) server-side tools (ADR-026 §2). DISJOINT from SERVER_SIDE_TOOLS:
+# the two registries are mutually exclusive (invariant GLOBAL_SERVER_SIDE_TOOLS ∩ SERVER_SIDE_TOOLS
+# = ∅). Combined server-side = SERVER_SIDE_TOOLS ∪ GLOBAL_SERVER_SIDE_TOOLS; everything else in
+# ALL_TOOL_NAMES is client-side.
+GLOBAL_SERVER_SIDE_TOOLS = frozenset({TOOL_TIME_NOW})
 
 ALL_TOOL_NAMES = frozenset(
     {
@@ -56,6 +68,7 @@ ALL_TOOL_NAMES = frozenset(
         TOOL_REMINDERS_READ,
         TOOL_REMINDERS_CREATE,
         *SERVER_SIDE_TOOLS,
+        *GLOBAL_SERVER_SIDE_TOOLS,
     }
 )
 
@@ -82,6 +95,8 @@ _DOMAIN_TO_ANTHROPIC: dict[str, str] = {
     TOOL_SITE_LIST: "site_list",
     TOOL_SITE_READ: "site_read",
     TOOL_SITE_DELETE: "site_delete",
+    # Global server-side time.now (ADR-026 §2): same dot→underscore mapping.
+    TOOL_TIME_NOW: "time_now",
 }
 _ANTHROPIC_TO_DOMAIN: dict[str, str] = {a: d for d, a in _DOMAIN_TO_ANTHROPIC.items()}
 
@@ -230,6 +245,25 @@ class SiteDeleteArgs(_PathModel):
     pass
 
 
+# --- global server-side time.now (ADR-026) ---
+# Q-026-1: length cap for the optional tz arg (≤ 64 — longer than any valid IANA name). Enforced
+# in the handler (GlobalToolHandlers) so an over-limit tz becomes a tool-result error
+# `invalid_timezone` (the turn survives, ADR-026 §6) rather than a 422 of the turn. It is therefore
+# NOT a pydantic max_length constraint here (that would 422 the turn instead).
+TIME_NOW_TZ_MAX_LENGTH = 64
+
+
+class TimeNowArgs(_StrictModel):
+    """Args for time.now (ADR-026 §6): optional IANA timezone name (e.g. Europe/Moscow).
+
+    `extra='forbid'` (any other key → args validation error, like other tools). `tz` length and
+    IANA validity are checked in GlobalToolHandlers, not here — an invalid/over-long tz must degrade
+    to a tool-result error `invalid_timezone`, not fail the turn with 422 (Q-026-1, ADR-026 §6).
+    """
+
+    tz: str | None = None
+
+
 _ARGS_BY_TOOL: dict[str, type[_StrictModel]] = {
     TOOL_FILES_READ: FilesReadArgs,
     TOOL_FILES_WRITE: FilesWriteArgs,
@@ -244,6 +278,7 @@ _ARGS_BY_TOOL: dict[str, type[_StrictModel]] = {
     TOOL_SITE_LIST: SiteListArgs,
     TOOL_SITE_READ: SiteReadArgs,
     TOOL_SITE_DELETE: SiteDeleteArgs,
+    TOOL_TIME_NOW: TimeNowArgs,
 }
 
 
@@ -271,6 +306,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     TOOL_SITE_LIST: "List the files of the current website project.",
     TOOL_SITE_READ: "Read a file from the current website project by relative path.",
     TOOL_SITE_DELETE: "Delete a file from the current website project by relative path.",
+    TOOL_TIME_NOW: (
+        "Get the current date and time. Always returns UTC (ISO8601, unix timestamp, weekday). "
+        "Pass an optional IANA timezone 'tz' (e.g. 'Europe/Moscow') to also get the local time. "
+        "Call this whenever the request depends on the current date, time, or day of the week — "
+        "do not guess."
+    ),
 }
 
 
@@ -294,8 +335,8 @@ def tool_catalog() -> list[dict[str, Any]]:
 
     Single source of truth: iterates ``_ARGS_BY_TOOL`` (deterministic order). Each entry carries
     the dotted domain ``name`` (NOT the anthropic-underscore transport name), description,
-    ``mutating`` (name in MUTATING_TOOLS), ``execution`` ("server" for SERVER_SIDE_TOOLS else
-    "client") and ``inputSchema`` (the args JSON Schema).
+    ``mutating`` (name in MUTATING_TOOLS), ``execution`` ("server" for SERVER_SIDE_TOOLS ∪
+    GLOBAL_SERVER_SIDE_TOOLS else "client", ADR-026 §2) and ``inputSchema`` (the args JSON Schema).
     """
     catalog: list[dict[str, Any]] = []
     for name in _ARGS_BY_TOOL:
@@ -304,7 +345,11 @@ def tool_catalog() -> list[dict[str, Any]]:
                 "name": name,
                 "description": TOOL_DESCRIPTIONS[name],
                 "mutating": name in MUTATING_TOOLS,
-                "execution": "server" if name in SERVER_SIDE_TOOLS else "client",
+                "execution": (
+                    "server"
+                    if name in SERVER_SIDE_TOOLS or name in GLOBAL_SERVER_SIDE_TOOLS
+                    else "client"
+                ),
                 "inputSchema": tool_input_schema(name),
             }
         )
@@ -314,20 +359,27 @@ def tool_catalog() -> list[dict[str, Any]]:
 def anthropic_tool_definitions(*, include_server_side: bool = True) -> list[dict[str, Any]]:
     """Tool definitions for the Anthropic messages API (input_schema per tool).
 
-    ADR-022 (axis A — project presence): when ``include_server_side`` is False, server-side
-    ``site.*`` tools (``SERVER_SIDE_TOOLS``) are EXCLUDED from the offered set — Claude never sees
-    them and cannot call them. The orchestrator passes ``include_server_side=False`` for «чистый
-    чат» sessions (``chat_sessions.project_id IS NULL``) and ``True`` when a project is present.
+    ADR-022 (axis A — project presence): when ``include_server_side`` is False, PROJECT-SCOPED
+    server-side ``site.*`` tools (``SERVER_SIDE_TOOLS``) are EXCLUDED from the offered set — Claude
+    never sees them and cannot call them. The orchestrator passes ``include_server_side=False`` for
+    «чистый чат» sessions (``chat_sessions.project_id IS NULL``) and ``True`` when a project is
+    present.
+
+    ADR-026 §3: the ``include_server_side`` flag gates ONLY project-scoped ``SERVER_SIDE_TOOLS``
+    (``site.*``). GLOBAL server-side tools (``GLOBAL_SERVER_SIDE_TOOLS`` — ``time.now``) are NEVER
+    excluded by this flag — they are offered to Claude ALWAYS, with or without a project, in both
+    assistant_modes (utility tool, axis B does not filter it).
 
     Note (Q-012-1 — Open): the orthogonal assistant_mode filter (axis B) is NOT yet implemented in
     code. Until it is, the effective offer-set = this project_id gate over the current behavior
-    (all client-side tools always offered; site.* gated only by project presence). When axis B
-    lands, it composes by logical AND with this flag.
+    (all client-side tools always offered; site.* gated only by project presence; time.now always
+    offered). When axis B lands, it composes by logical AND with this flag (time.now stays exempt).
     """
     definitions: list[dict[str, Any]] = []
     for name in _ARGS_BY_TOOL:
         if not include_server_side and name in SERVER_SIDE_TOOLS:
-            # Axis A gate: drop site.* when the session has no project (ADR-022 §2).
+            # Axis A gate: drop project-scoped site.* when the session has no project (ADR-022 §2).
+            # GLOBAL_SERVER_SIDE_TOOLS (time.now) are deliberately NOT under this gate (ADR-026 §3).
             continue
         definitions.append(
             {

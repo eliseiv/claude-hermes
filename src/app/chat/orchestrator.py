@@ -27,8 +27,10 @@ from app.audit.service import (
 from app.byok.service import BYOKService
 from app.chat.anthropic_client import AnthropicAuthError, AnthropicClient, AnthropicResult
 from app.chat.attachments import prepare_attachments
+from app.chat.global_tools import GlobalToolHandlers
 from app.chat.repository import ChatRepository, derive_title
 from app.chat.tools import (
+    GLOBAL_SERVER_SIDE_TOOLS,
     MUTATING_TOOLS,
     SERVER_SIDE_TOOLS,
     anthropic_tool_definitions,
@@ -64,19 +66,30 @@ from app.website.tools import SiteToolHandlers
 
 logger = logging.getLogger("app.chat.orchestrator")
 
+# ADR-026 §7: static, date-FREE instruction telling Claude it has no built-in knowledge of the
+# current date/time and must call the time.now tool. Identical in both modes. It is STATIC (no date
+# is ever interpolated), so the system prompt stays stable between requests and the Anthropic prompt
+# cache (cache_control: ephemeral) is NOT invalidated — the date arrives only in the time.now
+# tool_result, outside the cached system prefix.
+_TIME_NOW_INSTRUCTION = (
+    "You do not have built-in knowledge of the current date or time. If the user's request "
+    "depends on the current date, time, or day of the week, call the time.now tool to get it; "
+    "do not guess."
+)
+
 # ADR-012: base system prompt selected by assistant_mode (chat vs code). Single source of truth
 # for each mode's prompt (no scattered hardcoding). The set of tools offered to Claude is
 # unchanged in this sprint (Q-012-1 default deferred); only the system prompt varies.
 _SYSTEM_PROMPT_CHAT = (
     "You are a helpful assistant integrated into an iOS app. You can call tools that the "
     "user's device executes locally (files, calendar, reminders). Use tools when needed and "
-    "respond concisely."
+    "respond concisely. " + _TIME_NOW_INSTRUCTION
 )
 _SYSTEM_PROMPT_CODE = (
     "You are a coding assistant integrated into an iOS app. Favor precise, technical answers: "
     "produce correct, idiomatic code with brief explanations. You can call tools that the "
     "user's device executes locally (files, calendar, reminders) and server-side site tools. "
-    "Use tools when needed and respond concisely."
+    "Use tools when needed and respond concisely. " + _TIME_NOW_INSTRUCTION
 )
 
 
@@ -168,6 +181,8 @@ class _Deps:
     audit: AuditService
     anthropic: AnthropicClient
     site_tools: SiteToolHandlers
+    # ADR-026: project-independent global server-side tools (time.now), executed without a project.
+    global_tools: GlobalToolHandlers
     preferences: PreferencesService
 
 
@@ -182,6 +197,7 @@ class ChatOrchestrator:
         anthropic_client: AnthropicClient,
         site_tools: SiteToolHandlers,
         preferences: PreferencesService,
+        global_tools: GlobalToolHandlers | None = None,
     ) -> None:
         self._session = session
         self._deps = _Deps(
@@ -191,6 +207,9 @@ class ChatOrchestrator:
             audit=audit,
             anthropic=anthropic_client,
             site_tools=site_tools,
+            # Default to a SystemClock-backed handler so existing callers keep working; the DI
+            # factory (deps.py) wires an explicit instance (ADR-026 §5).
+            global_tools=global_tools if global_tools is not None else GlobalToolHandlers(),
             preferences=preferences,
         )
 
@@ -328,10 +347,16 @@ class ChatOrchestrator:
             )
 
         # ADR-025 barrier: continuation only when ALL client-side tool_calls of this turn are
-        # completed/errored. Server-side site.* are executed on the backend and were completed in
-        # the run loop; the barrier considers only client-side calls.
+        # completed/errored. Server-side tools (project-scoped site.* AND global time.now,
+        # ADR-026 §4) are executed on the backend and were completed in the run loop; the barrier
+        # considers only client-side calls.
         turn_calls = await self._deps.repo.list_tool_calls_for_step(session_id, message_step_id)
-        client_calls = [tc for tc in turn_calls if tc.tool_name not in SERVER_SIDE_TOOLS]
+        client_calls = [
+            tc
+            for tc in turn_calls
+            if tc.tool_name not in SERVER_SIDE_TOOLS
+            and tc.tool_name not in GLOBAL_SERVER_SIDE_TOOLS
+        ]
         pending = [tc for tc in client_calls if tc.status not in ("completed", "errored")]
         if pending:
             # Barrier not closed → tell the client which results are still awaited. No Anthropic
@@ -883,9 +908,23 @@ class ChatOrchestrator:
                 )
             )
 
-            if tool_name in SERVER_SIDE_TOOLS:
+            if tool_name in GLOBAL_SERVER_SIDE_TOOLS:
+                # ADR-026 §4: global server-side (time.now) is routed BEFORE the project-scoped
+                # branch — executed immediately WITHOUT external_project_id and WITHOUT the
+                # has_project guard. «Нет проекта» is the normal mode here, not an anomaly.
+                await self._execute_global_server_side_tool(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message_step_id=message_step_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    args=validated_args,
+                    provider_tool_use_id=provider_tool_use_id,
+                )
+            elif tool_name in SERVER_SIDE_TOOLS:
                 # Invariant (ADR-022): reaching here implies has_project is True (the project-less
-                # site.* anomaly raised above), so external_project_id is a resolved string.
+                # site.* anomaly raised above), so external_project_id is a resolved string. The
+                # assert applies ONLY to project-scoped site.* (ADR-026 §4).
                 assert external_project_id is not None  # noqa: S101 - ADR-022 guard invariant
                 await self._execute_server_side_tool(
                     user_id=user_id,
@@ -949,6 +988,59 @@ class ChatOrchestrator:
             external_project_id=external_project_id,
             session_id=session_id,
         )
+        payload = execution.to_tool_result_payload()
+        status = "errored" if execution.is_error else "completed"
+        await self._deps.repo.complete_tool_call(
+            tool_call_id=tool_call_id,
+            status=status,
+            result=payload,
+        )
+        await self._deps.repo.add_step(
+            session_id=session_id,
+            message_step_id=message_step_id,
+            role="tool",
+            payload={
+                "toolCallId": str(tool_call_id),
+                "providerToolUseId": provider_tool_use_id,
+                "toolName": tool_name,
+                "result": payload.get("result"),
+                "error": payload.get("error"),
+            },
+        )
+        await self._deps.audit.record(
+            AuditEvent(
+                user_id=user_id,
+                session_id=session_id,
+                event_type=EVENT_TOOL_CALL_COMPLETED,
+                payload={
+                    "toolCallId": str(tool_call_id),
+                    "toolName": tool_name,
+                    "status": status,
+                },
+            )
+        )
+
+    async def _execute_global_server_side_tool(
+        self,
+        *,
+        user_id: uuid.UUID,
+        session_id: uuid.UUID,
+        message_step_id: uuid.UUID,
+        tool_call_id: uuid.UUID,
+        tool_name: str,
+        args: dict[str, Any],
+        provider_tool_use_id: str,
+    ) -> None:
+        """Execute a global server-side tool (time.now) on the backend (ADR-026 §4, §6).
+
+        Mirrors _execute_server_side_tool but is PROJECT-INDEPENDENT: no external_project_id is
+        resolved or passed (time.now is global). The tool_call is moved to status=completed
+        immediately (no client tool_result is awaited); the tool step stores providerToolUseId so
+        _build_messages replays the continuation with a consistent id pair (ADR-008). time.now is
+        NOT in MUTATING_TOOLS → no tool_mutation audit; only the standard tool_call_completed audit
+        is recorded. Billing is unchanged (server-side round adds no debit, ADR-006).
+        """
+        execution = await self._deps.global_tools.execute(tool_name=tool_name, args=args)
         payload = execution.to_tool_result_payload()
         status = "errored" if execution.is_error else "completed"
         await self._deps.repo.complete_tool_call(
