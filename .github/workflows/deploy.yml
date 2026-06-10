@@ -16,8 +16,8 @@
 #
 # MULTI-INSTANCE (ADR-017 §CI/CD INSTANCES-loop): same `dir:project` loop as ci.yml's gated deploy
 # job. claude-ios FIRST -> `-p claude-ios` == basename of /opt/claude-ios => NO-OP for the live
-# broadnova.shop (backward-compat). A clone (e.g. `avelyra:avelyra`) is added ONLY after its
-# /opt/avelyra is provisioned (clone .env + .secrets/) — not listed yet.
+# broadnova.shop (backward-compat). The second instance `avelyra:avelyra` (avelyraweb.shop) is
+# provisioned (clone .env + .secrets/) and is now in the loop.
 #
 # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
 #   SSH_HOST=87.239.135.154
@@ -74,9 +74,9 @@ jobs:
             set -euo pipefail
             # INSTANCES — space-separated `dir:project` list, claude-ios FIRST (ADR-017 §CI/CD
             # INSTANCES-loop). `-p claude-ios` == basename of /opt/claude-ios => no-op vs the
-            # previous no-`-p` deploy (backward-compat). Add a clone (" avelyra:avelyra") ONLY
-            # after /opt/avelyra is provisioned on the server.
-            INSTANCES="claude-ios:claude-ios"
+            # previous no-`-p` deploy (backward-compat). The second instance `avelyra:avelyra`
+            # (avelyraweb.shop) is provisioned on the server and is now in the loop.
+            INSTANCES="claude-ios:claude-ios avelyra:avelyra"
             for entry in $INSTANCES; do
               dir="${entry%%:*}"; proj="${entry##*:}"
               echo "[deploy] === instance dir=/opt/$dir project=$proj ==="

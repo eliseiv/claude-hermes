@@ -150,9 +150,9 @@ jobs:
   # loop over $INSTANCES, a space-separated `dir:project` list with claude-ios FIRST. For the live
   # instance `claude-ios:claude-ios` -> `-p claude-ios` is the SAME project name as the previous
   # deploy with no `-p` (basename of /opt/claude-ios) => a NO-OP for broadnova.shop (backward-
-  # compat). A second instance is added LATER (e.g. `avelyra:avelyra`) only after /opt/avelyra is
-  # provisioned on the server (clone .env + .secrets/ per docs/07-deployment.md §Процедура
-  # провижининга клона); it is intentionally NOT listed yet — /opt/avelyra does not exist.
+  # compat). The second instance `avelyra:avelyra` (avelyraweb.shop) is provisioned on the server
+  # (clone .env + .secrets/ per docs/07-deployment.md §Процедура провижининга клона) and is now in
+  # the loop, so every push to main auto-deploys BOTH instances.
   #
   # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
   #   SSH_HOST=87.239.135.154 / SSH_USER=root / SSH_PRIVATE_KEY (public half in server authorized_keys)
@@ -202,9 +202,10 @@ jobs:
             set -euo pipefail
             # INSTANCES — space-separated `dir:project` list, claude-ios FIRST (ADR-017 §CI/CD
             # INSTANCES-loop). `-p claude-ios` == basename of /opt/claude-ios => no-op vs the
-            # previous no-`-p` deploy (backward-compat for the live broadnova.shop). Add a clone
-            # (e.g. " avelyra:avelyra") ONLY after /opt/avelyra is provisioned on the server.
-            INSTANCES="claude-ios:claude-ios"
+            # previous no-`-p` deploy (backward-compat for the live broadnova.shop). The second
+            # instance `avelyra:avelyra` (avelyraweb.shop) is provisioned on the server, so each
+            # push to main auto-deploys BOTH instances.
+            INSTANCES="claude-ios:claude-ios avelyra:avelyra"
             for entry in $INSTANCES; do
               dir="${entry%%:*}"; proj="${entry##*:}"
               echo "[deploy] === instance dir=/opt/$dir project=$proj ==="
