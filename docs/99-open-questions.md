@@ -86,17 +86,24 @@
 
 **Cross-ref:** [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md), [07-deployment.md](07-deployment.md#маршрутизация-через-traefik-docker-labels), [07-deployment.md prod-checklist](07-deployment.md#prod-readiness-checklist-must-configure-before-launch).
 
-## Q-017-3 — выкат второго инстанса avelyraweb.shop (мульти-инстанс)
+## Q-017-3 — выкат второго инстанса avelyraweb.shop (мульти-инстанс) — Closed
 
-**Статус:** Open (операционный, не блокирует архитектуру) — 2026-06-10.
+**Статус:** **Closed / Resolved — 2026-06-10.** Второй инстанс `avelyra` (`avelyraweb.shop`) развёрнут на сервере и включён в `INSTANCES` обоих deploy-workflow. Живой broadnova.shop не затронут.
 
-Архитектура мульти-инстанса/клонирования зафиксирована ([ADR-017 §Мульти-инстанс](adr/ADR-017-shared-server-traefik-deploy.md), [07-deployment.md §Мульти-инстанс](07-deployment.md#мульти-инстанс--клонирование-сервиса)): `COMPOSE_PROJECT_NAME`-параметризация compose (дефолт `claude-ios`, инвариант обратной совместимости), clone `.env`-контракт, процедура провижининга, INSTANCES-loop в CI. Остаются **next-step операции devops** (не архитектурные решения):
-1. Параметризовать `docker-compose.prod.yml` через `${COMPOSE_PROJECT_NAME:-claude-ios}` (image + router/service-имена); проверить инвариант `compose config` для существующего `/opt/claude-ios/.env`.
-2. Добавить закомментированный `COMPOSE_PROJECT_NAME` в `.env.prod.example`.
-3. Внедрить `INSTANCES`-loop в deploy-job (`claude-ios:claude-ios` первым).
-4. Провизионить `/opt/avelyra` (git clone, свой `.env`, свежий JWT keypair в `.secrets/`, свежие секреты) и выкатить `-p avelyra`.
+**Итог выката (2026-06-10).** Все next-step операции devops выполнены и проверены ревью:
+1. `docker-compose.prod.yml` параметризован через `${COMPOSE_PROJECT_NAME:-claude-ios}` (image + Traefik router/service-имена); инвариант обратной совместимости проверен (`compose config` для существующего `/opt/claude-ios/.env` идентичен — broadnova не затронут).
+2. Закомментированный `COMPOSE_PROJECT_NAME` (дефолт `claude-ios`) добавлен в `.env.prod.example`.
+3. `INSTANCES`-loop внедрён в **оба** workflow (`ci.yml` gated deploy-job + ручной `deploy.yml`): `INSTANCES="claude-ios:claude-ios avelyra:avelyra"`, **claude-ios первым** (backward-compat no-op).
+4. `/opt/avelyra` провизионирован (git clone того же репо, свой `.env`, **свежий** JWT keypair в `/opt/avelyra/.secrets/`, **свежие** секреты `POSTGRES_PASSWORD`/`ANTHROPIC_API_KEY`/`ADMIN_API_SECRET`/`KMS_LOCAL_MASTER_KEY`/`PREVIEW_URL_SECRET`/`METRICS_SCRAPE_TOKEN`) и выкачен `-p avelyra`. `GET https://avelyraweb.shop/healthz` и `/docs` → `200`; round-trip auth зелёный; `broadnova.shop/healthz` → `200` (сосед не затронут).
 
-**Open-параметры (дефолты разумны, уточнение не блокирует):** имя project для второго инстанса (предложено `avelyra`); `JWT_AUDIENCE` клона (по умолчанию `claude-ios`, меняется только при отдельном iOS-приложении/bundle клона); режимы клона (`DOCS_ENABLED`/`STOREKIT_TEST_MODE`) — старт по аналогии с broadnova (staging), prod-блокеры из [prod-checklist](07-deployment.md#prod-readiness-checklist-must-configure-before-launch) применяются к каждому инстансу отдельно.
+**Изоляция (подтверждена).** Инстансы полностью изолированы по данным, секретам и JWT keypair: раздельные тома `avelyra_pgdata`/`claude-ios_pgdata`, раздельные `.secrets/`, у avelyra **собственные** секреты (не копии broadnova). Разделяются только внешняя сеть `web` + общий edge-Traefik (`/opt/edge`).
+
+**Зафиксированные параметры клона avelyra:**
+- `COMPOSE_PROJECT_NAME=avelyra`, `SERVICE_DOMAIN=avelyraweb.shop`, `JWT_ISSUER=https://avelyraweb.shop`, `JWT_AUDIENCE=claude-ios` (по умолчанию переиспользован — отдельного iOS-приложения/bundle у клона пока нет), `TRAEFIK_CERTRESOLVER=le` (общий резолвер).
+- **`ANTHROPIC_API_KEY` переиспользован по согласованию** (отступление от рекомендации «свой ключ на инстанс» — принято осознанно на старте; при росте нагрузки/раздельном биллинге развести по отдельным ключам).
+- **Staging-паритет с broadnova:** `DOCS_ENABLED=true` (Swagger доступен), `STOREKIT_TEST_MODE=true` (Apple prod-certs отложены, [Q-007-1](99-open-questions.md)/[TD-007](100-known-tech-debt.md)).
+
+**Остаточные prod-блокеры avelyra (must-configure-before-launch, применяются к КАЖДОМУ инстансу отдельно — см. [prod-checklist](07-deployment.md#prod-readiness-checklist-must-configure-before-launch)):** перед публичным запуском avelyra выключить staging-режимы — `DOCS_ENABLED=false`, `STOREKIT_TEST_MODE=false` + Apple prod-certs/реальный `APPSTORE_BUNDLE_ID`/заведённые IAP — и сконфигурировать собственный JWT signing key (свежая RSA-пара уже в `/opt/avelyra/.secrets/`). Это не блокирует staging — avelyra работает в staging-паритете с broadnova.
 
 **Cross-ref:** [ADR-017 §Мульти-инстанс](adr/ADR-017-shared-server-traefik-deploy.md), [07-deployment.md §Мульти-инстанс](07-deployment.md#мульти-инстанс--клонирование-сервиса), [07-deployment.md §CI/CD INSTANCES-loop](07-deployment.md#cicd-контракт-instances-loop-мульти-инстанс), [ADR-018](adr/ADR-018-embedded-auth-issuer.md) (per-instance JWT keypair).
 
