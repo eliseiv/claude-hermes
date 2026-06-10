@@ -11,19 +11,26 @@
 # The image is BUILT ON THE SERVER (`docker compose up -d --build`), not pulled
 # from a registry — there is no immutable registry tag in this scheme (ADR-017).
 #
-# Flow (per ADR-017): SSH to the server -> cd /opt/claude-ios -> git pull ->
-#   docker compose -f docker-compose.prod.yml run --rm migrate  (alembic upgrade head 0001->0004)
-#   docker compose -f docker-compose.prod.yml up -d --build      (rebuild + restart api)
-#   smoke: curl -fsS https://${SERVICE_DOMAIN}/healthz
+# Flow (per ADR-017): SSH to the server -> for each instance in $INSTANCES: cd /opt/<dir> ->
+#   git pull -> docker compose -p <proj> ... run --rm migrate -> ... up -d --build -> smoke /healthz.
+#
+# MULTI-INSTANCE (ADR-017 §CI/CD INSTANCES-loop): same `dir:project` loop as ci.yml's gated deploy
+# job. claude-ios FIRST -> `-p claude-ios` == basename of /opt/claude-ios => NO-OP for the live
+# broadnova.shop (backward-compat). A clone (e.g. `avelyra:avelyra`) is added ONLY after its
+# /opt/avelyra is provisioned (clone .env + .secrets/) — not listed yet.
 #
 # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
 #   SSH_HOST=87.239.135.154
 #   SSH_USER=root
 #   SSH_PRIVATE_KEY  (private key whose public half is in the server's ~/.ssh/authorized_keys)
-# Optional repo Variable (not a secret): SERVICE_DOMAIN=broadnova.shop (Q-017-1 resolved; used
-# for the public smoke check). If unset, the smoke step is skipped (e.g. before the A-record /
-# TLS cert exists on the first deploy) — see the `if: ${{ vars.SERVICE_DOMAIN != '' }}` guard
-# and the retry loop on the smoke step below, so a not-yet-ready DNS/cert does not fail deploy.
+#
+# PER-INSTANCE SMOKE (docs/07-deployment.md §CI/CD INSTANCES-loop: "Smoke-gate выполняется на
+# каждый инстанс по его SERVICE_DOMAIN"): the smoke check runs INSIDE the SSH loop, once per
+# instance, against the domain read from THAT instance's /opt/<dir>/.env (`SERVICE_DOMAIN=`).
+# It is NOT the global repo Variable `vars.SERVICE_DOMAIN` (which would only cover one domain
+# once a second instance like avelyra is added). Smoke is NON-FATAL (warning, not failure):
+# on a first deploy the A-record / Traefik Let's Encrypt cert may still be settling. If an
+# instance's .env has no SERVICE_DOMAIN, its smoke is skipped for that instance only.
 #
 # ROLLBACK (no registry/immutable tag): on the server, in /opt/claude-ios:
 #   git log --oneline -n 5                         # find the previous good commit
@@ -65,37 +72,47 @@ jobs:
           script_stop: true
           script: |
             set -euo pipefail
-            cd /opt/claude-ios
-            echo "[deploy] git pull"
-            git pull --ff-only
-            echo "[deploy] migrate (alembic upgrade head, chain 0001->0004)"
-            docker compose -f docker-compose.prod.yml --env-file .env run --rm migrate
-            echo "[deploy] build + restart (image built on the server)"
-            docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+            # INSTANCES — space-separated `dir:project` list, claude-ios FIRST (ADR-017 §CI/CD
+            # INSTANCES-loop). `-p claude-ios` == basename of /opt/claude-ios => no-op vs the
+            # previous no-`-p` deploy (backward-compat). Add a clone (" avelyra:avelyra") ONLY
+            # after /opt/avelyra is provisioned on the server.
+            INSTANCES="claude-ios:claude-ios"
+            for entry in $INSTANCES; do
+              dir="${entry%%:*}"; proj="${entry##*:}"
+              echo "[deploy] === instance dir=/opt/$dir project=$proj ==="
+              cd "/opt/$dir"
+              echo "[deploy] git pull"
+              git pull --ff-only
+              echo "[deploy] migrate (alembic upgrade head)"
+              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate
+              echo "[deploy] build + restart (image built on the server)"
+              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --build
+              # Per-instance public smoke check through Traefik (TLS + Host routing), against THIS
+              # instance's own SERVICE_DOMAIN read from its /opt/$dir/.env — NOT a single global
+              # domain (so a second instance is smoke-checked on its own domain, not claude-ios's).
+              # NON-FATAL: on a first deploy the A-record / Traefik Let's Encrypt cert may still be
+              # settling; retry 12 x 5s = 60s, then emit a ::warning:: instead of failing deploy.
+              # If this instance's .env has no SERVICE_DOMAIN, skip smoke for it only.
+              inst_domain="$(grep -E '^SERVICE_DOMAIN=' .env | head -n1 | cut -d= -f2- | tr -d '\"'"'"' ' || true)"
+              if [ -z "$inst_domain" ]; then
+                echo "::warning title=Smoke skipped ($proj)::no SERVICE_DOMAIN in /opt/$dir/.env — skipping smoke for this instance"
+              else
+                url="https://$inst_domain/healthz"
+                echo "[smoke:$proj] GET $url"
+                smoke_ok=0
+                for i in $(seq 1 12); do
+                  if curl -fsS --max-time 5 "$url" >/dev/null; then
+                    echo "[smoke:$proj] healthz OK"
+                    smoke_ok=1
+                    break
+                  fi
+                  echo "[smoke:$proj] not ready ($i/12) — retrying in 5s"
+                  sleep 5
+                done
+                if [ "$smoke_ok" -ne 1 ]; then
+                  echo "::warning title=Smoke /healthz not green ($proj)::$url did not return 200 within 60s. The deploy (migrate+build+up) for $proj succeeded; DNS/A-record propagation or Traefik's Let's Encrypt cert (resolver 'le') may still be settling on the first deploy. Re-run this workflow once they are ready."
+                fi
+              fi
+            done
             echo "[deploy] prune dangling build layers (best-effort)"
             docker image prune -f || true
-
-      # Public smoke check through Traefik (TLS + Host routing). SERVICE_DOMAIN is a repo
-      # Variable (not a secret), resolved to broadnova.shop. Skipped if unset (e.g. before the
-      # domain/A-record exists). NON-FATAL by design: the deploy itself (migrate + build + up)
-      # already succeeded above; on the FIRST deploy the A-record may not have propagated or
-      # Traefik's Let's Encrypt cert (resolver `le`) may still be issuing, which would make this
-      # transiently fail through no fault of the build. We retry (12 x 5s = 60s) and, if still
-      # not green, emit a ::warning:: instead of failing the workflow. Re-run the deploy (or just
-      # this workflow via workflow_dispatch) once DNS/cert settle to get a green smoke.
-      - name: Smoke check /healthz (public, through Traefik)
-        if: ${{ vars.SERVICE_DOMAIN != '' }}
-        run: |
-          set -uo pipefail
-          url="https://${{ vars.SERVICE_DOMAIN }}/healthz"
-          echo "[smoke] GET $url"
-          for i in $(seq 1 12); do
-            if curl -fsS --max-time 5 "$url" >/dev/null; then
-              echo "[smoke] healthz OK"
-              exit 0
-            fi
-            echo "[smoke] not ready ($i/12) — retrying in 5s"
-            sleep 5
-          done
-          echo "::warning title=Smoke /healthz not green::$url did not return 200 within 60s. The deploy (migrate+build+up) succeeded; DNS/A-record propagation or Traefik's Let's Encrypt cert (resolver 'le') may still be settling on the first deploy. Re-run this workflow once they are ready."
-          exit 0

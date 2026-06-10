@@ -86,6 +86,20 @@
 
 **Cross-ref:** [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md), [07-deployment.md](07-deployment.md#маршрутизация-через-traefik-docker-labels), [07-deployment.md prod-checklist](07-deployment.md#prod-readiness-checklist-must-configure-before-launch).
 
+## Q-017-3 — выкат второго инстанса avelyraweb.shop (мульти-инстанс)
+
+**Статус:** Open (операционный, не блокирует архитектуру) — 2026-06-10.
+
+Архитектура мульти-инстанса/клонирования зафиксирована ([ADR-017 §Мульти-инстанс](adr/ADR-017-shared-server-traefik-deploy.md), [07-deployment.md §Мульти-инстанс](07-deployment.md#мульти-инстанс--клонирование-сервиса)): `COMPOSE_PROJECT_NAME`-параметризация compose (дефолт `claude-ios`, инвариант обратной совместимости), clone `.env`-контракт, процедура провижининга, INSTANCES-loop в CI. Остаются **next-step операции devops** (не архитектурные решения):
+1. Параметризовать `docker-compose.prod.yml` через `${COMPOSE_PROJECT_NAME:-claude-ios}` (image + router/service-имена); проверить инвариант `compose config` для существующего `/opt/claude-ios/.env`.
+2. Добавить закомментированный `COMPOSE_PROJECT_NAME` в `.env.prod.example`.
+3. Внедрить `INSTANCES`-loop в deploy-job (`claude-ios:claude-ios` первым).
+4. Провизионить `/opt/avelyra` (git clone, свой `.env`, свежий JWT keypair в `.secrets/`, свежие секреты) и выкатить `-p avelyra`.
+
+**Open-параметры (дефолты разумны, уточнение не блокирует):** имя project для второго инстанса (предложено `avelyra`); `JWT_AUDIENCE` клона (по умолчанию `claude-ios`, меняется только при отдельном iOS-приложении/bundle клона); режимы клона (`DOCS_ENABLED`/`STOREKIT_TEST_MODE`) — старт по аналогии с broadnova (staging), prod-блокеры из [prod-checklist](07-deployment.md#prod-readiness-checklist-must-configure-before-launch) применяются к каждому инстансу отдельно.
+
+**Cross-ref:** [ADR-017 §Мульти-инстанс](adr/ADR-017-shared-server-traefik-deploy.md), [07-deployment.md §Мульти-инстанс](07-deployment.md#мульти-инстанс--клонирование-сервиса), [07-deployment.md §CI/CD INSTANCES-loop](07-deployment.md#cicd-контракт-instances-loop-мульти-инстанс), [ADR-018](adr/ADR-018-embedded-auth-issuer.md) (per-instance JWT keypair).
+
 ## Блокеры (для orchestrator)
 - ~~**Q-015-1 (покупка токенов × policy)**~~ — **Closed (2026-06-02, вариант б):** покупка токенов требует активной подписки (`403 subscription_required` до grant), [ADR-002](adr/ADR-002-access-policy-state-machine.md) без изменений. Требует backend-доработки: policy-guard перед `WalletService.grant` в token-purchase. См. [ADR-015 §Доступность](adr/ADR-015-consumable-token-iap.md).
 - **Q-016-2 (web search)** — блокирует **только** фичу веб-поиска: нет выбора провайдера → нет контракта server-side tool. Остальное расширение не блокирует.

@@ -1,7 +1,8 @@
 # ADR-017 — Deploy-топология: общий сервер за внешним Traefik + GitHub Actions SSH
 
-- **Статус:** Accepted (2026-06-02)
+- **Статус:** Accepted (2026-06-02; расширен 2026-06-10 разделом «Мульти-инстанс / клонирование сервиса»)
 - **Контекст ревизует:** [TD-005](../100-known-tech-debt.md) (зафиксирован VPS + Caddy-standalone). Не отменяет [ADR-001](ADR-001-stack-choice.md) (стек) и [ADR-010](ADR-010-backend-hosted-preview.md) (контракт reverse-proxy на `/v1/preview/*`).
+- **Расширение (2026-06-10):** добавлен паттерн мульти-инстанс / клонирования за общим Traefik (`COMPOSE_PROJECT_NAME`-параметризация, изоляция доменов/данных/секретов, per-instance JWT keypair). Playbook — [07-deployment.md §Мульти-инстанс](../07-deployment.md#мульти-инстанс--клонирование-сервиса). Связано с [Q-017-3](../99-open-questions.md).
 
 ## Контекст
 
@@ -64,6 +65,30 @@
 - `root`-доступ по SSH из CI — повышенный риск компрометации `SSH_PRIVATE_KEY`; ключ — только в GitHub Secrets, ротация при подозрении.
 
 **Закрытое тех-долговое последствие:** [TD-005](../100-known-tech-debt.md) обновлён — финальная схема = shared-server + Traefik + GitHub Actions SSH (не противоречит, уточняет deploy-target).
+
+## Расширение: мульти-инстанс / клонирование сервиса (2026-06-10)
+
+**Контекст расширения.** Тот же общий сервер `87.239.135.154` и тот же общий edge-Traefik (`/opt/edge`) должны обслуживать **несколько независимых инстансов** одного и того же кода claude-ios под **разными доменами** (первый — `broadnova.shop`, второй — `avelyraweb.shop`, DNS уже → `87.239.135.154`). Каждый инстанс — изолированный стек (свой `api`+`postgres`+`redis`, свои тома, свои секреты), маршрутизируемый своим `Host()`-правилом через общий Traefik. Паттерн портирован из соседнего сервиса lovable-ai и адаптирован под **простую** архитектуру claude-ios (нет build-фермы, egress-proxy, worker/beat, S3, host-dir провижининга — только `api`+`postgres`+`redis`+`migrate`+per-instance `.secrets/` JWT keypair).
+
+**Решение (расширяет п.1–9 выше, не отменяет их):**
+
+10. **Инстанс-префикс — единый ключ `COMPOSE_PROJECT_NAME`.** Имя docker-compose project задаётся флагом `-p <inst>` при деплое (приоритет Compose: CLI `-p` > `COMPOSE_PROJECT_NAME` env > top-level `name:` в файле > basename каталога). Это автоматически изолирует **сети, тома, контейнеры** инстанса под префиксом project-name.
+
+11. **Параметризация `docker-compose.prod.yml` (минимальная, через `${COMPOSE_PROJECT_NAME:-claude-ios}`):**
+    - **image-теги:** `image: ${COMPOSE_PROJECT_NAME:-claude-ios}-backend:prod` (сервисы `migrate`, `api`) — у каждого инстанса свой локально собранный образ, без коллизии тегов.
+    - **Traefik router/service-имена:** `traefik.http.routers.${COMPOSE_PROJECT_NAME:-claude-ios}.*` и `traefik.http.services.${COMPOSE_PROJECT_NAME:-claude-ios}.*` — уникальные имена роутера/сервиса в общем Traefik (иначе два инстанса с router-именем `claude-ios` затрут друг друга).
+    - **Host-правило:** `Host(\`${SERVICE_DOMAIN}\`)` — **уже** параметризовано (п.4), переопределяется через `.env` каждого инстанса.
+    - **cert-resolver:** `${TRAEFIK_CERTRESOLVER}` — **уже** параметризован (п.4), общий `le` для всех инстансов.
+
+12. **Инвариант обратной совместимости (КРИТИЧНО).** Любая новая параметризация **обязана** иметь дефолт = текущему захардкоженному значению (`claude-ios`). Формальный критерий: для существующего `/opt/claude-ios/.env` (без ключа `COMPOSE_PROJECT_NAME`) команда `docker compose -f docker-compose.prod.yml --env-file .env config` даёт **идентичный** результат до и после параметризации — те же project-name (`claude-ios`), image (`claude-ios-backend:prod`), router/service-имена (`claude-ios`), сети, тома. Иначе — регрессия живого прода broadnova.shop. Существующий деплой `docker compose -f docker-compose.prod.yml --env-file .env up -d` (БЕЗ `-p`) и новый `docker compose -p claude-ios -f ... up -d` должны быть эквивалентны (project-name `claude-ios` совпадает с basename `/opt/claude-ios`).
+
+13. **Изоляция и разделяемое.** Разделяется **только** внешняя сеть `web` + сам edge-Traefik (общие для всех сервисов сервера). Изоляция инстансов: разные `Host()` (по `SERVICE_DOMAIN`), уникальные router/service-имена (префикс project-name), отдельные `default`-сети и тома (`pgdata`/`redisdata` именуются `<project>_pgdata`), свои `.env` и `.secrets/`. Инстансы **не делят** БД, Redis, секреты, JWT keypair.
+
+14. **Per-instance секреты и JWT keypair.** Клон генерирует **свежие** секреты (не копии соседа): `POSTGRES_PASSWORD`, `ANTHROPIC_API_KEY`, `ADMIN_API_SECRET`, `KMS_LOCAL_MASTER_KEY`, `PREVIEW_URL_SECRET`, `METRICS_SCRAPE_TOKEN`, `STOREKIT_TEST_SECRET` (если test-mode) и **собственный RSA JWT keypair** в `/opt/<inst>/.secrets/` (`jwt_private.pem`+`jwt_public.pem`, `chown 10001:10001`, `chmod 640`, каталог `750`). `JWT_ISSUER=https://<домен>`, `SERVICE_DOMAIN=<домен>`, `TRUSTED_PROXY_IPS`=подсеть `web`. Это аналог host-dir провижининга lovable-ai, сведённый к одному `.secrets/`-каталогу.
+
+15. **CI/CD — INSTANCES-loop.** Существующий single-instance deploy-job переходит на итерацию по нормативному списку `INSTANCES` (формат `dir:project`, claude-ios **первым** для backward-compat). Поскольку `-p claude-ios` совпадает с текущим неявным project-name, добавление цикла — no-op для живого инстанса. Спецификация — [07-deployment.md §CI/CD: INSTANCES-loop](../07-deployment.md#cicd-контракт-instances-loop-мульти-инстанс).
+
+**Последствия расширения.** Плюсы: повторно используется один и тот же код/compose/CI для N доменов без форка; полная изоляция данных и секретов между инстансами; живой broadnova.shop не затрагивается (дефолты = текущие значения). Минусы/риски: сборка образа на сервере умножается на число инстансов (нагрузка при одновременном деплое); общий Traefik — единая точка отказа для всех доменов; операционная дисциплина обязательна (`-p` нельзя забыть — иначе клон затрёт тома/роутер claude-ios; свежие секреты нельзя копировать у соседа). Связано с [ADR-018](ADR-018-embedded-auth-issuer.md) (per-instance JWT keypair) и [Q-017-3](../99-open-questions.md) (статус выката avelyraweb.shop).
 
 ## Альтернативы
 

@@ -76,7 +76,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: claude-ios-backend:prod
+    # Multi-instance (ADR-017 §Мульти-инстанс): image tag is parameterised by
+    # ${COMPOSE_PROJECT_NAME:-claude-ios}. Default `claude-ios` == the previous hardcoded value
+    # (backward-compat invariant: `compose config` is identical for the existing /opt/claude-ios
+    # .env that does NOT set COMPOSE_PROJECT_NAME). A clone sets COMPOSE_PROJECT_NAME=<inst> in
+    # its .env (and deploys with `-p <inst>`), yielding `<inst>-backend:prod`.
+    image: ${COMPOSE_PROJECT_NAME:-claude-ios}-backend:prod
     restart: "no"
     env_file:
       - .env
@@ -92,7 +97,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: claude-ios-backend:prod
+    # Multi-instance (ADR-017 §Мульти-инстанс): same parameterised tag as `migrate`
+    # (${COMPOSE_PROJECT_NAME:-claude-ios}-backend:prod); default `claude-ios` keeps the
+    # existing `claude-ios-backend:prod` for the live broadnova.shop instance.
+    image: ${COMPOSE_PROJECT_NAME:-claude-ios}-backend:prod
     restart: unless-stopped
     env_file:
       - .env
@@ -144,18 +152,25 @@ services:
       # Host router. SERVICE_DOMAIN comes from .env (Q-017-1 resolved -> broadnova.shop; A-record
       # broadnova.shop -> 87.239.135.154 must exist before launch for Traefik's ACME challenge).
       # Backticks are required by Traefik's rule syntax.
-      - "traefik.http.routers.claude-ios.rule=Host(`${SERVICE_DOMAIN:?set SERVICE_DOMAIN in .env}`)"
+      #
+      # Multi-instance (ADR-017 §Мульти-инстанс): the router/service NAMES are parameterised by
+      # ${COMPOSE_PROJECT_NAME:-claude-ios} so each instance gets a UNIQUE Traefik router/service
+      # (avoids a name collision behind the SHARED Traefik). Default `claude-ios` == the previous
+      # hardcoded name -> identical labels for the live broadnova.shop instance (backward-compat).
+      # The rule VALUE (Host) and certresolver stay driven by SERVICE_DOMAIN/TRAEFIK_CERTRESOLVER
+      # per-instance .env (already parameterised — only the router name changed around them).
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-claude-ios}.rule=Host(`${SERVICE_DOMAIN:?set SERVICE_DOMAIN in .env}`)"
       # TLS via the websecure entrypoint (443), terminated by the external Traefik.
-      - "traefik.http.routers.claude-ios.entrypoints=websecure"
-      - "traefik.http.routers.claude-ios.tls=true"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-claude-ios}.entrypoints=websecure"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-claude-ios}.tls=true"
       # ACME cert resolver name: the resolver configured in the shared Traefik (/opt/edge) by the
       # server owner. Q-017-2 resolved -> `le` (it is the default resolver on the websecure
       # entrypoint, so this label is technically optional, but we set it EXPLICITLY for
       # robustness/clarity). Parameterised via TRAEFIK_CERTRESOLVER in .env (value `le`).
       # See .env.prod.example and infra/deploy/README.md.
-      - "traefik.http.routers.claude-ios.tls.certresolver=${TRAEFIK_CERTRESOLVER:?set TRAEFIK_CERTRESOLVER in .env (ACME resolver name from /opt/edge, resolved: le)}"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-claude-ios}.tls.certresolver=${TRAEFIK_CERTRESOLVER:?set TRAEFIK_CERTRESOLVER in .env (ACME resolver name from /opt/edge, resolved: le)}"
       # Traefik proxies inbound traffic to the container's internal port 8000 over `web`.
-      - "traefik.http.services.claude-ios.loadbalancer.server.port=8000"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-claude-ios}.loadbalancer.server.port=8000"
 
 networks:
   # External network shared with the Traefik edge-proxy. Created once on the server:
