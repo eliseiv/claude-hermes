@@ -15,7 +15,7 @@
 2. Контейнер `api` — в **внешней** docker-сети `web` (общая с Traefik, создана `docker network create web`) + `default` (внутренняя для PG/Redis).
 3. Маршрутизация — через **docker-labels** (Traefik service discovery), не через наш конфиг прокси.
 4. SSL/nginx/Caddy у нас **не настраивается** — TLS целиком ответственность Traefik. `postgres`/`redis` — только в `default`, без публикации портов.
-5. CI/CD — GitHub Actions → SSH на сервер → `cd /opt/<service> && git pull && docker compose up -d --build`.
+5. CI/CD — GitHub Actions → SSH на сервер → сборка/выкатка на сервере (build из исходников, не из registry). Принцип «build на сервере» неизменен; **детальный per-instance процесс** (`git pull --ff-only` → explicit `build` → `migrate` → `up -d --no-build` → readiness-gate; `set -uo pipefail` без `-e`, `script_stop: false`, `$FAILED`-аккумуляция, финальный `exit 1`) зафиксирован в [07-deployment.md §Процедура деплоя](../07-deployment.md#процедура-деплоя-github-actions--ssh) и [§CI/CD INSTANCES-loop](../07-deployment.md#cicd-контракт-instances-loop-мульти-инстанс) — источник истины операционной детали.
 
 ## Решение
 
@@ -41,7 +41,7 @@
    ```
    `certresolver` параметризован через `${TRAEFIK_CERTRESOLVER}` = **`le`** — имя ACME-резолвера общего Traefik (из `/opt/edge`; [Q-017-2](../99-open-questions.md), Closed 2026-06-02). `le` сделан **дефолтным** на entrypoint `websecure` (`--entrypoints.websecure.http.tls.certresolver=le`), поэтому label `tls.certresolver` **опционален** (сертификат выпускается автоматически для любого HTTPS-роутера); явный label рекомендован для надёжности. Домен — `${SERVICE_DOMAIN}` = **`broadnova.shop`** ([Q-017-1](../99-open-questions.md), Closed 2026-06-02).
 
-5. **CI/CD = GitHub Actions SSH workflow.** Сборка/выкатка на сервере: SSH → `cd /opt/<service>` → `git pull` → `docker compose up -d --build`. Образ собирается **на сервере** (build из исходников в `/opt/<service>`), а не пушится из registry. GitHub Secrets: `SSH_HOST=87.239.135.154`, `SSH_USER=root`, `SSH_PRIVATE_KEY`. `apply_release`-seam ([ADR-001]/инфра) специализируется под этот SSH-flow.
+5. **CI/CD = GitHub Actions SSH workflow.** Сборка/выкатка на сервере: SSH (`appleboy/ssh-action`, `script_stop: false`) → per-instance loop по `$INSTANCES` (`cd /opt/<dir>` → `git pull --ff-only` → explicit `docker compose build api migrate` → `run --rm migrate` → `up -d --no-build` → readiness-gate `${proj}-api-1` healthy → NON-FATAL smoke `/healthz`). Образ собирается **на сервере** (build из исходников в `/opt/<dir>`), а не пушится из registry. Remote-скрипт под `set -uo pipefail` **без `-e`** (loop обязан пройти все инстансы); реальные сбои копятся в `$FAILED`, финальный `exit 1` краснит job. `up -d --build` **заменён** на explicit build → migrate → `up --no-build` + readiness-gate, т.к. совмещённая команда отдавала транзиентный non-zero, обрывавший loop под прежним `set -e`. Детальный листинг и обоснование — [07-deployment.md §Процедура деплоя](../07-deployment.md#процедура-деплоя-github-actions--ssh) и [§CI/CD INSTANCES-loop](../07-deployment.md#cicd-контракт-instances-loop-мульти-инстанс). GitHub Secrets: `SSH_HOST=87.239.135.154`, `SSH_USER=root`, `SSH_PRIVATE_KEY`. `apply_release`-seam ([ADR-001]/инфра) специализируется под этот SSH-flow.
 
 6. **`/healthz`** — публичный endpoint `200` как алиас `GET /health` (для healthcheck Traefik и smoke). Контракт зафиксирован в [API-REFERENCE.md](../API-REFERENCE.md) и [api-gateway/02-api-contracts.md](../modules/api-gateway/02-api-contracts.md). Без auth.
 
@@ -56,7 +56,7 @@
 **Плюсы:**
 - Меньше нашей ответственности: TLS, ACME, edge-роутинг — на общем Traefik. Наш стек проще (нет proxy-контейнера, Caddyfile, certbot).
 - Совместное использование сервера с другими сервисами без конфликта портов (изоляция через сети + labels).
-- Деплой проще операционно: `git pull && docker compose up -d --build` по SSH из GitHub Actions.
+- Деплой операционно прост: `git pull --ff-only` + явные `docker compose build` / `run --rm migrate` / `up -d --no-build` на сервере по SSH из GitHub Actions (образ собирается на сервере, без registry; см. п.5 выше и [07-deployment.md §Процедура деплоя](../07-deployment.md#процедура-деплоя-github-actions--ssh)).
 
 **Минусы / риски:**
 - Сборка образа **на сервере** при каждом деплое (нет immutable registry-tag) → дольше выкатка, нагрузка на сервер при build, rollback — через `git checkout <prev-commit>` + rebuild, а не переключение тега. Зафиксировано в [07-deployment.md §Откат](../07-deployment.md#откат).

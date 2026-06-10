@@ -68,31 +68,70 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # Abort on the first failing command; -u catches unset vars.
-          script_stop: true
+          # NOTE: identical hardened logic to the gated deploy job in ci.yml. We do NOT trust the
+          # fused exit code of `compose up --build`; failures are managed explicitly so a real
+          # failure goes red but a transient/benign one does not falsely abort the INSTANCES loop.
+          # script_stop MUST be false. appleboy/ssh-action's `script_stop: true` injects `set -e`
+          # into the remote script REGARDLESS of the `set -uo pipefail` declared below — i.e. it
+          # would override our design and abort on the FIRST non-zero command. We deliberately do
+          # NOT want `-e`: the INSTANCES loop must run through ALL instances, recording per-instance
+          # failures in FAILED instead of bailing on the first one (which would drop avelyra).
+          # With script_stop:false the remote shell behaviour is governed solely by our own
+          # `set -uo pipefail` (note: NO `-e`). Loop resilience is therefore INTENTIONAL by design,
+          # not an accident of every failing command happening to be guarded.
+          # INVARIANT: a single instance's failure is captured in FAILED and does NOT abort the
+          # others; real failures are caught by explicit rc checks (`if ! build`, `if ! migrate`) +
+          # the api readiness gate, and the job goes RED via the final `exit 1` when FAILED is
+          # non-empty. That final `exit 1` is OUTSIDE any guard, so real failures always go red.
+          script_stop: false
           script: |
-            set -euo pipefail
-            # INSTANCES — space-separated `dir:project` list, claude-ios FIRST (ADR-017 §CI/CD
-            # INSTANCES-loop). `-p claude-ios` == basename of /opt/claude-ios => no-op vs the
-            # previous no-`-p` deploy (backward-compat). The second instance `avelyra:avelyra`
-            # (avelyraweb.shop) is provisioned on the server and is now in the loop.
+            set -uo pipefail   # NO `-e` on purpose — see script_stop note above (loop must visit ALL instances)
+            # INCIDENT (2026-06-10) ROOT CAUSE & FIX — see ci.yml deploy job for the full write-up.
+            # The combined `docker compose up -d --build` exited 1 right after api Started (BuildKit
+            # build + one-shot `migrate` dependency + api start fused into one exit code), aborting
+            # the loop under `set -e` before avelyra was reached, despite api being healthy. FIX:
+            # split into (1) build, (2) migrate, (3) up --no-build (rc not trusted), (4) readiness
+            # gate on api container health. Real failures (build/migrate/api-not-healthy) still go
+            # red; only the spurious `up --build` exit is no longer trusted. claude-ios behaviour is
+            # unchanged (same -p/images/labels; verified on the server).
+            #
+            # INSTANCES — `dir:project` list, claude-ios FIRST (ADR-017 §CI/CD INSTANCES-loop).
             INSTANCES="claude-ios:claude-ios avelyra:avelyra"
+            FAILED=""   # collect instances that REALLY failed; job goes red at the end if non-empty
             for entry in $INSTANCES; do
               dir="${entry%%:*}"; proj="${entry##*:}"
               echo "[deploy] === instance dir=/opt/$dir project=$proj ==="
-              cd "/opt/$dir"
-              echo "[deploy] git pull"
-              git pull --ff-only
-              echo "[deploy] migrate (alembic upgrade head)"
-              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate
-              echo "[deploy] build + restart (image built on the server)"
-              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --build
+              cd "/opt/$dir" || { echo "::error title=cd failed ($proj)::/opt/$dir missing"; FAILED="$FAILED $proj"; continue; }
+              echo "[deploy:$proj] git pull"
+              if ! git pull --ff-only; then
+                echo "::error title=git pull failed ($proj)::ff-only pull failed in /opt/$dir"; FAILED="$FAILED $proj"; continue
+              fi
+              echo "[deploy:$proj] build (image built on the server)"
+              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env build api migrate; then
+                echo "::error title=build failed ($proj)::docker compose build returned non-zero"; FAILED="$FAILED $proj"; continue
+              fi
+              echo "[deploy:$proj] migrate (alembic upgrade head)"
+              if ! docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate; then
+                echo "::error title=migrate failed ($proj)::alembic upgrade head returned non-zero"; FAILED="$FAILED $proj"; continue
+              fi
+              echo "[deploy:$proj] up -d --no-build (rc recorded, not trusted; readiness gate decides)"
+              up_rc=0
+              docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --no-build || up_rc=$?
+              echo "[deploy:$proj] up rc=$up_rc (informational)"
+              echo "[deploy:$proj] readiness gate: api container health"
+              ready=0
+              for i in $(seq 1 30); do
+                h="$(docker inspect "${proj}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
+                if [ "$h" = "healthy" ]; then echo "[deploy:$proj] api healthy ($i)"; ready=1; break; fi
+                echo "[deploy:$proj] api health=$h ($i/30) — retrying in 2s"; sleep 2
+              done
+              if [ "$ready" -ne 1 ]; then
+                echo "::error title=api not healthy ($proj)::api did not become healthy within ~60s (up rc=$up_rc). Last logs:"
+                docker logs "${proj}-api-1" --tail 40 2>&1 || true
+                FAILED="$FAILED $proj"; continue
+              fi
               # Per-instance public smoke check through Traefik (TLS + Host routing), against THIS
-              # instance's own SERVICE_DOMAIN read from its /opt/$dir/.env — NOT a single global
-              # domain (so a second instance is smoke-checked on its own domain, not claude-ios's).
-              # NON-FATAL: on a first deploy the A-record / Traefik Let's Encrypt cert may still be
-              # settling; retry 12 x 5s = 60s, then emit a ::warning:: instead of failing deploy.
-              # If this instance's .env has no SERVICE_DOMAIN, skip smoke for it only.
+              # instance's own SERVICE_DOMAIN read from its /opt/$dir/.env. NON-FATAL (warning).
               inst_domain="$(grep -E '^SERVICE_DOMAIN=' .env | head -n1 | cut -d= -f2- | tr -d '\"'"'"' ' || true)"
               if [ -z "$inst_domain" ]; then
                 echo "::warning title=Smoke skipped ($proj)::no SERVICE_DOMAIN in /opt/$dir/.env — skipping smoke for this instance"
@@ -110,9 +149,14 @@ jobs:
                   sleep 5
                 done
                 if [ "$smoke_ok" -ne 1 ]; then
-                  echo "::warning title=Smoke /healthz not green ($proj)::$url did not return 200 within 60s. The deploy (migrate+build+up) for $proj succeeded; DNS/A-record propagation or Traefik's Let's Encrypt cert (resolver 'le') may still be settling on the first deploy. Re-run this workflow once they are ready."
+                  echo "::warning title=Smoke /healthz not green ($proj)::$url did not return 200 within 60s. The deploy (build+migrate+up) for $proj succeeded and api is healthy in-container; public DNS/A-record propagation or Traefik's Let's Encrypt cert (resolver 'le') may still be settling on the first deploy. Re-run this workflow once they are ready."
                 fi
               fi
             done
             echo "[deploy] prune dangling build layers (best-effort)"
             docker image prune -f || true
+            if [ -n "$FAILED" ]; then
+              echo "::error title=Deploy failed::instance(s) failed:$FAILED"
+              exit 1
+            fi
+            echo "[deploy] all instances deployed and healthy"
