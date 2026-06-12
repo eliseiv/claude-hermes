@@ -66,6 +66,19 @@
 
 **Resolution (2026-06-10, решение пользователя = вариант A).** При `status=tool_call` `ChatResponse` (`/chat/run` и `/chat/tool-result`) **опционально** возвращает `assistantMessage` — текст из `text`-блоков **того же** assistant-шага, чей `tool_use` вернулся как `toolCall` (тот же шаг, на который указывает `stepId`, [ADR-023](adr/ADR-023-sync-ids-in-chat-response.md)). Значение = конкатенация/текст этих `text`-блоков; при их отсутствии `assistantMessage = null`/опущено. Backend перестаёт отбрасывать текст (`orchestrator.py:661`) и кладёт его в `assistantMessage`. Согласовано с нормализацией истории: текст в `GET /v1/chats/{id}` → `steps[].payload.content[]` того же шага (по `stepId`) — **тот же**. Изменение аддитивно/обратносовместимо: поле уже было опционально-nullable; меняется лишь то, что оно теперь может быть НЕ-null при `tool_call`; остальные поля `tool_call` (`toolCall` обязателен, `toolCall.id`/`name` доменные) не меняются. `assistantMessage` при `status=assistant_message` (финал) — без изменений; при `status=blocked` — `null`. Cross-ref: [ADR-024 §Decision п.3](adr/ADR-024-history-payload-domain-normalization.md), [chat-orchestrator/02-api-contracts.md §Response (200)](modules/chat-orchestrator/02-api-contracts.md#response-200), [chat-orchestrator/09-testing.md §ADR-024](modules/chat-orchestrator/09-testing.md), [API-REFERENCE.md §5](API-REFERENCE.md).
 
+## Открытые вопросы унификации контракта календаря ([ADR-027](adr/ADR-027-calendar-read-contract-alignment.md), 2026-06-11)
+
+| ID | Вопрос | Статус | Принятый дефолт (если есть) | Блокирует backend? |
+|---|---|---|---|---|
+| Q-027-1 | Перевести ли календарные `start`/`end` (`calendar.read` + `calendar.create_events`) на **tz-aware** ISO8601 (с offset / UTC) вместо naive local? | **Open — отложен** | **На MVP — naive local datetime без offset** (`"2026-06-11T09:00:00"`), как сложившийся де-факто формат `create_events`; `calendar.read` выровнен под него ([ADR-027 §Decision 2](adr/ADR-027-calendar-read-contract-alignment.md)). Tz-aware — будущее усиление **обоих** инструментов симметрично, отдельным ADR; iOS оперирует локальным временем устройства, на MVP достаточно. | Нет (MVP работает на naive local) |
+| Q-027-2 | Нужна ли миграция уже сохранённых сессий (исторические `tool_call` в `chat_steps`/`tool_calls` с прежними `startDate`/`endDate` date-only)? | **Closed (2026-06-11)** | **Миграция не требуется.** Исторические шаги хранят то, что было сгенерировано на момент записи; реплей/история (`GET /v1/chats/{id}`) отдаёт `tool_use.input` как есть — нормализация ([ADR-024](adr/ADR-024-history-payload-domain-normalization.md)) не переписывает имена/значения аргументов внутри payload. Влияние ограничено отображением старых шагов; новые вызовы используют `start`/`end` datetime. Backfill бессмыслен (date-only-значения корректны для своих исторических вызовов). | Нет (решено) |
+
+### Q-027-1 — tz-aware vs naive local для календаря
+Цель [ADR-027](adr/ADR-027-calendar-read-contract-alignment.md) — выровнять `calendar.read` под **существующий** формат `calendar.create_events` (naive local datetime), не реформируя create. Переход на tz-aware затронул бы оба инструмента и контракт create без необходимости на MVP. Если появятся кросс-таймзонные сценарии (события в чужой зоне, серверная нормализация времени) — вводить tz-aware **симметрично** для read и create отдельным ADR с явной конвенцией offset.
+
+### Q-027-2 — миграция исторических календарных вызовов (Closed)
+Решено: миграции нет. Старые `calendar.read`-вызовы с date-only `startDate`/`endDate` остаются в истории как есть и валидны для своих исторических ходов; нормализация истории ([ADR-024](adr/ADR-024-history-payload-domain-normalization.md)) их не трогает (переписывает только доменные имена инструментов и id-блоков, не содержимое `tool_use.input`). Замена контракта вступает в силу для **новых** вызовов после релиза iOS.
+
 ## Q-015-1 — продуктовое противоречие монетизации MVP (Closed)
 
 **Статус:** Closed — 2026-06-02, решение пользователя. **Выбран вариант (б): покупка токенов требует активной подписки** (докупка сверх месячного пакета).
@@ -115,6 +128,19 @@
 
 ### Q-026-1 — лимит длины `tz` и дефолтная таймзона (Closed 2026-06-10)
 Аргумент `tz` инструмента `time.now` ([ADR-026 §6](adr/ADR-026-global-server-side-tools-and-time-now.md)) — опциональный IANA-имя зоны. **Закрыт принятием дефолтов (реализованы):** длина `≤ 64` (`TIME_NOW_TZ_MAX_LENGTH = 64`, проверка в handler `GlobalToolHandlers`, не pydantic — over-limit → tool-result error, не 422 хода; защита от мусорного/раздутого ввода до резолва `zoneinfo`); дефолтная зона сервиса — **UTC** (без `tz` модель получает UTC-набор `utc`/`unix`/`weekday`; локальное `local`/`timezone` — только при явном валидном `tz`). Невалидный/длинный `tz` → tool-result error `invalid_timezone`, ход продолжается. [TD-019](100-known-tech-debt.md) (tz-база в prod-образе) — **Resolved** (зависимость `tzdata` добавлена), `tz` в prod работает; UTC работает всегда независимо.
+
+## Открытые вопросы аддитивных правок контракта iOS (2026-06-12, [ADR-028](adr/ADR-028-projectid-in-chat-list-and-server-tools-in-chat-response.md))
+
+| ID | Вопрос | Статус | Принятый дефолт (если есть) | Блокирует backend? |
+|---|---|---|---|---|
+| Q-028-1 | Формат `summary` элемента `serverTools[]` — единый компактный (`"ok"` для всех `completed`) ИЛИ доменный per-tool (например имя файла для `site.write_file`, weekday для `time.now`)? | **Closed (2026-06-12, дефолт = единый компактный формат, реализован)** | **Единый компактный формат (финальное MVP-решение):** `completed` → литерал `"ok"`, `errored` → короткий `error_code` (например `invalid_timezone`); обрезка до `_SUMMARY_MAX_CHARS=120`. **Без raw result, без `error_message`, без путей/URL/signed-token** (реализовано в `_server_tool_summary`, безопасность/размер — [ADR-028 §Решение 2](adr/ADR-028-projectid-in-chat-list-and-server-tools-in-chat-response.md)). Per-tool обогащение — отдельная задача по запросу, не MVP; контракт поля не меняется. | Нет (решено) |
+
+### Q-028-1 — формат `summary` для server-side инструментов (Closed 2026-06-12)
+**Статус:** Closed — реализация зафиксировала единый компактный формат, это и есть финальное MVP-решение. `serverTools[].summary` ([ADR-028](adr/ADR-028-projectid-in-chat-list-and-server-tools-in-chat-response.md)) — компактный индикатор итога, **не** канал доставки результата (полный результат — в истории `GET /v1/chats/{id}` после нормализации [ADR-024](adr/ADR-024-history-payload-domain-normalization.md)).
+
+**Принятое решение (дефолт, реализован в `_server_tool_summary`):** `summary` несёт **строго** один из двух вариантов — `completed` → литерал `"ok"`; `errored` → короткий машинный `error_code` (например `invalid_timezone`). **Никогда** не читаются и не попадают в ответ: raw result, `error_message`/детали ошибки, стектрейсы, пути, URL, signed-token (`site.*` может вернуть пути/URL/signed-token — они исключены by-design). Обрезка до `_SUMMARY_MAX_CHARS=120`.
+
+**Per-tool обогащение — отдельная будущая задача (не MVP).** Если iOS-UX потребует более информативного доменного per-tool-итога (без утечки секретов) — вводится отдельным уточнением/feature по реальной потребности; контракт поля (тип `string|null`, лимит 120, `status` ∈ {completed,errored}) при этом **не** меняется. Закрытие Q-028-1 дефолтом путь к обогащению не закрывает — это самостоятельная аддитивная правка при запросе.
 
 ## Блокеры (для orchestrator)
 - ~~**Q-015-1 (покупка токенов × policy)**~~ — **Closed (2026-06-02, вариант б):** покупка токенов требует активной подписки (`403 subscription_required` до grant), [ADR-002](adr/ADR-002-access-policy-state-machine.md) без изменений. Требует backend-доработки: policy-guard перед `WalletService.grant` в token-purchase. См. [ADR-015 §Доступность](adr/ADR-015-consumable-token-iap.md).

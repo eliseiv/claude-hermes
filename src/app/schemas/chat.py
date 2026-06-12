@@ -234,6 +234,31 @@ class ToolCallSchema(StrictModel):
     args: dict[str, Any] = Field(description="Аргументы вызова инструмента.")
 
 
+class ServerToolExecutionSchema(StrictModel):
+    """Одно server-side выполнение, выполненное backend за этот вызов /chat/run (ADR-028)."""
+
+    toolName: str = Field(
+        description=(
+            "Доменное имя инструмента с точкой (например `time.now`, `site.write_file`). "
+            "Совпадает с `name` из `/v1/tools` и `toolName` из `GET /v1/chats/{id}/steps`."
+        )
+    )
+    status: Literal["completed", "errored"] = Field(
+        description=(
+            "Итог выполнения: `completed` (успех) или `errored` (инструмент вернул ошибку; ход "
+            "при этом не падает)."
+        )
+    )
+    summary: str | None = Field(
+        default=None,
+        description=(
+            "Компактный человекочитаемый итог (≤120 символов). НЕ raw-результат: без путей, URL, "
+            "имён превью-файлов со signed-token и иных чувствительных данных. Полный результат — "
+            "только в истории `GET /v1/chats/{id}` (ADR-024)."
+        ),
+    )
+
+
 _BLOCK_REASON_DOC = (
     "Причина бизнес-блокировки (присутствует только при `status=blocked`). Значения:\n\n"
     "- `trial_used` — бесплатная пробная генерация использована, подписки нет. "
@@ -269,6 +294,10 @@ class ChatResponse(StrictModel):
 
     `messageStepId`/`stepId` присутствуют при `assistant_message`/`tool_call` и при
     `blocked`+`max_tokens`; `null` при policy-`blocked` (шаг/ход не создаются).
+
+    `serverTools` (ADR-028) — server-side выполнения (`site.*`/`time.now`) этого вызова; всегда
+    присутствует (возможно `[]`). Пустой при policy-`blocked`; может быть НЕпустым при
+    `blocked`+`max_tokens`.
     """
 
     status: Literal["assistant_message", "tool_call", "blocked"] = Field(
@@ -321,4 +350,15 @@ class ChatResponse(StrictModel):
     usage: dict[str, Any] | None = Field(
         default=None,
         description="Потребление токенов модели (при `assistant_message`/`tool_call`).",
+    )
+    serverTools: list[ServerToolExecutionSchema] = Field(
+        default_factory=list,
+        description=(
+            "Server-side инструменты (`site.*`, `time.now`), выполненные backend за ЭТОТ вызов "
+            "`/chat/run` (или один `/chat/tool-result`-continuation), в порядке выполнения "
+            "(ADR-028). Присутствует всегда: пустой `[]` — server-side не выполнялись (в т.ч. "
+            "policy-`blocked`, где tool-loop не запускался); при `blocked=max_tokens` может быть "
+            "НЕпустым (раунды до обрыва). client-side вызовы здесь НЕ перечисляются — они в "
+            "`toolCalls[]`. Информационное поле: на биллинг не влияет (ADR-006)."
+        ),
     )

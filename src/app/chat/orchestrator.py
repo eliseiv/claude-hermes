@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,9 +62,14 @@ from app.policy.loader import load_policy_state
 from app.preferences.service import PreferencesService
 from app.schemas.chat import AttachmentIn
 from app.wallet.service import WalletService
-from app.website.tools import SiteToolHandlers
+from app.website.tools import SiteToolHandlers, ToolExecution
 
 logger = logging.getLogger("app.chat.orchestrator")
+
+# ADR-028 Решение 2: hard cap for serverTools[].summary (same value as steps-view summary).
+# The summary is a COMPACT indicator only — it MUST NOT carry the raw tool result, paths, URLs,
+# preview signed-tokens or any secret. Anything longer is truncated to this length.
+_SUMMARY_MAX_CHARS = 120
 
 # ADR-026 §7: static, date-FREE instruction telling Claude it has no built-in knowledge of the
 # current date/time and must call the time.now tool. Identical in both modes. It is STATIC (no date
@@ -97,11 +102,39 @@ def _system_prompt_for(assistant_mode: str) -> str:
     return _SYSTEM_PROMPT_CODE if assistant_mode == "code" else _SYSTEM_PROMPT_CHAT
 
 
+def _server_tool_summary(execution: ToolExecution) -> str | None:
+    """Build the COMPACT serverTools[].summary for a server-side execution (ADR-028 Решение 2).
+
+    MVP default (Q-028-1): a single compact summary, NOT the raw result. completed → "ok";
+    errored → the short machine error code (e.g. "invalid_timezone"), never details/stacktraces.
+    The raw result/path/URL/signed-token NEVER appears here (it stays only in /chats history,
+    ADR-024). Defensively truncated to _SUMMARY_MAX_CHARS even though codes are already short.
+    """
+    if execution.is_error:
+        code = execution.error_code or "errored"
+        return code[:_SUMMARY_MAX_CHARS]
+    return "ok"
+
+
 @dataclass(frozen=True)
 class ToolCallOut:
     id: str
     name: str
     args: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ServerToolExecutionOut:
+    """One server-side tool execution of this /chat/run call (ADR-028 Решение 2).
+
+    tool_name is the DOMAIN dotted name (anthropic_client already reverse-maps tool_use.name to
+    domain before it reaches the orchestrator). summary is a COMPACT, already-truncated indicator
+    (≤ _SUMMARY_MAX_CHARS) and NEVER the raw result / path / URL / signed-token.
+    """
+
+    tool_name: str
+    status: str  # completed | errored
+    summary: str | None
 
 
 @dataclass(frozen=True)
@@ -131,6 +164,11 @@ class ChatRunOut:
     # both are set (the truncated assistant step IS created) and usage is present.
     message_step_id: uuid.UUID | None = None
     step_id: uuid.UUID | None = None
+    # ADR-028 Решение 2: server-side tools (site.* / time.now) executed by the backend during THIS
+    # /chat/run (or one /chat/tool-result continuation), in execution order. Always a list (possibly
+    # empty). Empty for policy-blocked (tool-loop never ran); may be NON-empty for
+    # blocked+max_tokens (server-side rounds could run before the final turn was truncated).
+    server_tools: list[ServerToolExecutionOut] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -582,6 +620,11 @@ class ChatOrchestrator:
         # A turn with any client-side tool returns status=tool_call to iOS as before. A pure
         # assistant turn is the final step. The loop is bounded by MAX_SERVER_TOOL_ROUNDS (§2).
         max_rounds = get_settings().max_server_tool_rounds
+        # ADR-028 Решение 2: accumulate the server-side tools executed across ALL rounds of THIS
+        # call (one /chat/run or one /chat/tool-result continuation), in execution order. Threaded
+        # into every terminal ChatRunOut of this loop so the client sees what ran, regardless of how
+        # the turn ended (assistant_message / client tool_call / max_tokens).
+        server_tools: list[ServerToolExecutionOut] = []
         # ADR-020: the FULL attachment content blocks are injected into the last user turn on the
         # first iteration ONLY; subsequent (tool-loop) iterations replay placeholders from
         # chat_steps. The override is consumed after the first iteration so heavy base64 is never
@@ -634,12 +677,15 @@ class ChatOrchestrator:
             # tool branch.
             if result.stop_reason == "max_tokens":
                 api_key = None
+                # ADR-028: blocked+max_tokens may carry NON-empty server_tools (server-side rounds
+                # could have run before the final turn was truncated).
                 return await self._handle_max_tokens(
                     user_id=user_id,
                     session_id=session_id,
                     message_step_id=message_step_id,
                     result=result,
                     usage=usage,
+                    server_tools=server_tools,
                 )
 
             if result.stop_reason == "tool_use" and result.tool_uses:
@@ -650,11 +696,14 @@ class ChatOrchestrator:
                     result=result,
                     usage=usage,
                     has_project=has_project,
+                    server_tools=server_tools,
                 )
                 # Persist the tool_use step + tool_calls + tool_results + audit (no billing here).
                 await self._session.commit()
                 if outcome.client_out is not None:
                     # A client-side tool is pending → hand off to iOS (drop the plaintext key).
+                    # server_tools carries any server-side tools executed in this same turn BEFORE
+                    # the client-side hand-off (ADR-028).
                     api_key = None
                     return outcome.client_out
                 # Pure server-side turn: results are persisted; continue the loop to Anthropic.
@@ -669,6 +718,7 @@ class ChatOrchestrator:
                 billing=billing,
                 result=result,
                 usage=usage,
+                server_tools=server_tools,
             )
 
         # Exceeded MAX_SERVER_TOOL_ROUNDS consecutive server-side rounds (ADR-011 §2): controlled
@@ -712,6 +762,7 @@ class ChatOrchestrator:
         billing: _BillingPlan,
         result: AnthropicResult,
         usage: dict[str, Any],
+        server_tools: list[ServerToolExecutionOut],
     ) -> ChatRunOut:
         # Final assistant_message. The assistant-step + billing (debit or trial flip) + audit are
         # committed together as one short transaction (atomicity per MAJOR-4 / CRITICAL-1).
@@ -772,6 +823,8 @@ class ChatOrchestrator:
             usage=usage,
             message_step_id=message_step_id,
             step_id=assistant_step.id,
+            # ADR-028: server-side tools executed in this /chat/run before the final assistant turn.
+            server_tools=list(server_tools),
         )
 
     async def _handle_max_tokens(
@@ -782,6 +835,7 @@ class ChatOrchestrator:
         message_step_id: uuid.UUID,
         result: AnthropicResult,
         usage: dict[str, Any],
+        server_tools: list[ServerToolExecutionOut],
     ) -> ChatRunOut:
         """Handle a max_tokens-truncated turn (ADR-025 A2): blocked(max_tokens), NO debit.
 
@@ -830,6 +884,9 @@ class ChatOrchestrator:
             usage=usage,
             message_step_id=message_step_id,
             step_id=truncated_step.id,
+            # ADR-028: server-side rounds may have run before the final turn hit max_tokens →
+            # surface them (this blocked row may be NON-empty, unlike policy-block).
+            server_tools=list(server_tools),
         )
 
     async def _handle_tool_use(
@@ -841,6 +898,7 @@ class ChatOrchestrator:
         result: AnthropicResult,
         usage: dict[str, Any],
         has_project: bool,
+        server_tools: list[ServerToolExecutionOut],
     ) -> _TurnOutcome:
         """Process a tool_use turn (ADR-008/011): persist tool_calls, branch server/client-side.
 
@@ -920,6 +978,7 @@ class ChatOrchestrator:
                     tool_name=tool_name,
                     args=validated_args,
                     provider_tool_use_id=provider_tool_use_id,
+                    server_tools=server_tools,
                 )
             elif tool_name in SERVER_SIDE_TOOLS:
                 # Invariant (ADR-022): reaching here implies has_project is True (the project-less
@@ -935,6 +994,7 @@ class ChatOrchestrator:
                     args=validated_args,
                     provider_tool_use_id=provider_tool_use_id,
                     external_project_id=external_project_id,
+                    server_tools=server_tools,
                 )
             else:
                 # Client-side: leave pending; surface in toolCalls[] (ADR-025).
@@ -957,6 +1017,9 @@ class ChatOrchestrator:
                     usage=usage,
                     message_step_id=message_step_id,
                     step_id=assistant_step.id,
+                    # ADR-028: any server-side tools executed in this turn BEFORE the client-side
+                    # hand-off are surfaced (snapshot — copy, not the live accumulator).
+                    server_tools=list(server_tools),
                 )
             )
         # Purely server-side turn → continue the loop (no hand-off to iOS).
@@ -973,6 +1036,7 @@ class ChatOrchestrator:
         args: dict[str, Any],
         provider_tool_use_id: str,
         external_project_id: str,
+        server_tools: list[ServerToolExecutionOut],
     ) -> None:
         """Execute a site.* tool on the backend and persist its tool_result (ADR-011 §1, §4).
 
@@ -980,6 +1044,8 @@ class ChatOrchestrator:
         The tool step stores the providerToolUseId so _build_messages replays the continuation with
         a consistent id pair (ADR-008). MUTATING audit (site.write_file/site.delete → tool_mutation)
         is recorded inside the handler, in this same transaction (audit/03-architecture).
+        ADR-028: append a COMPACT (status + summary, NO raw result/path/URL/token) entry to
+        server_tools for the /chat/run response.
         """
         execution = await self._deps.site_tools.execute(
             tool_name=tool_name,
@@ -990,6 +1056,15 @@ class ChatOrchestrator:
         )
         payload = execution.to_tool_result_payload()
         status = "errored" if execution.is_error else "completed"
+        # ADR-028 Решение 2: record the server-side execution (domain name, status, summary).
+        # _server_tool_summary deliberately ignores the raw payload — only "ok" / short error code.
+        server_tools.append(
+            ServerToolExecutionOut(
+                tool_name=tool_name,
+                status=status,
+                summary=_server_tool_summary(execution),
+            )
+        )
         await self._deps.repo.complete_tool_call(
             tool_call_id=tool_call_id,
             status=status,
@@ -1030,6 +1105,7 @@ class ChatOrchestrator:
         tool_name: str,
         args: dict[str, Any],
         provider_tool_use_id: str,
+        server_tools: list[ServerToolExecutionOut],
     ) -> None:
         """Execute a global server-side tool (time.now) on the backend (ADR-026 §4, §6).
 
@@ -1039,10 +1115,19 @@ class ChatOrchestrator:
         _build_messages replays the continuation with a consistent id pair (ADR-008). time.now is
         NOT in MUTATING_TOOLS → no tool_mutation audit; only the standard tool_call_completed audit
         is recorded. Billing is unchanged (server-side round adds no debit, ADR-006).
+        ADR-028: append a COMPACT (status + summary, NO raw result) entry to server_tools.
         """
         execution = await self._deps.global_tools.execute(tool_name=tool_name, args=args)
         payload = execution.to_tool_result_payload()
         status = "errored" if execution.is_error else "completed"
+        # ADR-028 Решение 2: record the time.now execution (domain name, status, compact summary).
+        server_tools.append(
+            ServerToolExecutionOut(
+                tool_name=tool_name,
+                status=status,
+                summary=_server_tool_summary(execution),
+            )
+        )
         await self._deps.repo.complete_tool_call(
             tool_call_id=tool_call_id,
             status=status,

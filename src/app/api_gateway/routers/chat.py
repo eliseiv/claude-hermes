@@ -20,6 +20,7 @@ from app.schemas.chat import (
     ChatResponse,
     ChatRunRequest,
     ChatToolResultRequest,
+    ServerToolExecutionSchema,
     ToolCallSchema,
 )
 
@@ -279,6 +280,11 @@ def _to_response(out: ChatRunOut) -> ChatResponse:
         if out.tool_calls is not None
         else None
     )
+    # ADR-028: server-side tools executed by the backend in this call (compact name/status/summary).
+    server_tools = [
+        ServerToolExecutionSchema(toolName=st.tool_name, status=st.status, summary=st.summary)
+        for st in out.server_tools
+    ]
     return ChatResponse(
         status=out.status,
         sessionId=out.session_id,
@@ -289,6 +295,7 @@ def _to_response(out: ChatRunOut) -> ChatResponse:
         toolCall=tool_call,
         blockReason=out.block_reason,
         usage=out.usage,
+        serverTools=server_tools,
     )
 
 

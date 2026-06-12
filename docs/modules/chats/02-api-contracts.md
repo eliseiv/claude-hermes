@@ -22,6 +22,7 @@
       "preview": "string (срез последнего сообщения)",
       "assistantMode": "chat | code",
       "isPinned": false,
+      "projectId": "string | null",
       "workspaceProjectId": "uuid | null",
       "updatedAt": "ISO8601"
     }
@@ -30,7 +31,9 @@
 }
 ```
 - Сортировка: `is_pinned DESC, updated_at DESC` (BR-CH-3).
-- Поле `workspaceProjectId` присутствует в ответе, но в **Спринте 1 всегда `null`**: колонка `chat_sessions.workspace_project_id` ещё не создана (отложена на **СПРИНТ 2**, [ADR-013](../../adr/ADR-013-workspace-projects-vs-website-builder.md)). Сервис хардкодит `null` до появления колонки.
+- **`projectId` (свободная строка, [ADR-028](../../adr/ADR-028-projectid-in-chat-list-and-server-tools-in-chat-response.md), аддитивно):** `= chat_sessions.project_id` — тот же свободный строковый идентификатор website-builder-проекта, что клиент передал в `POST /v1/chat/run` при создании сессии ([ADR-022](../../adr/ADR-022-optional-project-and-tool-gating.md)). Формат и семантика **идентичны** `projectId` из `/chat/run`. **`null` = «чистый чат»** — сессия создана без `projectId` (website-builder не активирован, `site.*` Claude не предлагались); это основной режим сервиса. Поле позволяет iOS в списке отличить проектные чаты от чистых без запроса истории.
+- **`projectId` ≠ `workspaceProjectId`** — независимые, не взаимозаменяемые поля ([ADR-013](../../adr/ADR-013-workspace-projects-vs-website-builder.md)): `projectId` — свободная строка website-builder (есть сейчас), `workspaceProjectId` — UUID рабочего пространства (Спринт 2). Оба присутствуют в ответе одновременно.
+- Поле `workspaceProjectId` присутствует в ответе, но в **Спринте 1 всегда `null`**: колонка `chat_sessions.workspace_project_id` ещё не создана (отложена на **СПРИНТ 2**, [ADR-013](../../adr/ADR-013-workspace-projects-vs-website-builder.md)). Сервис хардкодит `null` до появления колонки. **[ADR-028](../../adr/ADR-028-projectid-in-chat-list-and-server-tools-in-chat-response.md) его не трогает** — добавляется только `projectId`.
 - N+1 на `preview` (отдельный запрос на каждый чат страницы) — осознанный tech-debt [`TD-012`](../../100-known-tech-debt.md), приемлемо для текущего per-user масштаба.
 
 ## GET /v1/chats/{id}

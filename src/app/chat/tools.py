@@ -184,8 +184,8 @@ class FilesMkdirArgs(_PathModel):
 
 # --- calendar ---
 class CalendarReadArgs(_StrictModel):
-    startDate: str
-    endDate: str
+    start: str
+    end: str
     calendarId: str | None = None
 
 
@@ -289,8 +289,16 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     TOOL_FILES_WRITE: "Write a file on the user's device.",
     TOOL_FILES_LIST: "List files/directories on the user's device.",
     TOOL_FILES_MKDIR: "Create a directory on the user's device.",
-    TOOL_CALENDAR_READ: "Read calendar events in a date range.",
-    TOOL_CALENDAR_CREATE: "Create calendar events.",
+    TOOL_CALENDAR_READ: (
+        "Read calendar events within a time range. 'start' and 'end' are ISO8601 datetime "
+        "strings in local time without timezone offset, e.g. '2026-06-11T09:00:00'. For a "
+        "whole day use start at 00:00:00 and end at the next day 00:00:00 (end-exclusive). "
+        "Use the time.now tool if you do not know the current date."
+    ),
+    TOOL_CALENDAR_CREATE: (
+        "Create calendar events. Each event's 'start' and 'end' are ISO8601 datetime strings "
+        "in local time without timezone offset, e.g. '2026-06-11T09:00:00'."
+    ),
     TOOL_REMINDERS_READ: "Read reminders.",
     TOOL_REMINDERS_CREATE: "Create reminders.",
     TOOL_SITE_WRITE_FILE: (

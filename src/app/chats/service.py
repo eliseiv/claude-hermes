@@ -32,6 +32,9 @@ class ChatListItemView:
     preview: str | None
     assistant_mode: str
     is_pinned: bool
+    # ADR-028 Решение 1: website-builder project key (= chat_sessions.project_id, ADR-022).
+    # null = «чистый чат» (сессия создана без projectId). Независимо от workspace_project_id.
+    project_id: str | None
     workspace_project_id: uuid.UUID | None
     updated_at: datetime.datetime
 
@@ -118,6 +121,8 @@ class ChatsService:
                 preview=item.preview,
                 assistant_mode=item.session.assistant_mode,
                 is_pinned=item.session.is_pinned,
+                # ADR-028: website-builder project key from the session (free string, ADR-022).
+                project_id=item.session.project_id,
                 # workspace_project_id is a Sprint-2 column; not present yet → always null.
                 workspace_project_id=None,
                 updated_at=item.session.updated_at,

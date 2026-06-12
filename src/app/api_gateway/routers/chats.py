@@ -63,6 +63,7 @@ async def list_chats(
                 preview=item.preview,
                 assistantMode=item.assistant_mode,
                 isPinned=item.is_pinned,
+                projectId=item.project_id,
                 workspaceProjectId=item.workspace_project_id,
                 updatedAt=item.updated_at,
             )

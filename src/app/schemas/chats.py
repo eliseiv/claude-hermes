@@ -21,6 +21,14 @@ class ChatListItemSchema(StrictModel):
     )
     assistantMode: Literal["chat", "code"] = Field(description="Тип ассистента (chat|code).")
     isPinned: bool = Field(description="Закреплён ли чат.")
+    projectId: str | None = Field(
+        default=None,
+        description=(
+            "Идентификатор website-builder-проекта (= chat_sessions.project_id, ADR-022): "
+            "свободная строка, заданная при создании сессии. null = «чистый чат» (проект не "
+            "активирован). Независим от workspaceProjectId."
+        ),
+    )
     workspaceProjectId: uuid.UUID | None = Field(
         default=None,
         description="Привязка к рабочему пространству (или null).",
