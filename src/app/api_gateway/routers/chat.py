@@ -281,8 +281,14 @@ def _to_response(out: ChatRunOut) -> ChatResponse:
         else None
     )
     # ADR-028: server-side tools executed by the backend in this call (compact name/status/summary).
+    # ADR-030: toolCallId = domain tool_calls.id (uuid → str), correlates with /v1/chats/{id} steps.
     server_tools = [
-        ServerToolExecutionSchema(toolName=st.tool_name, status=st.status, summary=st.summary)
+        ServerToolExecutionSchema(
+            toolCallId=str(st.tool_call_id),
+            toolName=st.tool_name,
+            status=st.status,
+            summary=st.summary,
+        )
         for st in out.server_tools
     ]
     return ChatResponse(

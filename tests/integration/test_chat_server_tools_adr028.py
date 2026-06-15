@@ -47,6 +47,22 @@ async def _count(maker: async_sessionmaker[AsyncSession], sql: str, uid: uuid.UU
         return int(await s.scalar(text(sql), {"u": str(uid)}) or 0)
 
 
+def _assert_server_tool(
+    entry: dict[str, object], *, toolName: str, status: str, summary: object
+) -> None:
+    """Assert the legacy ADR-028 fields of a serverTools[] element while tolerating the additive
+    ADR-030 ``toolCallId`` (asserted to be a non-empty valid uuid). Using == on the whole dict broke
+    once ADR-030 added ``toolCallId``; this keeps the original intent and stays forward-compatible.
+    """
+    assert entry["toolName"] == toolName, entry
+    assert entry["status"] == status, entry
+    assert entry["summary"] == summary, entry
+    # ADR-030: every element carries a non-empty domain uuid toolCallId.
+    tcid = entry.get("toolCallId")
+    assert isinstance(tcid, str) and tcid, f"toolCallId must be a non-empty string: {entry}"
+    uuid.UUID(tcid)  # raises if not a valid uuid → test fails
+
+
 @pytest.fixture
 def preview_secret() -> object:
     # site.preview builds an HMAC-signed URL; a configured secret makes the raw result carry a
@@ -105,7 +121,10 @@ async def test_time_now_round_listed_completed_with_compact_summary(
     )
     body = r.json()
     assert body["status"] == "assistant_message", body
-    assert body["serverTools"] == [{"toolName": "time.now", "status": "completed", "summary": "ok"}]
+    assert len(body["serverTools"]) == 1
+    _assert_server_tool(
+        body["serverTools"][0], toolName="time.now", status="completed", summary="ok"
+    )
     # The compact summary must be tiny (≤ 120) and not the raw UTC/unix/weekday result dict.
     summary = body["serverTools"][0]["summary"]
     assert summary == "ok"
@@ -257,7 +276,10 @@ async def test_server_tools_present_when_turn_ends_in_client_tool_call(
     body = r.json()
     assert body["status"] == "tool_call", body
     # server-side executed before the hand-off is surfaced.
-    assert body["serverTools"] == [{"toolName": "time.now", "status": "completed", "summary": "ok"}]
+    assert len(body["serverTools"]) == 1
+    _assert_server_tool(
+        body["serverTools"][0], toolName="time.now", status="completed", summary="ok"
+    )
     # client-side stays in toolCalls[] (NOT in serverTools).
     assert [tc["name"] for tc in body["toolCalls"]] == ["files.read"]
     server_names = {e["toolName"] for e in body["serverTools"]}
@@ -316,7 +338,10 @@ async def test_max_tokens_after_server_round_has_non_empty_server_tools(
     assert body["status"] == "blocked"
     assert body["blockReason"] == "max_tokens"
     # Unlike policy-block: the server-side round that ran before truncation IS surfaced.
-    assert body["serverTools"] == [{"toolName": "time.now", "status": "completed", "summary": "ok"}]
+    assert len(body["serverTools"]) == 1
+    _assert_server_tool(
+        body["serverTools"][0], toolName="time.now", status="completed", summary="ok"
+    )
     # Credit NOT debited (truncated generation is free, ADR-025).
     assert (
         await _count(
@@ -404,7 +429,8 @@ async def test_tool_result_continuation_surfaces_its_server_tools(
     ).json()
     assert tr["status"] == "assistant_message", tr
     # The continuation's own server-side round (time.now) is surfaced on the continuation response.
-    assert tr["serverTools"] == [{"toolName": "time.now", "status": "completed", "summary": "ok"}]
+    assert len(tr["serverTools"]) == 1
+    _assert_server_tool(tr["serverTools"][0], toolName="time.now", status="completed", summary="ok")
 
 
 # ============================================================================================

@@ -237,6 +237,15 @@ class ToolCallSchema(StrictModel):
 class ServerToolExecutionSchema(StrictModel):
     """Одно server-side выполнение, выполненное backend за этот вызов /chat/run (ADR-028)."""
 
+    toolCallId: str = Field(
+        description=(
+            "Доменный идентификатор вызова инструмента (uuid4 = `tool_calls.id`) этого "
+            "server-side выполнения (ADR-030). Совпадает с `toolCallId` соответствующего "
+            "tool-шага в `GET /v1/chats/{id}` → `steps[].payload.toolCallId` (нормативный "
+            "инвариант корреляции). Тот же домен id, что у client-side `toolCalls[].id`; "
+            "НЕ provider-`toolu_...` (ADR-008)."
+        )
+    )
     toolName: str = Field(
         description=(
             "Доменное имя инструмента с точкой (например `time.now`, `site.write_file`). "

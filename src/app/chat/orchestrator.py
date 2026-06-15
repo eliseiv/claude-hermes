@@ -130,8 +130,14 @@ class ServerToolExecutionOut:
     tool_name is the DOMAIN dotted name (anthropic_client already reverse-maps tool_use.name to
     domain before it reaches the orchestrator). summary is a COMPACT, already-truncated indicator
     (≤ _SUMMARY_MAX_CHARS) and NEVER the raw result / path / URL / signed-token.
+
+    tool_call_id is the DOMAIN tool_calls.id (uuid4) of this server-side execution (ADR-030).
+    It equals the toolCallId of the matching tool step in GET /v1/chats/{id} (correlation
+    invariant) and is the same id domain as client-side toolCalls[].id — NOT the provider
+    toolu_... id (ADR-008).
     """
 
+    tool_call_id: uuid.UUID
     tool_name: str
     status: str  # completed | errored
     summary: str | None
@@ -1060,6 +1066,7 @@ class ChatOrchestrator:
         # _server_tool_summary deliberately ignores the raw payload — only "ok" / short error code.
         server_tools.append(
             ServerToolExecutionOut(
+                tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 status=status,
                 summary=_server_tool_summary(execution),
@@ -1123,6 +1130,7 @@ class ChatOrchestrator:
         # ADR-028 Решение 2: record the time.now execution (domain name, status, compact summary).
         server_tools.append(
             ServerToolExecutionOut(
+                tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 status=status,
                 summary=_server_tool_summary(execution),
