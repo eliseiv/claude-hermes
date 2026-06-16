@@ -309,7 +309,9 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     ),
     TOOL_SITE_PREVIEW: (
         "Get a temporary signed preview URL for the current website project. Optional 'entry' "
-        "selects the start file (default index.html)."
+        "selects the start file (default index.html). The returned `url` is an ABSOLUTE URL that "
+        "opens directly in a browser (signed token, no authentication). Use it exactly as "
+        "returned — do NOT change, shorten, or add a host/domain to it."
     ),
     TOOL_SITE_LIST: "List the files of the current website project.",
     TOOL_SITE_READ: "Read a file from the current website project by relative path.",

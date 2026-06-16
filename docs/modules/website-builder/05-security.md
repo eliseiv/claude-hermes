@@ -8,6 +8,11 @@ HTML/JS**, исполняемый в браузере. Базовое решен
   `ANTHROPIC_API_KEY`, `ADMIN_API_SECRET`. Только env / secret manager, никогда в коде/образе. Ротация: при смене секрета
   ранее выданные URL инвалидируются (приемлемо — TTL короткий).
 
+## Абсолютный preview-URL (ADR-031) — модель угроз НЕ меняется
+- С [ADR-031](../../adr/ADR-031-absolute-preview-url.md) `site.preview` отдаёт **абсолютный** URL `https://<SERVICE_DOMAIN>/v1/preview/...` вместо относительного пути (фикс галлюцинации хоста моделью).
+- Это **не ослабляет** контур: авторизация целиком в **подписи** (HMAC+TTL, owner-isolation ниже), **не в хосте**. Тот же signed token, тот же TTL, тот же path-traversal guard и content-type allowlist. preview-роутер `GET /v1/preview/...` и верификация **не изменены**.
+- `SERVICE_DOMAIN` — PUBLIC (доменное имя, уже в Traefik-лейблах), не секрет; добавление его в чтение app-config новых секретов не вводит.
+
 ## Signed URL (HMAC + TTL)
 - `token = base64url(exp) . base64url(HMAC_SHA256(PREVIEW_URL_SECRET, "projectId|ownerUserId|exp"))`.
 - Проверка: HMAC constant-time (`hmac.compare_digest`) + `exp` не истёк. Любое несовпадение/истечение → `403`.

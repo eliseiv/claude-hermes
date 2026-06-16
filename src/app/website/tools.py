@@ -29,6 +29,7 @@ from app.chat.tools import (
     TOOL_SITE_READ,
     TOOL_SITE_WRITE_FILE,
 )
+from app.config import get_settings
 from app.observability.metrics import site_file_write_total
 from app.website.service import SiteFileError, WebsiteService
 from app.website.signed_url import PreviewSecretMissingError, build_token
@@ -165,7 +166,14 @@ class SiteToolHandlers:
             signed = build_token(project_id=project.id, owner_user_id=user_id)
         except PreviewSecretMissingError as exc:
             return ToolExecution.error("preview_unavailable", str(exc))
-        url = f"/v1/preview/{project.id}/{signed.token}/{entry}"
+        # ADR-031: absolute URL on our domain so the model copies it verbatim and does not
+        # hallucinate a host. Normalization strips the trailing slash => no double slash before
+        # /v1/. Empty SERVICE_DOMAIN (dev) => relative fallback, no hardcoded localhost (TD-022).
+        domain = get_settings().normalized_service_domain()
+        if domain:
+            url = f"https://{domain}/v1/preview/{project.id}/{signed.token}/{entry}"
+        else:
+            url = f"/v1/preview/{project.id}/{signed.token}/{entry}"
         expires_at = datetime.datetime.fromtimestamp(signed.expires_at, tz=datetime.UTC).isoformat()
         return ToolExecution.ok({"url": url, "expiresAt": expires_at})
 

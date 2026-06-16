@@ -139,6 +139,10 @@ class Settings(BaseSettings):
     preview_max_files: int = Field(default=200, alias="PREVIEW_MAX_FILES")
     # Guard against an infinite server-side tool loop (ADR-011 §2).
     max_server_tool_rounds: int = Field(default=16, alias="MAX_SERVER_TOOL_ROUNDS")
+    # PUBLIC service host (not a secret; already in Traefik Host labels and .env.prod.example,
+    # ADR-017). Read here only to build the ABSOLUTE site.preview URL so the model copies it
+    # verbatim instead of hallucinating a host (ADR-031). Empty => relative fallback (dev).
+    service_domain: str = Field(default="", alias="SERVICE_DOMAIN")
 
     # --- Trusted reverse-proxy (X-Forwarded-For parsing, 07-deployment.md) ---
     # API runs behind a reverse-proxy / LB (TLS termination). Only trust XFF/X-Real-IP
@@ -292,6 +296,24 @@ class Settings(BaseSettings):
     def resolve_public_key(self) -> str:
         """Public RS256 verification key PEM (used by JwtVerifier and the JWKS endpoint)."""
         return self._resolve_pem(self.jwt_public_key_path, self.jwt_public_key)
+
+    def normalized_service_domain(self) -> str:
+        """Return SERVICE_DOMAIN as a bare host[:port] for the absolute preview URL (ADR-031).
+
+        Strips a leading http(s):// scheme (case-insensitive) and surrounding slashes so the
+        value is the same host regardless of how it is set (``broadnova.shop``,
+        ``https://broadnova.shop`` or ``broadnova.shop/``). Returns '' when unset/blank, which
+        the caller treats as "not configured" => relative fallback. Snapping the trailing slash
+        guarantees the assembled URL has no double slash before ``/v1/``.
+        """
+        value = self.service_domain.strip()
+        lowered = value.lower()
+        if lowered.startswith("https://"):
+            value = value[len("https://") :]
+        elif lowered.startswith("http://"):
+            value = value[len("http://") :]
+        value = value.strip("/")
+        return value
 
     def trusted_proxy_networks(self) -> tuple[_IpNetwork, ...]:
         """Parse TRUSTED_PROXY_IPS (comma-separated IPs/CIDRs) into networks.
