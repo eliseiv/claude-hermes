@@ -339,3 +339,34 @@ Backend только инициирует tool-call; исполняет клие
 - Контракт ответа провайдер-агностичен (один формат); наполнение — модели активного провайдера.
 
 **Коды:** `200`; `401` нет/невалидный JWT; `429` rate-limit.
+
+## GET /v1/presets — пресеты промтов ([ADR-035](../../adr/ADR-035-prompt-presets-endpoint.md))
+
+Источник для чипов-пресетов на главном экране чата iOS (экран 4). Тап по чипу подставляет `prompt` в композер. Набор и тексты меняются деплоем backend **без релиза iOS-приложения**. Провайдер/инстанс-агностично: идентичный ответ на всех 3 инстансах. Источник — статический реестр в коде (`src/app/chat/presets.py`, single source of truth, по образцу [`GET /v1/tools`](#get-v1tools--каталог-инструментов-adr-019)).
+
+### Auth
+- **JWT-protected** (как `GET /v1/tools`/`GET /v1/models`): `Authorization: Bearer <JWT>` обязателен. Каталог не секретен, контур авторизации единый. Per-user rate-limit как у прочих read-эндпоинтов (`enforce_other_limits`). Метод `GET` (read-only, без побочных эффектов: не создаёт сессию, не пишет ledger/audit).
+
+### Response (200)
+```json
+{
+  "presets": [
+    {
+      "id": "plan_week",
+      "title": "Plan Week",
+      "icon": "calendar",
+      "prompt": "Help me plan my upcoming week. Ask me about my priorities, deadlines, and commitments, then propose a balanced day-by-day schedule."
+    }
+  ]
+}
+```
+- `id` — стабильный slug (`[a-z0-9_]`, snake_case), уникален в наборе; стабилен между релизами.
+- `title` — отображаемое имя чипа.
+- `icon` — имя **SF Symbol** (например `calendar`, `doc.text`, `camera`); клиент рендерит `Image(systemName:)`, при отсутствии символа — клиентский fallback. Не emoji ([ADR-035 §4](../../adr/ADR-035-prompt-presets-endpoint.md)).
+- `prompt` — plain-text, подставляется в композер при тапе (без шаблонов/плейсхолдеров на старте).
+- Порядок элементов = порядок чипов на экране (детерминированный, порядок объявления в реестре). Все 4 поля обязательны и непусты.
+- Локализация отсутствует на старте — единый язык (EN), без `Accept-Language`-ветвления ([ADR-035 §5](../../adr/ADR-035-prompt-presets-endpoint.md), [Q-035-2](../../99-open-questions.md)).
+
+**Дефолтный набор (7, со скрина):** `plan_week` (Plan Week), `meeting_notes` (Meeting Notes), `tasks_from_photo` (Tasks from Photo), `design_brief` (Design Brief), `daily_review` (Daily Review), `summarize_text` (Summarize Text), `project_structure` (Project Structure) — тексты/иконки в [ADR-035 §3](../../adr/ADR-035-prompt-presets-endpoint.md).
+
+**Коды:** `200`; `401` нет/невалидный JWT; `429` rate-limit.

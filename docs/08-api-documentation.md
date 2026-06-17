@@ -128,18 +128,21 @@ OpenAPI-тексты (`summary`, `description` эндпоинтов, `Field(desc
 | `Auth` | `POST /v1/auth/register`, `POST /v1/auth/token`, `POST /v1/auth/refresh`, `GET /v1/auth/jwks` | none | Получение и обновление токена доступа. Точка входа для тестирования. |
 | `Chat` | `POST /v1/chat/run`, `POST /v1/chat/tool-result` | `bearerAuth` | Диалог с ассистентом и tool-loop (вызовы инструментов на устройстве). |
 | `Tools` | `GET /v1/tools` | `bearerAuth` | Каталог инструментов, доступных в tool-loop. |
+| `Models` | `GET /v1/models` | `bearerAuth` | Каталог доступных моделей активного провайдера для селектора модели ([ADR-034](adr/ADR-034-user-model-selection.md)). |
+| `Presets` | `GET /v1/presets` | `bearerAuth` | Пресеты промтов для чипов на главном экране чата ([ADR-035](adr/ADR-035-prompt-presets-endpoint.md)). |
 | `Policy` | `GET /v1/policy/effective` | `bearerAuth` | Эффективные права пользователя для UI (можно ли генерировать и почему нет). |
 | `Wallet` | `GET /v1/wallet`, `POST /v1/wallet/consume` | `bearerAuth` | Баланс кредитов и списание (1 кредит = 1 сообщение). |
 | `Subscription` | `POST /v1/subscription/sync` | `bearerAuth` | Синхронизация подписки StoreKit и начисление кредитов периода. |
 | `Tokens` | `POST /v1/tokens/purchase`, `GET /v1/tokens/products` | `bearerAuth` | Покупка пакетов токенов и каталог продуктов. |
 | `BYOK` | `POST /v1/byok/set`, `POST /v1/byok/toggle`, `POST /v1/byok/delete` | `bearerAuth` | Свой ключ Anthropic: сохранение, включение, удаление. |
+| `Admin` | `POST /v1/admin/wallet/grant`, `GET /v1/admin/wallet/{userId}` | `adminToken` | Операторские действия: начисление и просмотр кошелька. Авторизация — `X-Admin-Token`. |
+| `Preview` | `GET /v1/preview/{projectId}/{token}/{path}` | none | Публичная отдача сгенерированных сайтов по подписанной ссылке (авторизация в подписи, без JWT, [ADR-010](adr/ADR-010-backend-hosted-preview.md)). |
 | `Chats` | `GET/PATCH/DELETE /v1/chats[/{id}]` (+ `/{id}/steps`) | `bearerAuth` | История чатов: список, переименование, удаление, шаги. |
 | `Profile` | `GET/PATCH /v1/profile` | `bearerAuth` | Профиль пользователя. |
 | `Preferences` | `GET/PATCH /v1/preferences` | `bearerAuth` | Пользовательские настройки. |
-| `Admin` | `POST /v1/admin/wallet/grant`, `GET /v1/admin/wallet/{userId}` | `adminToken` | Операторские действия: начисление и просмотр кошелька. Авторизация — `X-Admin-Token`. |
 | `Health` | `GET /health`, `GET /healthz`, `GET /ready`, `GET /metrics` | none | Служебные проверки и метрики (без auth). `/healthz` — алиас `/health` ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)). |
 
-Каждый endpoint имеет ровно один тег из таблицы и security согласно колонке (R2). Порядок в `openapi_tags` = порядок сценария: `Auth`, `Chat`, `Tools`, `Policy`, `Wallet`, `Subscription`, `Tokens`, `BYOK`, `Chats`, `Profile`, `Preferences`, `Admin`, `Health`.
+Каждый endpoint имеет ровно один тег из таблицы и security согласно колонке (R2). Порядок в `openapi_tags` = фактический порядок в `_OPENAPI_TAGS` (`src/app/main.py`): `Auth`, `Chat`, `Tools`, `Models`, `Presets`, `Policy`, `Wallet`, `Subscription`, `Tokens`, `BYOK`, `Admin`, `Preview`, `Chats`, `Profile`, `Preferences`, `Health`.
 
 > Прочие модули расширения (workspaces, snippets, attachments, notifications — см. [карту маршрутов](modules/api-gateway/02-api-contracts.md)) получают собственные теги по тому же принципу: пользовательский JWT (`bearerAuth`), лаконичные тексты (R2ter), один тег на endpoint.
 
