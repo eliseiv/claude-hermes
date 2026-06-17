@@ -22,7 +22,7 @@
       "data": "<base64>"
     }
   ],
-  "context": { "any": "object (optional)" }
+  "context": { "codeLanguage": "Swift", "responseStyle": "concise (optional)" }
 }
 ```
 - `sessionId` отсутствует → создаётся новая сессия. На сессию фиксируются: `mode` (billing_mode, credits|byok — **способ оплаты**, [ADR-012](../../adr/ADR-012-assistant-mode-vs-billing-mode.md)), `assistantMode` (тип ассистента chat|code), `model` (опц., см. ниже), `projectId` (опц., см. ниже) и `workspaceProjectId` (привязка к рабочему пространству, [ADR-013](../../adr/ADR-013-workspace-projects-vs-website-builder.md)).
@@ -54,6 +54,22 @@
   - **Валидация (фокус ревью, [05-security.md](../../05-security.md)):** соответствие `type`/`mediaType` реальному содержимому по magic bytes; лимиты проверяются **до** декодирования base64; PDF — guard числа страниц (анти-bomb). URL-вложения запрещены (нет backend-fetch).
   - **Реплей/хранение ([ADR-020 §3](../../adr/ADR-020-inline-base64-attachments-mvp.md)):** на первом витке полные content-блоки отправляются Claude; в `chat_steps.payload` сохраняется **лёгкий текстовый плейсхолдер** (НЕ base64); на последующих tool-витках реплеится только плейсхолдер (тяжёлый контент не повторяется).
   - **Биллинг:** обычный chat-шаг (1 кредит, [ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md) без изменений); vision/PDF-токены входят в message-шаг, отдельной тарификации нет.
+<a id="context-adr-037"></a>
+- **`context` (опц., object, per-message, [ADR-037](../../adr/ADR-037-chatrunrequest-context-allowlist-injection.md)).** Доп-настройки **текущего хода** (не сессии). В отличие от session-fixed `mode`/`assistantMode`/`model`/`projectId`/`workspaceProjectId`, `context` присылается и применяется на **каждом** `/chat/run` и может меняться по ходу чата. **Не** хранится в `chat_sessions`, **миграции БД нет** — влияет на содержимое текущего user-сообщения, которое персистится как user-step (`chat_steps.payload`) → корректный replay.
+  - **Allowlist ключей** (всё остальное игнорируется; значения нормализуются `strip`, пустое после strip → ключ игнорируется):
+
+    | Ключ | Тип | Валидация |
+    |---|---|---|
+    | `codeLanguage` | str | непустой, ≤40 символов (свободная строка; язык программирования для code-режима) |
+    | `responseStyle` | str enum | `concise` \| `balanced` \| `detailed` (lower-case); вне набора → ключ игнорируется |
+    | `verbosity` | str enum | `low` \| `medium` \| `high` (lower-case); вне набора → ключ игнорируется |
+    | `tone` | str | непустой, ≤40 символов (свободная строка) |
+    | `locale` | str | непустой, ≤35 символов, символы `[A-Za-z0-9_-]` (BCP-47-подобный); вне класса → ключ игнорируется |
+
+  - **Поведение на невалидное (lenient).** Неизвестные ключи — **игнорируются** (forward-compat). Ключ с неверным типом/длиной/вне-enum/вне-символьного-класса значением — **этот ключ игнорируется**, остальные применяются; запрос **не** падает. Существующая size-валидация сохраняется: сериализованный `context` > `size_limit_context` (≤64KB) → **`422`** (грубо-битое/огромное тело); не-объект → `422` (StrictModel).
+  - **Куда инъектируется.** Backend собирает детерминированный компактный текст-блок (фикс. порядок ключей `codeLanguage, responseStyle, verbosity, tone, locale`, экранирование разделителей), напр. `[Conversation settings for this message: codeLanguage=Swift; responseStyle=concise; locale=ru-RU]`, и добавляет его к содержимому **user-сообщения turn0**: блок **лидирует**, затем `\n\n`, затем `message`. **НЕ в system-prompt** (prompt-кэш не ломается; нет повышения авторитета пользовательских данных, [05-security.md](../../05-security.md)). На continuation/`/chat/tool-result` повторно **не** подаётся (уже в истории хода).
+  - **Кэш-инвариант / провайдер-агностичность.** `system`+`tools` от `context` не зависят → prompt-кэш Anthropic не инвалидируется; блок — обычный текст в user-content → одинаково на Anthropic и OpenAI ([ADR-033](../../adr/ADR-033-llm-provider-abstraction.md)).
+  - **Обратная совместимость.** Без `context` / пустой объект / нет валидных ключей → user-сообщение = только `message` (поведение неизменно). Биллинг неизменен (1 кредит, [ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)). Расширение allowlist → [Q-037-1](../../99-open-questions.md); связь с `preferences.code_defaults` (вне scope) → [TD-028](../../100-known-tech-debt.md).
 - Size-лимиты: `message` ≤ 32KB, `context` ≤ 64KB (см. [05-security.md](../../05-security.md)). **Тело `/v1/chat/run` имеет повышенный transport-лимит** (`ATTACHMENT_REQUEST_BODY_LIMIT`, дефолт 12 MB) для inline base64-вложений — общий лимит `≤512KB` прочих роутов **не меняется**, повышение применяется только к роуту `/v1/chat/run` ([ADR-020](../../adr/ADR-020-inline-base64-attachments-mvp.md), [05-security.md](../../05-security.md)). Лимиты на вложения: одно ≤ `ATTACHMENT_MAX_BYTES_IMAGE` (дефолт 5 MB) / `ATTACHMENT_MAX_BYTES_DOCUMENT` (дефолт 8 MB), суммарно ≤ `ATTACHMENT_TOTAL_BYTES` (дефолт 10 MB).
 - При старте нового пользовательского message-шага Orchestrator генерирует `messageStepId` (UUID), персистирует его в `chat_steps.message_step_id` и `tool_calls.message_step_id`. Он един для всех tool-раундов шага (включая re-entry через `/chat/tool-result`) и используется как ключ идемпотентности credits-debit ([ADR-005](../../adr/ADR-005-idempotency-ledger.md), [ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)). `messageStepId` — внутренняя величина биллинга, не путать с gateway correlation `requestId` (`X-Request-Id`).
 

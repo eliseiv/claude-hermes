@@ -198,6 +198,14 @@
 
 > Q-036-* (детали): API-путь (`/v1/workspaces`), стратегия хранения (BYTEA, не attachments), инъекция, удаление (CASCADE/SET NULL), пагинация, биллинг — **закрыты решениями [ADR-036](adr/ADR-036-workspaces-implementation.md)**, не заводятся как открытые вопросы. Остаются только калибровка лимитов (Q-036-1) и усечение (Q-036-2 → [Q-013-1](#)).
 
+## Открытые вопросы `context` (2026-06-17, [ADR-037](adr/ADR-037-chatrunrequest-context-allowlist-injection.md))
+
+| ID | Вопрос | Статус | Принятый дефолт (если есть) | Блокирует backend? |
+|---|---|---|---|---|
+| Q-037-1 | Расширение allowlist `context`: доп. ключи (помимо `codeLanguage`/`responseStyle`/`verbosity`/`tone`/`locale`), перевод свободных строк (`codeLanguage`/`tone`) в enum, i18n служебного блока. | Open | Старт ([ADR-037 §1](adr/ADR-037-chatrunrequest-context-allowlist-injection.md)) — 5 ключей, реестр в коде; неизвестные ключи игнорируются (forward-compat). Расширение — аддитивно, без слома контракта. | Нет (реализуемо на текущем наборе) |
+
+> Связь `context` (per-message override) с серверными дефолтами `preferences.code_defaults` (как взаимодействуют, кто главнее) — **вне scope ADR-037**, зафиксировано как [TD-028](100-known-tech-debt.md).
+
 ## Блокеры (для orchestrator)
 - ~~**Q-015-1 (покупка токенов × policy)**~~ — **Closed (2026-06-02, вариант б):** покупка токенов требует активной подписки (`403 subscription_required` до grant), [ADR-002](adr/ADR-002-access-policy-state-machine.md) без изменений. Требует backend-доработки: policy-guard перед `WalletService.grant` в token-purchase. См. [ADR-015 §Доступность](adr/ADR-015-consumable-token-iap.md).
 - **Q-016-2 (web search)** — блокирует **только** фичу веб-поиска: нет выбора провайдера → нет контракта server-side tool. Остальное расширение не блокирует.

@@ -113,6 +113,101 @@ def _system_prompt_for(assistant_mode: str) -> str:
     return _SYSTEM_PROMPT_CODE if assistant_mode == "code" else _SYSTEM_PROMPT_CHAT
 
 
+# ADR-037 §1,§3: allowlist for ChatRunRequest.context — a fixed registry of known per-message
+# conversation settings, rendered into a compact text block prepended to the turn-0 user message.
+# The rendered key order is FIXED (the order below), independent of the request dict's key order
+# (deterministic block). Unknown keys are ignored (forward-compat); a key whose value fails its
+# per-key validation is dropped (lenient, NOT a 422). Free-string keys have a length cap; enum keys
+# must match a closed set; locale additionally enforces a character class. The whole context block
+# is INJECTED INTO THE USER MESSAGE (never the system prompt) — so the Anthropic prompt cache
+# (cache_control: ephemeral on system) is not invalidated and user data does not gain system
+# authority (05-security.md).
+_CONTEXT_FREE_STRING_MAX = {
+    "codeLanguage": 40,
+    "tone": 40,
+    "locale": 35,
+}
+_CONTEXT_ENUMS = {
+    "responseStyle": frozenset({"concise", "balanced", "detailed"}),
+    "verbosity": frozenset({"low", "medium", "high"}),
+}
+# locale: BCP-47-like, restricted character class to keep arbitrary text out of the block (§1).
+_CONTEXT_LOCALE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+# Deterministic render order (ADR-037 §3 = the allowlist-table order).
+_CONTEXT_KEY_ORDER = ("codeLanguage", "responseStyle", "verbosity", "tone", "locale")
+
+
+def _sanitize_context_value(value: str) -> str:
+    """Strip block-structure characters from a free-string value (ADR-037 §3 escaping).
+
+    Newlines / ``;`` / ``=`` would break the single-line ``k=v; k=v`` block structure, so they are
+    replaced with a space and the result is collapsed/stripped. Defensive against a value smuggling
+    its own delimiters into the conversation-settings block.
+    """
+    cleaned = value.replace("\n", " ").replace("\r", " ").replace(";", " ").replace("=", " ")
+    return " ".join(cleaned.split())
+
+
+def _validated_context_value(key: str, raw: Any) -> str | None:
+    """Validate+normalize one context value for ``key`` per ADR-037 §1; None → drop the key.
+
+    All values must be ``str`` and non-empty after ``strip``. Free-string keys are length-capped
+    (chars, post-strip) then sanitized; enum keys are lower-cased and must be in the closed set;
+    ``locale`` must match the restricted character class. A wrong type / out-of-range / out-of-enum
+    value yields None (the key is ignored — lenient, never a 422).
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    if key in _CONTEXT_ENUMS:
+        lowered = value.lower()
+        return lowered if lowered in _CONTEXT_ENUMS[key] else None
+    if key == "locale":
+        if len(value) > _CONTEXT_FREE_STRING_MAX["locale"]:
+            return None
+        if any(ch not in _CONTEXT_LOCALE_CHARS for ch in value):
+            return None
+        return value  # already constrained to a safe char class; no sanitize needed
+    if key in _CONTEXT_FREE_STRING_MAX:
+        if len(value) > _CONTEXT_FREE_STRING_MAX[key]:
+            return None
+        sanitized = _sanitize_context_value(value)
+        return sanitized or None
+    # Unknown key (not in any allowlist branch) → ignored by the caller's iteration over the fixed
+    # key order; this path is unreachable for keys in _CONTEXT_KEY_ORDER. Defensive None.
+    return None  # pragma: no cover
+
+
+def _render_context_block(context: dict[str, Any] | None) -> str | None:
+    """Render the deterministic per-message conversation-settings block (ADR-037 §3).
+
+    Returns None when ``context`` is absent/empty or no allowlisted key survives validation (→ the
+    turn behaves exactly as without ``context``). Otherwise returns a single-line block in FIXED key
+    order with only the valid present keys, e.g.::
+
+        [Conversation settings for this message: codeLanguage=Swift; responseStyle=concise]
+
+    Unknown keys are ignored; per-key-invalid values are dropped (lenient). The content of
+    ``context`` is NEVER logged (05-security.md) — this function neither logs nor raises.
+    """
+    if not context:
+        return None
+    parts: list[str] = []
+    for key in _CONTEXT_KEY_ORDER:
+        if key not in context:
+            continue
+        value = _validated_context_value(key, context[key])
+        if value is not None:
+            parts.append(f"{key}={value}")
+    if not parts:
+        return None
+    return f"[Conversation settings for this message: {'; '.join(parts)}]"
+
+
 def _system_prompt_with_workspace(assistant_mode: str, instructions: str | None) -> str:
     """Compose the system prompt for a workspace session (ADR-036 §3).
 
@@ -336,6 +431,7 @@ class ChatOrchestrator:
         attachments: list[AttachmentIn] | None = None,
         model: str | None = None,
         workspace_project_id: uuid.UUID | None = None,
+        context: dict[str, Any] | None = None,
     ) -> ChatRunOut:
         message_step_id = uuid.uuid4()  # CO-4b: billing key for this user message-step
         # ADR-034 §3: resolve the session-fixed model. None (no field) → NULL (= instance default,
@@ -414,12 +510,22 @@ class ChatOrchestrator:
         # chat_steps.payload (provider-agnostic). Raw base64 is NEVER persisted (storage invariant).
         # Validation runs BEFORE persisting the user step so a bad attachment (incl. PDF-on-OpenAI)
         # is a clean 422 with no DB write. The shared validation runs before the provider branch.
+        # ADR-037 §3,§4: build the per-message conversation-settings block from `context` and
+        # PREPEND it to the turn-0 user text (block leads, then "\n\n", then the user message). When
+        # no valid key survives validation → None → the text is the bare message (unchanged). The
+        # block is injected into the USER content here — the single common turn-0 assembly point
+        # BEFORE the provider client — never into `system` (prompt-cache invariant, ADR-037 §5) and
+        # provider-agnostically (plain text in user content works on both Anthropic and OpenAI). It
+        # is part of the persisted user-step payload below → correct replay; on continuation /
+        # tool-result it is NOT re-injected (it already lives in the history of this turn).
+        context_block = _render_context_block(context)
+        message_text = f"{context_block}\n\n{message}" if context_block is not None else message
         prepared: PreparedAttachments | None = None
-        user_payload_content: list[dict[str, Any]] = [{"type": "text", "text": message}]
+        user_payload_content: list[dict[str, Any]] = [{"type": "text", "text": message_text}]
         if attachments:
             prepared = prepare_attachments(attachments, get_settings(), _active_provider())
             user_payload_content = [
-                {"type": "text", "text": message},
+                {"type": "text", "text": message_text},
                 *prepared.placeholders,
             ]
 
