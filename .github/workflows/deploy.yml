@@ -16,8 +16,9 @@
 #
 # MULTI-INSTANCE (ADR-017 §CI/CD INSTANCES-loop): same `dir:project` loop as ci.yml's gated deploy
 # job. claude-ios FIRST -> `-p claude-ios` == basename of /opt/claude-ios => NO-OP for the live
-# broadnova.shop (backward-compat). The second instance `avelyra:avelyra` (avelyraweb.shop) is
-# provisioned (clone .env + .secrets/) and is now in the loop.
+# broadnova.shop (backward-compat). The other instances `avelyra:avelyra` (avelyraweb.shop),
+# `orvianix:orvianix` (orvianix.shop, OpenAI) and `veltrio:veltrio` (veltriohub.shop, OpenAI) are
+# provisioned (clone .env + .secrets/) and are in the loop.
 #
 # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
 #   SSH_HOST=87.239.135.154
@@ -96,9 +97,10 @@ jobs:
             # unchanged (same -p/images/labels; verified on the server).
             #
             # INSTANCES — `dir:project` list, claude-ios FIRST (ADR-017 §CI/CD INSTANCES-loop).
-            # 3rd instance `orvianix:orvianix` (orvianix.shop) is an OpenAI clone (ADR-033:
-            # LLM_PROVIDER=openai + OPENAI_* in its own .env); identical deploy/readiness/smoke.
-            INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix"
+            # 3rd instance `orvianix:orvianix` (orvianix.shop) and 4th `veltrio:veltrio`
+            # (veltriohub.shop) are OpenAI clones (ADR-033: LLM_PROVIDER=openai + OPENAI_* in their
+            # own .env); identical deploy/readiness/smoke.
+            INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio"
             FAILED=""   # collect instances that REALLY failed; job goes red at the end if non-empty
             for entry in $INSTANCES; do
               dir="${entry%%:*}"; proj="${entry##*:}"

@@ -150,9 +150,10 @@ jobs:
   # loop over $INSTANCES, a space-separated `dir:project` list with claude-ios FIRST. For the live
   # instance `claude-ios:claude-ios` -> `-p claude-ios` is the SAME project name as the previous
   # deploy with no `-p` (basename of /opt/claude-ios) => a NO-OP for broadnova.shop (backward-
-  # compat). The second instance `avelyra:avelyra` (avelyraweb.shop) is provisioned on the server
-  # (clone .env + .secrets/ per docs/07-deployment.md §Процедура провижининга клона) and is now in
-  # the loop, so every push to main auto-deploys BOTH instances.
+  # compat). The other instances `avelyra:avelyra` (avelyraweb.shop), `orvianix:orvianix`
+  # (orvianix.shop, OpenAI) and `veltrio:veltrio` (veltriohub.shop, OpenAI) are provisioned on the
+  # server (clone .env + .secrets/ per docs/07-deployment.md §Процедура провижининга клона) and are
+  # in the loop, so every push to main auto-deploys ALL instances.
   #
   # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
   #   SSH_HOST=87.239.135.154 / SSH_USER=root / SSH_PRIVATE_KEY (public half in server authorized_keys)
@@ -239,10 +240,11 @@ jobs:
             # INSTANCES-loop). `-p claude-ios` == basename of /opt/claude-ios => no-op vs the
             # previous no-`-p` deploy (backward-compat for the live broadnova.shop). The second
             # instance `avelyra:avelyra` (avelyraweb.shop) is provisioned on the server. The third
-            # instance `orvianix:orvianix` (orvianix.shop) is an OpenAI clone (ADR-033:
-            # LLM_PROVIDER=openai + OPENAI_* in its own /opt/orvianix/.env) — same code, same
-            # per-instance deploy/readiness/smoke; only its .env differs.
-            INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix"
+            # instance `orvianix:orvianix` (orvianix.shop) and the fourth `veltrio:veltrio`
+            # (veltriohub.shop) are OpenAI clones (ADR-033: LLM_PROVIDER=openai + OPENAI_* in their
+            # own /opt/<dir>/.env) — same code, same per-instance deploy/readiness/smoke; only their
+            # .env differs.
+            INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio"
             FAILED=""   # collect instances that REALLY failed; job goes red at the end if non-empty
             for entry in $INSTANCES; do
               dir="${entry%%:*}"; proj="${entry##*:}"
