@@ -391,14 +391,26 @@ async def test_injection_is_provider_agnostic_openai(
     db_sessionmaker: async_sessionmaker[AsyncSession],
     fake_anthropic: FakeAnthropicClient,
     restore_provider: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With provider=openai the orchestrator still injects the block into user content (turn-0).
 
     Injection happens in `orchestrator.run()` BEFORE the provider client, so it is identical for
     both providers. The persisted user-step payload (provider-agnostic, replayed to either provider)
     carries the block; this is the single source the active client serializes per provider.
+
+    Hermetic: with provider=openai the `get_llm_client` factory would otherwise build a REAL
+    `OpenAIClient` (its `create_message` hits the OpenAI network → 401 under a placeholder key in
+    CI). We mirror conftest's anthropic-singleton patch on the OpenAI seam: pin
+    `llm_client._openai_singleton` to the same faithful `LLMClient` double (`fake_anthropic`) so the
+    factory returns the fake on the openai path — no `OpenAIClient()` construction, no network. The
+    assertion is on the PROVIDER-INDEPENDENT persisted user-step (the injected block), so the fake's
+    Anthropic-shaped wire recording is irrelevant here. `monkeypatch` auto-restores the singleton.
     """
+    from app.chat import llm_client as llm_client_mod
+
     get_settings().llm_provider = "openai"
+    monkeypatch.setattr(llm_client_mod, "_openai_singleton", fake_anthropic, raising=False)
     async with db_sessionmaker() as s:
         uid = await seed_user(s, subscription="active", balance=5)
     fake_anthropic.responses = [fake_anthropic.text_result("ok")]
