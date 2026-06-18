@@ -208,6 +208,22 @@ def _render_context_block(context: dict[str, Any] | None) -> str | None:
     return f"[Conversation settings for this message: {'; '.join(parts)}]"
 
 
+def _compose_turn0_text(block: str | None, msg: str) -> str:
+    """Compose the turn-0 user text from the context block (ADR-037) and the message (ADR-039 §3).
+
+    Returns "" only when there is no text at all (empty/whitespace-only message AND no context
+    block) — the caller then omits the text block entirely (image-only / file-only turn, §2). A
+    whitespace-only message is treated as «no text» (``.strip()``, symmetric with the §1 validator)
+    so a blank text block is never sent to the provider. No trailing ``"\\n\\n"`` is produced when
+    the message is empty but a block is present.
+    """
+    if not msg.strip():
+        return block or ""
+    if block is not None:
+        return f"{block}\n\n{msg}"
+    return msg
+
+
 def _system_prompt_with_workspace(assistant_mode: str, instructions: str | None) -> str:
     """Compose the system prompt for a workspace session (ADR-036 §3).
 
@@ -532,16 +548,23 @@ class ChatOrchestrator:
         # provider-agnostically (plain text in user content works on both Anthropic and OpenAI). It
         # is part of the persisted user-step payload below → correct replay; on continuation /
         # tool-result it is NOT re-injected (it already lives in the history of this turn).
+        # ADR-039 §2,§3: compose the turn-0 user text (context block + message) and add the text
+        # block ONLY when the text is non-empty. For an image-only / file-only turn the text is ""
+        # and NO text block is created — a blank text block (text="") is never sent to the provider
+        # (Anthropic/OpenAI may reject it; the decision lives here, the single turn-0 assembly
+        # point, not in the clients). The validator (§1) guarantees the resulting content is
+        # non-empty: empty text ⇒ there is ≥1 attachment ⇒ ≥1 placeholder. Text block (if any)
+        # leads, then the attachment placeholders — order unchanged.
         context_block = _render_context_block(context)
-        message_text = f"{context_block}\n\n{message}" if context_block is not None else message
+        message_text = _compose_turn0_text(context_block, message)
         prepared: PreparedAttachments | None = None
-        user_payload_content: list[dict[str, Any]] = [{"type": "text", "text": message_text}]
         if attachments:
             prepared = prepare_attachments(attachments, get_settings(), _active_provider())
-            user_payload_content = [
-                {"type": "text", "text": message_text},
-                *prepared.placeholders,
-            ]
+        text_blocks: list[dict[str, Any]] = (
+            [{"type": "text", "text": message_text}] if message_text else []
+        )
+        placeholders = prepared.placeholders if prepared is not None else []
+        user_payload_content: list[dict[str, Any]] = [*text_blocks, *placeholders]
 
         # ADR-036 §6: merge the workspace knowledge-file blocks with the request's inline
         # attachment blocks (project context first). Only the request attachments leave a persisted

@@ -85,7 +85,10 @@ class ChatRunRequest(StrictModel):
             "сессии, поле запроса игнорируется."
         ),
     )
-    message: str = Field(min_length=1, description="Текст сообщения пользователя.")
+    message: str = Field(
+        default="",
+        description="Текст сообщения пользователя. Опционален при наличии хотя бы одного вложения.",
+    )
     mode: Literal["credits", "byok"] = Field(
         description=(
             "Режим тарификации: `credits` (кредиты подписки) или `byok` (свой ключ Anthropic). "
@@ -124,6 +127,12 @@ class ChatRunRequest(StrictModel):
         # validated in the orchestrator at session creation (needs settings.allowed_models()).
         if self.model is not None and not self.model.strip():
             raise ValueError("model must be a non-empty string when provided")
+        # ADR-039 §1: message is optional but the turn must carry content. Valid iff message is
+        # non-empty after strip OR at least one attachment is present in the request. A
+        # whitespace-only message with no attachment is also rejected (→ 422). The size limit below
+        # still applies (an empty string trivially passes); a non-empty message is unchanged.
+        if not self.message.strip() and not self.attachments:
+            raise ValueError("message or at least one attachment is required")
         settings = get_settings()
         if len(self.message.encode("utf-8")) > settings.size_limit_message:
             raise ValueError("message exceeds size limit")

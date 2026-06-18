@@ -9,7 +9,7 @@
   "userId": "uuid",
   "projectId": "string (optional)",
   "sessionId": "uuid (optional)",
-  "message": "string",
+  "message": "string (optional, если есть ≥1 attachment — ADR-039)",
   "mode": "credits | byok",
   "assistantMode": "chat | code (optional)",
   "model": "string (optional)",
@@ -45,6 +45,11 @@
   - **Resume-сессия:** `workspaceProjectId` берётся из сессии; поле запроса при resume **игнорируется** (не ошибка). Файлы заново не инжектируются (turn-0-only); `instructions` подаются в `system` на каждом ходе через тот же helper (включая чаты, **перенесённые** в workspace позже через `PATCH /v1/chats/{id}`, [ADR-038](../../adr/ADR-038-move-chat-to-workspace.md)).
   - **Изменение привязки существующего чата ([ADR-038](../../adr/ADR-038-move-chat-to-workspace.md)):** `workspaceProjectId` в `/chat/run` остаётся **session-fixed**. Перенести/сменить/убрать привязку у существующей сессии — через `PATCH /v1/chats/{id}` с полем `workspaceProjectId: uuid|null` ([chats/02-api-contracts.md](../chats/02-api-contracts.md#patch-v1chatsid)). `/chat/run` каналом смены привязки не является.
   - **Не путать** с `projectId` (website-builder, TEXT) — разные поля, разная семантика ([ADR-013](../../adr/ADR-013-workspace-projects-vs-website-builder.md)). Биллинг неизменен (1 кредит, [ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)).
+<a id="message-adr-039"></a>
+- **`message` (опц. при наличии вложений, [ADR-039](../../adr/ADR-039-optional-message-with-attachments.md)).** Текст сообщения пользователя. Ранее обязателен (`min_length=1`); теперь **опционален**, тип `str` с дефолтом `""`. Правило валидности хода: **`message` непуст после `strip` ИЛИ есть ≥1 элемент в `attachments` запроса**; если и текст пуст (после strip), и вложений нет → **`422`** `"message or at least one attachment is required"`. Size-лимит `message` (≤32KB) сохранён.
+  - **Сборка turn-0 user-сообщения.** Text-блок добавляется в user-content **только если итоговый текст непуст** (после склейки с context-блоком [ADR-037](../../adr/ADR-037-chatrunrequest-context-allowlist-injection.md), см. [§context](#context-adr-037)). При пустом тексте отправляются **только** attachment-блоки (vision/document/text-file) — **пустой text-блок (`text=""`) не отправляется ни Anthropic, ни OpenAI** (провайдер может отвергнуть; [ADR-033](../../adr/ADR-033-llm-provider-abstraction.md), [ADR-039 §2,§4](../../adr/ADR-039-optional-message-with-attachments.md)).
+  - **Склейка с context-блоком ([ADR-037](../../adr/ADR-037-chatrunrequest-context-allowlist-injection.md)):** message непуст + блок → `block + "\n\n" + message` (как раньше); message непуст, блока нет → `message`; **message пуст + блок → `block`** (без висячего `"\n\n"`, text-блок присутствует); **message пуст + блока нет → text-блока нет** (только attachment-блоки). Whitespace-only message при наличии вложения трактуется как «нет текста» (text-блок не создаётся).
+  - **Edge / scope:** только текстовое файл-вложение (`type: text`/`document`) без текста — валидно. Пустой `message` + **только** workspace-файлы ([ADR-036](../../adr/ADR-036-workspaces-implementation.md)), без `attachments` запроса → **`422`** (требование «≥1 attachment» относится к `attachments` **запроса**; workspace-контекст ход «с вложением» не делает). Биллинг неизменен (1 кредит, [ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)); миграции нет; обратная совместимость полная (непустой message без вложений — как раньше).
 - `attachments[]` (опц., ≤ `ATTACHMENT_MAX_COUNT`, дефолт 10) — **inline base64-вложения** ([ADR-020](../../adr/ADR-020-inline-base64-attachments-mvp.md), заменяет двухшаговую модель [ADR-014](../../adr/ADR-014-multimodal-attachments.md)). Принимаются **только** в первом (новом) пользовательском message-шаге `/chat/run`; в `/chat/tool-result` — **не** принимаются. Поля вложения:
   - `type` ∈ `image | document | text` — класс вложения.
   - `mediaType` — конкретный MIME, строго из allowlist (см. ниже); вне allowlist → `422 unsupported_media_type`.
