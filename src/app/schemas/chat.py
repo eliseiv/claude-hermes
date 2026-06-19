@@ -115,9 +115,20 @@ class ChatRunRequest(StrictModel):
         default=None,
         description="Опциональный контекст клиента (например, локаль). Ограничен по размеру.",
     )
+    editMessageStepId: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "ID хода для редактирования: история сессии усекается от него и генерируется новый "
+            "ход. Требует sessionId."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_sizes(self) -> ChatRunRequest:
+        # ADR-040 §1: editMessageStepId is only valid within an existing (resume) session — it
+        # cannot be combined with creating a new session. Missing sessionId → 422.
+        if self.editMessageStepId is not None and self.sessionId is None:
+            raise ValueError("editMessageStepId requires sessionId")
         # ADR-022: projectId is optional (default None) → «чистый чат». When present it must be a
         # non-empty string (a blank projectId is rejected rather than silently treated as NULL).
         if self.projectId is not None and not self.projectId.strip():

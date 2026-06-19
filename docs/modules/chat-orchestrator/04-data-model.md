@@ -33,6 +33,10 @@
 - `message_step_id` — тот же billing message-step id, что у шага, инициировавшего tool-call. Позволяет `/chat/tool-result` восстановить `messageStepId` для финального debit, не генерируя новый.
 - `status`: `pending → completed | errored` (атомарный переход, ADR-005).
 - `result` — сохранённый tool-result клиента (для идемпотентности повторной отправки).
+- **FK завязан на `chat_sessions` (`session_id`, `ON DELETE CASCADE`), НЕ на `chat_steps`.** Удаление строк `chat_steps` (например при усечении истории, [ADR-040](../../adr/ADR-040-edit-message-and-regenerate.md)) каскадно `tool_calls` **не** удаляет — `tool_calls` усечённых ходов надо удалять **явно** по их `message_step_id`, иначе остаются осиротевшие строки. Каскад срабатывает только при удалении самой сессии ([chats DELETE](../chats/02-api-contracts.md#delete-v1chatsid)).
+
+## Усечение истории (редактирование сообщения, [ADR-040](../../adr/ADR-040-edit-message-and-regenerate.md))
+- При `editMessageStepId` в `/chat/run` оркестратор усекает историю сессии **до** записи нового user-шага: anchor = `min(seq)` шага с `role='user'` и `message_step_id = editMessageStepId`; удаляются все `chat_steps` с `seq >= anchor` **и явно** `tool_calls` усечённых ходов (см. FK-замечание выше). Всё в транзакции запроса (общий commit хода). Без user-шага → `404 message_not_found`. Метод репозитория — `truncate_from_message_step`. Изоляция: только в проверенной на владельца сессии.
 
 ## Инварианты
 - Запись в `chat_steps`/`tool_calls` только этим модулем.

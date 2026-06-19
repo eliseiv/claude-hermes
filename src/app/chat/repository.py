@@ -246,6 +246,57 @@ class ChatRepository:
         )
         return updated is not None
 
+    async def truncate_from_message_step(
+        self, session_id: uuid.UUID, message_step_id: uuid.UUID
+    ) -> int | None:
+        """Truncate session history from a turn for edit+regenerate (ADR-040 §2).
+
+        Deletes the user-step identified by ``message_step_id`` and EVERYTHING after it (its
+        assistant/tool steps and all later turns), plus the ``tool_calls`` of the truncated turns.
+        Returns the number of deleted ``chat_steps`` (>= 1 when the anchor is found), or ``None``
+        when no ``role='user'`` step with ``message_step_id`` exists in the session (caller →
+        404 message_not_found).
+
+        - **anchor** = min ``chat_steps.seq`` of the session's step with this ``message_step_id``
+          AND ``role='user'`` (ADR-021 monotonic seq is the only reliable order key; ADR-040 §4в:
+          the anchor is matched STRICTLY by ``role='user'`` — an assistant/tool-only message_step_id
+          resolves to None → 404). None → return None.
+        - ``tool_calls`` of the truncated turns are deleted EXPLICITLY (ADR-040 §2 step 3): their FK
+          is on ``chat_sessions`` (session_id), NOT on ``chat_steps`` — deleting steps does NOT
+          cascade them, so without this they would be orphaned. The subquery reads the
+          STILL-EXISTING steps (seq >= anchor) before the steps are deleted.
+        - All DELETEs are scoped by ``session_id`` (an already ownership-checked session — the
+          caller only truncates a resumed, owned session, ADR-040 §5). No cross-session deletion.
+        - ``flush()`` only — the surrounding /chat/run request transaction commits as one unit with
+          the new turn's generation (ADR-040 §2), so truncation + new user-step are atomic.
+        """
+        anchor = await self._session.scalar(
+            text(
+                "SELECT min(seq) FROM chat_steps "
+                "WHERE session_id = :sid AND message_step_id = :msid AND role = 'user'"
+            ),
+            {"sid": str(session_id), "msid": str(message_step_id)},
+        )
+        if anchor is None:
+            return None
+        # Delete tool_calls of the truncated turns FIRST (FK is on chat_sessions, not chat_steps →
+        # no cascade). The subquery reads the still-existing chat_steps (seq >= anchor).
+        await self._session.execute(
+            text(
+                "DELETE FROM tool_calls WHERE session_id = :sid AND message_step_id IN ("
+                "SELECT DISTINCT message_step_id FROM chat_steps "
+                "WHERE session_id = :sid AND seq >= :anchor)"
+            ),
+            {"sid": str(session_id), "anchor": anchor},
+        )
+        result = await self._session.execute(
+            text("DELETE FROM chat_steps WHERE session_id = :sid AND seq >= :anchor RETURNING id"),
+            {"sid": str(session_id), "anchor": anchor},
+        )
+        deleted = len(result.fetchall())
+        await self._session.flush()
+        return deleted
+
     async def assistant_tool_step_id(
         self, session_id: uuid.UUID, message_step_id: uuid.UUID
     ) -> uuid.UUID | None:

@@ -348,6 +348,8 @@ async def chat_run(
         # ADR-037: per-message conversation settings (allowlist + render → injected into the turn-0
         # user message inside orchestrator.run; not session-fixed, not stored).
         context=body.context,
+        # ADR-040: edit+regenerate — truncate history from this turn and generate a new one.
+        edit_message_step_id=body.editMessageStepId,
     )
     return _to_response(out)
 

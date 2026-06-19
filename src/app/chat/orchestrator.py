@@ -47,6 +47,7 @@ from app.chat.tools import (
 from app.config import get_settings
 from app.errors import (
     InsufficientCreditsError,
+    MessageNotFoundError,
     NotFoundError,
     UpstreamError,
     ValidationFailedError,
@@ -448,6 +449,7 @@ class ChatOrchestrator:
         model: str | None = None,
         workspace_project_id: uuid.UUID | None = None,
         context: dict[str, Any] | None = None,
+        edit_message_step_id: uuid.UUID | None = None,
     ) -> ChatRunOut:
         message_step_id = uuid.uuid4()  # CO-4b: billing key for this user message-step
         # ADR-034 §3: resolve the session-fixed model. None (no field) → NULL (= instance default,
@@ -503,6 +505,26 @@ class ChatOrchestrator:
         sess = ctx.session
         # mode is fixed on the session; use the session's stored mode.
         effective_mode = Mode(sess.mode)
+
+        # ADR-040 §2,§3: edit+regenerate. Truncate the session history from the edited turn (its
+        # user-step and EVERYTHING after) BEFORE persisting the new user-step of this turn, in the
+        # same request transaction (atomic; the request commits as one unit). Edit REQUIRES resume
+        # of an existing OWNED session (ADR-040 §1,§5): a new session (sessionId was given but the
+        # session is foreign/expired/missing → get_or_create created a fresh one, ctx.is_new=True)
+        # means there is no turn to edit → 404, NO truncation, and the empty just-created session
+        # row is rolled back with the request (the AppError propagates → db.session_scope rollback;
+        # commit happens only on success). Truncation is scoped by `sess.id` — the resumed, owned
+        # session — so a foreign chat can never be truncated. The new turn then proceeds normally:
+        # the freshly generated message_step_id (above) yields a new debit (CO-7); on resume
+        # (is_new=False) workspace files are NOT re-injected (turn-0-only, ADR-040 §4а).
+        if edit_message_step_id is not None:
+            if ctx.is_new:
+                raise MessageNotFoundError("message_not_found")
+            deleted = await self._deps.repo.truncate_from_message_step(
+                sess.id, edit_message_step_id
+            )
+            if deleted is None:
+                raise MessageNotFoundError("message_not_found")
 
         # ADR-036 §3/§6 + ADR-038 §3: workspace `instructions` live in the `system` param (NOT in
         # history) and MUST be injected on EVERY turn of a session with a workspace — decoupled

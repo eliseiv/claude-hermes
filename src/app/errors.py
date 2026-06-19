@@ -66,6 +66,23 @@ class WorkspaceNotFoundError(NotFoundError):
     code = "workspace_not_found"
 
 
+class MessageNotFoundError(NotFoundError):
+    """editMessageStepId in /chat/run does not resolve to a user-step of the session (ADR-040 §1).
+
+    404 with code=message_not_found (chat-orchestrator/02-api-contracts.md, anchor
+    editmessagestepid-adr-040): the message-step to edit was not found — either the session is
+    foreign/missing/expired (resume not performed, no turn to edit), or there is no `role='user'`
+    step with that message_step_id (anchor is matched strictly by role='user', ADR-040 §4в).
+    Distinct `code` per the contract's machine-readable value, mirroring the *_not_found family
+    (workspace/session/user). The ADR §3 normative note phrases this as
+    ``raise NotFoundError("message_not_found")``; the contract anchor specifies the wire `code`
+    `message_not_found`, so a dedicated subclass with that `code` satisfies both (the error handler
+    serializes `exc.code`, not `exc.message`).
+    """
+
+    code = "message_not_found"
+
+
 class ConflictError(AppError):
     status_code = 409
     code = "conflict"
