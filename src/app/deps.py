@@ -16,6 +16,7 @@ from app.admin.service import AdminService
 from app.api_gateway.auth import AuthenticatedUser, get_jwt_verifier
 from app.api_gateway.openapi_security import bearer_scheme
 from app.audit.service import AuditService
+from app.auth.apple import get_apple_verifier
 from app.auth.issuer import TokenIssuer
 from app.auth.service import AuthService
 from app.billing_adapty.service import AdaptyWebhookService
@@ -128,7 +129,7 @@ def get_token_issuer() -> TokenIssuer:
 
 
 def get_auth_service(session: DbSession) -> AuthService:
-    return AuthService(session, get_token_issuer(), get_settings())
+    return AuthService(session, get_token_issuer(), get_settings(), get_apple_verifier())
 
 
 def get_audit(session: DbSession) -> AuditService:

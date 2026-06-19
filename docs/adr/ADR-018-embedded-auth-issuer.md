@@ -3,6 +3,7 @@
 - Статус: Accepted
 - Дата: 2026-06-02
 - Закрывает: [Q-005-1](../99-open-questions.md) (конкретный JWT issuer / flow выпуска токенов)
+- Расширен: [ADR-043](ADR-043-sign-in-with-apple.md) (2026-06-19) — Sign in with Apple (`POST /v1/auth/apple`) поверх того же issuer: Apple identity token → НАША пара токенов + кросс-девайс аккаунт через `auth_identities`; закрывает [Q-018-2](../99-open-questions.md). Device-flow ([ADR-018](ADR-018-embedded-auth-issuer.md)) не изменён.
 - Связан с: [ADR-001](ADR-001-stack-choice.md) (модульный монолит), [ADR-007](ADR-007-lazy-user-provisioning.md) (lazy provisioning), [ADR-009](ADR-009-admin-token-auth.md) (изоляция admin-auth), [05-security.md](../05-security.md), [03-data-model.md](../03-data-model.md), [modules/auth/](../modules/auth/README.md)
 
 ## Context

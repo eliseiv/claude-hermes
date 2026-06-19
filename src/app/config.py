@@ -104,6 +104,24 @@ class Settings(BaseSettings):
     appstore_bundle_id: str = Field(default="", alias="APPSTORE_BUNDLE_ID")
     appstore_root_cert_dir: str = Field(default="", alias="APPSTORE_ROOT_CERT_DIR")
 
+    # --- Sign in with Apple (ADR-043, modules/auth Phase 6) ---
+    # Apple OIDC identity-token verification for POST /v1/auth/apple. Native Sign in with Apple
+    # only (aud = app bundle id); Services ID / web-flow is out of scope (Q-043-1). Values are
+    # env (not secrets except APPLE_TEST_SECRET) and per-instance, like APPSTORE_BUNDLE_ID.
+    apple_oidc_issuer: str = Field(default="https://appleid.apple.com", alias="APPLE_OIDC_ISSUER")
+    apple_jwks_url: str = Field(
+        default="https://appleid.apple.com/auth/keys", alias="APPLE_JWKS_URL"
+    )
+    # Expected `aud` = app bundle id. Empty => fall back to APPSTORE_BUNDLE_ID
+    # (apple_audience_resolved()); both empty => Apple sign-in "not configured" => 503.
+    apple_audience: str = Field(default="", alias="APPLE_AUDIENCE")
+    # test-mode (ADR-043 §2): env-gated HS256 identity tokens for hermetic tests (no Apple infra).
+    # Default false => prod fail-closed RS256 verification is unchanged. Active ONLY when
+    # apple_test_mode is true AND apple_test_secret is non-empty; HS256 outside test-mode => 401
+    # (no alg-confusion). The secret is redaction-allowlisted (`*secret*`) and never logged.
+    apple_test_mode: bool = Field(default=False, alias="APPLE_TEST_MODE")
+    apple_test_secret: str = Field(default="", alias="APPLE_TEST_SECRET")
+
     # --- StoreKit test-mode (TD-007, 09-e2e-testing.md §2; test/CI only) ---
     # Env-gated HS256 test transactions for e2e (no Apple infra). Default false => prod
     # fail-closed real JWS verification is unchanged. Active ONLY when storekit_test_mode is
@@ -398,6 +416,19 @@ class Settings(BaseSettings):
     def resolve_public_key(self) -> str:
         """Public RS256 verification key PEM (used by JwtVerifier and the JWKS endpoint)."""
         return self._resolve_pem(self.jwt_public_key_path, self.jwt_public_key)
+
+    def apple_audience_resolved(self) -> str:
+        """Effective Apple `aud` for verification (ADR-043 §3).
+
+        Returns ``apple_audience`` (stripped) if set, else ``appstore_bundle_id`` (stripped) as a
+        fallback (if a bundle id is already configured for StoreKit it doubles as the Apple
+        audience), else ``""``. An empty result means Apple sign-in is "not configured" — the
+        router returns 503 (operational misconfiguration, not a client error). Pure (no I/O).
+        """
+        explicit = self.apple_audience.strip()
+        if explicit:
+            return explicit
+        return self.appstore_bundle_id.strip()
 
     def normalized_service_domain(self) -> str:
         """Return SERVICE_DOMAIN as a bare host[:port] for the absolute preview URL (ADR-031).

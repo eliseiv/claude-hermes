@@ -458,3 +458,42 @@ class WorkspaceFile(Base):
         CheckConstraint("size >= 0", name="ck_workspace_files_size_nonneg"),
         Index("ix_workspace_files_project", "workspace_project_id"),
     )
+
+
+class AuthIdentity(Base):
+    """External identity-provider link (Sign in with Apple on start) — ADR-043 §4, migration 0012.
+
+    ``UNIQUE(provider, subject)`` is the cross-device resolution point (one Apple account = one
+    ``userId``) and the race-safety anchor (``ON CONFLICT (provider, subject) DO NOTHING`` +
+    re-read, like ``auth_devices``). ``ix_auth_identities_user`` powers the reverse lookup "does
+    this userId already have an Apple identity" (account-linking, ADR-043 §5). FK ON DELETE
+    CASCADE (identities live while the user lives). ``users``/``auth_devices``/
+    ``auth_refresh_tokens`` are NOT changed.
+    """
+
+    __tablename__ = "auth_identities"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=_uuid_default
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(Text, nullable=False)  # 'apple' (extensible)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)  # provider-stable id (apple sub)
+    email: Mapped[str | None] = mapped_column(Text, nullable=True)  # optional (private-relay)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+
+    __table_args__ = (
+        # Unique INDEX (not a table constraint) to match the DDL/migration name exactly
+        # (ux_auth_identities_provider_subject), like auth_refresh_tokens' ux_refresh_token_hash.
+        Index(
+            "ux_auth_identities_provider_subject",
+            "provider",
+            "subject",
+            unique=True,
+        ),
+        Index("ix_auth_identities_user", "user_id"),
+    )

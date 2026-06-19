@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.deps import client_ip, get_auth_service
 from app.errors import NotFoundError, RateLimitedError
 from app.schemas.auth import (
+    AppleSignInRequest,
     JwksResponse,
     RefreshRequest,
     RegisterRequest,
@@ -101,6 +102,31 @@ async def auth_refresh(
 ) -> TokenResponse:
     await _rate_limit(request)
     tokens = await auth.refresh(body.refreshToken)
+    return _to_response(tokens)
+
+
+@router.post(
+    "/apple",
+    response_model=TokenResponse,
+    summary="Вход через Apple",
+    description=(
+        "Принимает Apple identity token (нативный Sign in with Apple), верифицирует его и "
+        "выдаёт нашу пару токенов — кросс-девайс аккаунт (один Apple-аккаунт = один `userId`). "
+        "`deviceId` опционален. Невалидный/просроченный токен — `401`. `503`, если выпуск "
+        "токенов не настроен или Apple-аудитория не задана."
+    ),
+)
+async def auth_apple(
+    request: Request,
+    auth: Annotated[AuthService, Depends(get_auth_service)],
+    body: AppleSignInRequest,
+) -> TokenResponse:
+    # "not configured" (503) and verification failures (401) are raised inside the service /
+    # verifier and mapped by the global error handler (ServiceUnavailableError / UnauthorizedError).
+    await _rate_limit(request)
+    tokens = await auth.sign_in_with_apple(
+        identity_token=body.identityToken, device_id=body.deviceId, nonce=body.nonce
+    )
     return _to_response(tokens)
 
 

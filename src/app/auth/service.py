@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.apple import AppleIdentityVerifier
 from app.auth.issuer import IssuerNotConfiguredError, TokenIssuer
 from app.config import Settings
 from app.errors import ServiceUnavailableError, UnauthorizedError
@@ -46,10 +47,19 @@ def _hash_refresh(token: str) -> str:
 
 
 class AuthService:
-    def __init__(self, session: AsyncSession, issuer: TokenIssuer, settings: Settings) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        issuer: TokenIssuer,
+        settings: Settings,
+        apple_verifier: AppleIdentityVerifier,
+    ) -> None:
         self._session = session
         self._issuer = issuer
         self._refresh_ttl = settings.auth_refresh_ttl_seconds
+        # ADR-043: Apple identity-token verifier (Sign in with Apple). Injected so the audience /
+        # JWKS client / test-mode resolution stays a process-wide singleton.
+        self._apple = apple_verifier
 
     def _require_issuer(self) -> None:
         if not self._issuer.configured:
@@ -139,6 +149,123 @@ class AuthService:
         tokens = await self._issue_pair(user_id, resolved_device_id)
         await self._session.commit()
         return tokens
+
+    async def sign_in_with_apple(
+        self, identity_token: str, device_id: str | None, nonce: str | None
+    ) -> IssuedTokens:
+        """Sign in with Apple: verify the identity token and issue OUR token pair (ADR-043 §5).
+
+        One atomic flow (single request transaction, idempotent, race-safe), yielding the SAME
+        TokenResponse contract as register/token. Cross-device account: one ``apple_sub`` =>
+        one ``userId`` on every device.
+
+        Steps:
+        1. Require OUR issuer (else 503, like register_or_token); verify the Apple token (the
+           verifier raises 503 when the Apple audience is not configured, 401 on any bad token).
+        2. Resolve deviceId (None => generate a UUIDv4, returned to the client).
+        3. Look up ``auth_identities (provider='apple', subject=apple_sub)``:
+           - found => target = its userId (cross-device, same account).
+           - not found => resolve the device's userId (find-or-create); if that user has NO Apple
+             identity yet, LINK to it (preserves the anonymous device account's credits/history);
+             otherwise create a NEW user and link the Apple identity to it.
+        4. Upsert the device binding to the resulting user (conflict apple_sub-user != device-user
+           => the device is re-pointed to the apple_sub-user; no data auto-merge, Q-043-2).
+        5. Issue OUR pair and commit.
+        """
+        self._require_issuer()
+        # Verifier owns the audience "not configured" => 503 decision (ADR-043 §2 single place).
+        identity = self._apple.verify(identity_token, nonce)
+        apple_sub = identity.apple_sub
+        resolved_device_id = device_id or str(uuid.uuid4())
+
+        target_user_id = await self._resolve_apple_user(
+            apple_sub=apple_sub, email=identity.email, device_id=resolved_device_id
+        )
+        await self._upsert_device(resolved_device_id, target_user_id)
+
+        tokens = await self._issue_pair(target_user_id, resolved_device_id)
+        await self._session.commit()
+        return tokens
+
+    async def _resolve_apple_user(
+        self, *, apple_sub: str, email: str | None, device_id: str
+    ) -> uuid.UUID:
+        """Resolve the userId an Apple identity maps to, linking/creating as needed (ADR-043 §5).
+
+        Idempotent and race-safe: the Apple-identity INSERT uses ``ON CONFLICT (provider, subject)
+        DO NOTHING`` and we re-read the winning row, so a concurrent first sign-in of the same
+        ``apple_sub`` converges on one userId (no duplicates). ``email`` is written only when the
+        identity row is created; existing rows are never overwritten (Apple sends email only on
+        first consent — Q-043-1).
+        """
+        existing = await self._session.execute(
+            text(
+                "SELECT user_id FROM auth_identities "
+                "WHERE provider = 'apple' AND subject = :subject"
+            ),
+            {"subject": apple_sub},
+        )
+        row = existing.first()
+        if row is not None:
+            return uuid.UUID(str(row[0]))
+
+        # Unknown Apple identity. Resolve the device's user (create users+auth_devices if new).
+        device_user_id = await self._find_or_create_identity(device_id)
+
+        has_apple = await self._session.execute(
+            text(
+                "SELECT 1 FROM auth_identities "
+                "WHERE user_id = :user_id AND provider = 'apple' LIMIT 1"
+            ),
+            {"user_id": str(device_user_id)},
+        )
+        if has_apple.first() is None:
+            # Device account has no Apple identity yet => link to it (keep credits/history).
+            link_to = device_user_id
+        else:
+            # Device account already owns a different Apple identity => create a new user.
+            link_to = uuid.uuid4()
+            await self._session.execute(
+                text("INSERT INTO users (id) VALUES (:id) ON CONFLICT (id) DO NOTHING"),
+                {"id": str(link_to)},
+            )
+
+        await self._session.execute(
+            text(
+                "INSERT INTO auth_identities (user_id, provider, subject, email) "
+                "VALUES (:user_id, 'apple', :subject, :email) "
+                "ON CONFLICT (provider, subject) DO NOTHING"
+            ),
+            {"user_id": str(link_to), "subject": apple_sub, "email": email},
+        )
+        # Re-read to take the winning userId (handles a concurrent first sign-in of this apple_sub).
+        resolved = await self._session.execute(
+            text(
+                "SELECT user_id FROM auth_identities "
+                "WHERE provider = 'apple' AND subject = :subject"
+            ),
+            {"subject": apple_sub},
+        )
+        winner = resolved.first()
+        if winner is None:  # pragma: no cover - the insert above guarantees a row
+            raise ServiceUnavailableError("failed to link apple identity")
+        return uuid.UUID(str(winner[0]))
+
+    async def _upsert_device(self, device_id: str, user_id: uuid.UUID) -> None:
+        """Bind the device to ``user_id`` (ADR-043 §5 step 6), race-safe via ON CONFLICT.
+
+        On a conflict (the device previously belonged to another userId, e.g. signing into one's
+        Apple account on a shared device) the apple_sub-user wins: the device is re-pointed to it
+        and ``last_seen_at`` refreshed. No data auto-merge of the prior device account (Q-043-2).
+        """
+        await self._session.execute(
+            text(
+                "INSERT INTO auth_devices (user_id, device_id) VALUES (:user_id, :device_id) "
+                "ON CONFLICT (device_id) DO UPDATE "
+                "SET user_id = EXCLUDED.user_id, last_seen_at = now()"
+            ),
+            {"user_id": str(user_id), "device_id": device_id},
+        )
 
     async def refresh(self, refresh_token: str) -> IssuedTokens:
         """Rotate a refresh token into a new pair (single-use). Reuse/invalid => 401.

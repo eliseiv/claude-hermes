@@ -1,6 +1,6 @@
 # 03 — Data Model
 
-PostgreSQL 16. **19 таблиц спроектировано; 14 активны на MVP, 3 отложены** (`snippets`, `attachments`, `device_push_tokens` — миграция `0004` их **не создаёт**). `workspace_projects`/`workspace_files` — **Поставка 3 (миграция `0011`)**, реализуются ([ADR-036](adr/ADR-036-workspaces-implementation.md), собственное BYTEA-хранение, не зависят от `attachments`). Активные на MVP: 9 базовых + `projects`/`site_files` website-builder + 1 расширения Figma-gap Sprint 1 (`user_preferences`) + 2 встроенного auth-issuer (`auth_devices`, `auth_refresh_tokens`, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)). Отдельно про `attachments`: таблица **спроектирована, но на MVP не создаётся** — двухшаговый transport [ADR-014](adr/ADR-014-multimodal-attachments.md) Superseded ([TD-015](100-known-tech-debt.md)), chat-вложения на MVP реализуются inline base64 без таблицы ([ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md)). UUID v4 (`gen_random_uuid()` из `pgcrypto`). Все timestamp — `timestamptz`, UTC. Деньги/кредиты — целочисленные (минимальная неделимая единица), без float.
+PostgreSQL 16. **21 таблица спроектирована; 15 активны на MVP, 3 отложены** (`snippets`, `attachments`, `device_push_tokens` — миграция `0004` их **не создаёт**). `auth_identities` — Sign in with Apple (миграция `0012`, [ADR-043](adr/ADR-043-sign-in-with-apple.md)), спроектирована, ожидает реализации; `adapty_webhook_events` — миграция `0008`. `workspace_projects`/`workspace_files` — **Поставка 3 (миграция `0011`)**, реализуются ([ADR-036](adr/ADR-036-workspaces-implementation.md), собственное BYTEA-хранение, не зависят от `attachments`). Активные на MVP: 9 базовых + `projects`/`site_files` website-builder + 1 расширения Figma-gap Sprint 1 (`user_preferences`) + 2 встроенного auth-issuer (`auth_devices`, `auth_refresh_tokens`, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)). Отдельно про `attachments`: таблица **спроектирована, но на MVP не создаётся** — двухшаговый transport [ADR-014](adr/ADR-014-multimodal-attachments.md) Superseded ([TD-015](100-known-tech-debt.md)), chat-вложения на MVP реализуются inline base64 без таблицы ([ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md)). UUID v4 (`gen_random_uuid()` из `pgcrypto`). Все timestamp — `timestamptz`, UTC. Деньги/кредиты — целочисленные (минимальная неделимая единица), без float.
 
 > Расширение (2026-06-02, Figma-gap, см. [figma-gap-analysis.md](figma-gap-analysis.md)): новые таблицы и колонки спроектированы как expand-only миграции (`0004`+). Затронутые ADR: [ADR-012](adr/ADR-012-assistant-mode-vs-billing-mode.md) (`assistant_mode`), [ADR-013](adr/ADR-013-workspace-projects-vs-website-builder.md) (workspaces), [ADR-014](adr/ADR-014-multimodal-attachments.md) (attachments — **спроектирована, реализация отложена**, transport Superseded → [TD-015](100-known-tech-debt.md); MVP — inline base64 [ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md)), [ADR-015](adr/ADR-015-consumable-token-iap.md) (consumable IAP — без новой таблицы). На MVP миграция `0004` создаёт только Sprint-1 объекты (`user_preferences`, поля `chat_sessions`/`users`); `workspace_projects`/`workspace_files`/`snippets`/`attachments`/`device_push_tokens` — Sprint-2/3, **не созданы**.
 
@@ -29,6 +29,7 @@ erDiagram
     users ||--o{ device_push_tokens : registers
     users ||--o{ auth_devices : "identified by"
     auth_devices ||--o{ auth_refresh_tokens : issues
+    users ||--o{ auth_identities : "linked via"
 
     users { uuid id PK }
     subscriptions { uuid user_id FK }
@@ -49,6 +50,7 @@ erDiagram
     device_push_tokens { uuid id PK }
     auth_devices { text device_id PK }
     auth_refresh_tokens { uuid id PK }
+    auth_identities { uuid id PK }
 ```
 
 ## Enum-типы
@@ -411,6 +413,23 @@ CREATE INDEX ix_adapty_webhook_events_user_id ON adapty_webhook_events (user_id)
 ```
 > Журнал обработанных событий Adapty и **единая точка дедупликации**: `INSERT ... ON CONFLICT (event_id) DO NOTHING RETURNING event_id` в одной транзакции с upsert `subscriptions` + `WalletService.grant(idempotency_key="adapty-event:{event_id}")`. Повтор `event_id` → ничего не вставлено → `200 duplicate` без побочных эффектов. Двойная UNIQUE-граница (этот PK + `ux_ledger_idempotency`) исключает двойное начисление. `payload` хранит распарсенный объект (не сырые байты); bearer-секрет в нём отсутствует (он в заголовке). Детали — [modules/billing-adapty/04-data-model.md](modules/billing-adapty/04-data-model.md).
 
+## Таблица Sign in with Apple (миграция `0012`, [ADR-043](adr/ADR-043-sign-in-with-apple.md), модуль `auth`)
+
+### 21. auth_identities (модуль `auth`)
+```sql
+CREATE TABLE auth_identities (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider    TEXT NOT NULL,                       -- 'apple' (расширяемо: email/google/...)
+    subject     TEXT NOT NULL,                       -- провайдерский стабильный id (apple sub)
+    email       TEXT,                                -- опционально (может быть private-relay)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX ux_auth_identities_provider_subject ON auth_identities (provider, subject);
+CREATE INDEX ix_auth_identities_user ON auth_identities (user_id);
+```
+> Внешние identity-провайдеры (Sign in with Apple на старте, [ADR-043](adr/ADR-043-sign-in-with-apple.md)). `UNIQUE(provider, subject)` — кросс-девайс резолв (один Apple-аккаунт = один `userId`) и гонко-безопасность (`ON CONFLICT (provider, subject) DO NOTHING` + повторное чтение, образец `auth_devices`). Apple identity token верифицируется (`AppleIdentityVerifier`), но **не хранится**; в БД попадают только `subject`/`email`. Связывание apple_sub↔userId, конфликты — [ADR-043 §5](adr/ADR-043-sign-in-with-apple.md), [modules/auth/03-architecture.md](modules/auth/03-architecture.md#sign-in-with-apple-adr-043). Миграция `0012` (expand-only, цепочка `0011`→`0012`, single head).
+
 ## Инварианты
 - `wallets.balance >= 0` — БД CHECK + проверка в Wallet (двойная защита).
 - **Изоляция website-builder:** `site_files` → `projects` → `users` (FK `ON DELETE CASCADE`); доступ к файлам только через
@@ -421,7 +440,7 @@ CREATE INDEX ix_adapty_webhook_events_user_id ON adapty_webhook_events (user_id)
 - **Порядок шагов сессии (ADR-021):** реконструкция истории (`list_steps`) и поиск следующего шага (`next_step_after`) сортируют `chat_steps` по `seq` (монотонный identity), **НЕ** по `(created_at, id)`. `created_at` — информационный transaction-time timestamp, не порядковый ключ (несколько шагов одной транзакции имеют равный `created_at`; UUID-`id` не монотонный). `seq` гарантирует порядок вставки `tool_use` < `tool_result` в server-side tool-loop (устранён orphan tool_result → Anthropic 400, BUG-5).
 - **Нормализация content-блоков (ADR-021):** в `chat_steps.payload` хранятся только wire-валидные поля Anthropic Messages API; служебные поля SDK (`caller` и т.п.) вырезаются перед персистом и не попадают в реплей к Anthropic. Raw `tool_use.id` сохраняется дословно (ADR-008).
 - В `meta`, `payload`, `usage`, `args`, `result` запрещено хранить API-ключи и секреты.
-- Любая FK-зависимая вставка (`subscriptions`/`wallets`/`byok_keys`/`ledger_transactions`/`chat_sessions`/`audit_logs`/`user_preferences`/`workspace_projects`/`snippets`/`attachments`/`device_push_tokens`) выполняется только после того, как строка `users` для `sub` гарантированно существует — обеспечивается ленивым провижинингом в gateway ([ADR-007](adr/ADR-007-lazy-user-provisioning.md)). Прямой FK-violation на отсутствующем `users` — дефект провижининга.
+- Любая FK-зависимая вставка (`subscriptions`/`wallets`/`byok_keys`/`ledger_transactions`/`chat_sessions`/`audit_logs`/`user_preferences`/`workspace_projects`/`snippets`/`attachments`/`device_push_tokens`/`auth_identities`) выполняется только после того, как строка `users` для `sub` гарантированно существует. Исключение для `auth_identities` ([ADR-043](adr/ADR-043-sign-in-with-apple.md)): родительская `users` создаётся в том же потоке Apple-входа (привязка к существующему device-`userId` ИЛИ явный `INSERT users(uuid4())` для нового аккаунта) — FK гарантируется до INSERT identity (родительская `users` создаётся в потоке Apple-входа), а **не** lazy-провижинингом gateway. Прямой FK-violation на отсутствующем `users` — дефект провижининга.
 - **`adapty_webhook_events` — исключение из lazy-provisioning:** вебхук Adapty НЕ провижинит `users` (нет доверенного JWT-`sub`). `customer_user_id` из тела события сначала проверяется по существующим `users`; отсутствующий → `200 ignored/user_not_found`, без вставки `users`/`adapty_webhook_events` ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)). FK гарантируется явной проверкой существования пользователя ДО INSERT, а не провижинингом.
 - **Изоляция расширения (Figma-gap):** `workspace_files` → `workspace_projects` → `users` (BYTEA-контент в `workspace_files`, [ADR-036](adr/ADR-036-workspaces-implementation.md), без FK на `attachments`); `snippets`/`attachments`/`device_push_tokens` → `users` (все FK `ON DELETE CASCADE`). Доступ только владельца (`user_id == sub`). `chat_sessions.workspace_project_id` — `ON DELETE SET NULL` (чат переживает удаление workspace, [ADR-036 §5](adr/ADR-036-workspaces-implementation.md)); `attachments.session_id` — `ON DELETE SET NULL`.
 - **Терминология mode (ADR-012):** `chat_sessions.mode` (enum `chat_mode`) = `billing_mode` (credits|byok, способ оплаты); `chat_sessions.assistant_mode` (enum `assistant_mode`) = тип ассистента (chat|code). Это **разные ортогональные** поля. `chat_sessions.project_id` (TEXT, website-builder) ≠ `chat_sessions.workspace_project_id` (UUID FK, рабочее пространство) ([ADR-013](adr/ADR-013-workspace-projects-vs-website-builder.md)).

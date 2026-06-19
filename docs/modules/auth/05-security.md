@@ -33,8 +33,15 @@
 - **Массовая генерация identity (Sybil)** — [Q-018-1](../../99-open-questions.md): дефолт — per-IP rate-limit; усиление App Attest / DeviceCheck — post-MVP (не закрывается путь).
 - `deviceId` валидируется (строка `1..128`, charset `[A-Za-z0-9._:-]`, `extra='forbid'`) — защита от инъекций/мусора.
 
+## Sign in with Apple ([ADR-043](../../adr/ADR-043-sign-in-with-apple.md))
+- **Apple identity token** верифицируется `AppleIdentityVerifier` (`src/app/auth/apple.py`), но **не выпускается нами и не хранится**. После проверки выпускается НАША пара токенов (как `register`).
+- Верификация: подпись RS256 по Apple JWKS (`APPLE_JWKS_URL`, кэш `jwks_cache_ttl_seconds`), `iss=APPLE_OIDC_ISSUER`, `aud`=bundle id (`APPLE_AUDIENCE`, фолбэк `APPSTORE_BUNDLE_ID`), обязательны `sub`/`iss`/`aud`/`exp`. Любая ошибка → `401` (fail-closed). HS256 вне `APPLE_TEST_MODE` → `401`.
+- nonce опционален: при наличии claim `nonce` и присланного клиентом `nonce` → `sha256(nonce)==claim` (иначе `401`). Ужесточение — [Q-043-1](../../99-open-questions.md).
+- **НЕ логируются:** `identityToken` (`*token*`), `nonce` (`_DENY_EXACT`), `APPLE_TEST_SECRET` (`*secret*`). Verifier не помещает токен в исключения; ошибки обобщённые.
+- `auth_identities` хранит только `subject` (apple_sub) и опц. `email` — не токен. Связывание/конфликты — [03-architecture.md](03-architecture.md#sign-in-with-apple-adr-043).
+
 ## Что НЕ логируется
-Приватный ключ (`JWT_PRIVATE_KEY`/файл-содержимое), выпущенный access-token (JWT), refresh-token (plaintext и хэш не выводятся в ответных логах), любые `*key*`/`*token*`/`*secret*`. `deviceId` — нечувствителен (не PII), логируется как correlation-атрибут.
+Приватный ключ (`JWT_PRIVATE_KEY`/файл-содержимое), выпущенный access-token (JWT), refresh-token (plaintext и хэш не выводятся в ответных логах), **Apple identity token (`identityToken`) и `nonce`**, любые `*key*`/`*token*`/`*secret*`. `deviceId` — нечувствителен (не PII), логируется как correlation-атрибут.
 
 ## Модель угроз (дополнение к [05-security.md](../../05-security.md))
 | Угроза | Митигирование |
@@ -45,3 +52,7 @@
 | Подмена чужого `userId` через register | `userId` задаёт backend (uuid4 / find-by-device), не клиент; `register` не принимает `userId` в теле. |
 | Долгоживущий access при утечке | Короткий TTL (1ч); компрометация ограничена окном. |
 | Issuer не сконфигурирован (нет приватного ключа) в prod | `503` на issuer-эндпоинтах + prod-checklist пункт ([07-deployment.md](../../07-deployment.md)). |
+| Поддельный/чужой Apple identity token | Полная верификация подписи/`iss`/`aud`(=bundle)/`exp` по Apple JWKS; fail-closed `401`; HS256 только в test-mode ([ADR-043](../../adr/ADR-043-sign-in-with-apple.md)). |
+| Replay перехваченного Apple-токена | nonce-проверка при наличии (опц. MVP); короткий TTL Apple-токена; ужесточение (обязательный nonce + anti-replay) — [Q-043-1](../../99-open-questions.md). |
+| Подмена аккаунта через чужое устройство | Связывание не делает авто-merge данных; при конфликте берётся apple_sub-user, устройство upsert на него ([ADR-043 §5](../../adr/ADR-043-sign-in-with-apple.md), [Q-043-2](../../99-open-questions.md)). |
+| Утечка Apple-токена в логи | `identityToken`/`nonce` под redaction; не попадают в исключения. |

@@ -13,6 +13,14 @@
 - Access-token: RS256 JWT, TTL 1ч (`AUTH_ACCESS_TTL_SECONDS`). Refresh-token: opaque, TTL 30д (`AUTH_REFRESH_TTL_SECONDS`), хранится как `sha256`-хэш, single-use rotation + reuse-детект → ревокация цепочки.
 - `register` создаёт `users` явно (eager provisioning); lazy-provisioning ([ADR-007](adr/ADR-007-lazy-user-provisioning.md)) остаётся fallback; `trial_used`/policy не затронуты. Детали — [modules/auth/05-security.md](modules/auth/05-security.md).
 
+### Sign in with Apple ([ADR-043](adr/ADR-043-sign-in-with-apple.md), закрывает [Q-018-2](99-open-questions.md))
+- `POST /v1/auth/apple` — **без** пользовательского JWT (точка получения токена); та же per-IP rate-limit (`enforce_auth_limits`).
+- Клиент шлёт **Apple identity token** (OIDC JWT, RS256, нативный flow). Backend верифицирует через `AppleIdentityVerifier` (`src/app/auth/apple.py`): подпись по Apple JWKS (`APPLE_JWKS_URL`, кэш `jwks_cache_ttl_seconds`), `iss=APPLE_OIDC_ISSUER` (`https://appleid.apple.com`), `aud=APPLE_AUDIENCE` (**= bundle id**, фолбэк `APPSTORE_BUNDLE_ID`), обязательны claims `sub`/`iss`/`aud`/`exp`. Любая ошибка верификации → **`401` (fail-closed)**.
+- **Apple-токен — credential-equivalent: НЕ логируется** (redaction `*token*` ловит `identityToken`). **`nonce` НЕ логируется** (уже в `_DENY_EXACT`). Verifier не кладёт токен в текст исключений; ошибки обобщённые (`401` без раскрытия причины).
+- **nonce-политика** (опциональна, [ADR-043 §2](adr/ADR-043-sign-in-with-apple.md)): при наличии claim `nonce` и присланного клиентом `nonce` → проверяется `sha256(nonce)==claim` (иначе `401`); ужесточение (обязательный nonce + anti-replay) — [Q-043-1](99-open-questions.md).
+- **test-mode** (`APPLE_TEST_MODE=true`+`APPLE_TEST_SECRET`, HS256) — только для герметичных тестов (образец `STOREKIT_TEST_MODE`); вне test-mode HS256-токен → `401`. `APPLE_TEST_SECRET` — секрет (redaction `*secret*`).
+- Выпускается **НАША** пара токенов (как `register`) — Apple-токен не становится access-токеном для `/v1/*`. Идентичность apple_sub↔userId — таблица `auth_identities` (хранятся только `subject`/`email`, не токен).
+
 ## Модель идентичности и провижининг пользователей
 См. [ADR-007](adr/ADR-007-lazy-user-provisioning.md).
 - **Источник истины идентичности — доверенный JWT issuer.** `users.id` ≡ JWT `sub` (UUID, выдаёт issuer). Endpoint регистрации отсутствует и не предусмотрен.
