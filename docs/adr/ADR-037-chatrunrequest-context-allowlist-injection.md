@@ -1,8 +1,10 @@
 # ADR-037 — `ChatRunRequest.context`: per-message allowlist + инъекция в user-сообщение
 
-- **Статус:** Accepted
+- **Статус:** Accepted (ревизия отображения 2026-06-19 → [ADR-042](ADR-042-hide-context-block-from-user-facing-history.md))
 - **Дата:** 2026-06-17
 - **Связанные:** [ADR-012](ADR-012-assistant-mode-vs-billing-mode.md) (assistant_mode), [ADR-020](ADR-020-inline-base64-attachments-mvp.md) (turn0 user-content), [ADR-021](ADR-021-deterministic-step-order-and-block-normalization.md) (персист user-step), [ADR-033](ADR-033-llm-provider-abstraction.md) (провайдер-агностичность), [ADR-036](ADR-036-workspaces-implementation.md) (инъекция workspace.instructions — образец, но в system)
+
+> **Ревизия отображения (2026-06-19, [ADR-042](ADR-042-hide-context-block-from-user-facing-history.md)).** §4 фиксирует, что settings-блок персистится внутри текста user-шага в `chat_steps.payload` (для корректного replay) — это сохраняется без изменений. Но из-за этого блок был **виден в user-facing выводе**: в истории `GET /v1/chats/{id}` (`steps[].payload.content[].text`) и в превью `GET /v1/chats`. [ADR-042](ADR-042-hide-context-block-from-user-facing-history.md) **ревизует ADR-037 только в части отображения**: блок срезается **при отдаче** истории и превью (read-time strip, единый helper). Хранение (§4), инъекция в промт и реплей модели (`_build_messages`) этого ADR **не меняются** — модель по-прежнему получает блок. Тело ADR-037 ниже остаётся в силе как есть.
 
 ## Context
 

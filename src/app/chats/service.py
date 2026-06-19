@@ -16,7 +16,7 @@ from typing import Any
 
 from app.chat.tools import UnknownToolNameError, to_domain_tool_name
 from app.chats.cursor import ChatCursor, InvalidCursorError
-from app.chats.repository import ChatsRepository
+from app.chats.repository import ChatsRepository, strip_context_block
 from app.errors import NotFoundError, ValidationFailedError, WorkspaceNotFoundError
 from app.models import ChatSession, ChatStep, ToolCall
 from app.workspaces.service import WorkspacesService
@@ -195,6 +195,11 @@ class ChatsService:
         content = payload.get("content")
         if not isinstance(content, list):
             return payload
+        # ADR-042: for a user step, strip the leading ADR-037 conversation-settings block from the
+        # FIRST text block (where the block leads, ADR-037 §4) — on this deep copy only, so the
+        # stored payload stays wire-valid for replay. assistant/tool steps carry no block → skip.
+        if step.role == "user":
+            ChatsService._strip_leading_context_block(content)
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -205,6 +210,19 @@ class ChatsService:
                 ChatsService._normalize_tool_result_block(block, provider_to_domain, step)
             # text blocks and tool_use.input are intentionally left unchanged.
         return payload
+
+    @staticmethod
+    def _strip_leading_context_block(content: list[Any]) -> None:
+        """Strip the ADR-037 block from the first text block of a user step's content (ADR-042).
+
+        Mutates the FIRST ``type == "text"`` block in place (on the deep copy from
+        ``_normalize_payload``). Only the leading text block carries the block (ADR-037 §4);
+        attachment placeholders and any later blocks are not touched.
+        """
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"] = strip_context_block(str(block.get("text", "")))
+                return
 
     @staticmethod
     def _normalize_tool_use_block(

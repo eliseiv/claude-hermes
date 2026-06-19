@@ -9,6 +9,7 @@ scoped ``WHERE user_id = :sub``; a foreign chat is indistinguishable from a miss
 from __future__ import annotations
 
 import datetime
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, cast
@@ -21,6 +22,29 @@ from app.chats.cursor import ChatCursor
 from app.models import ChatSession, ChatStep, ToolCall
 
 _PREVIEW_MAX_CHARS = 160
+
+# ADR-042: single source of truth for stripping the leading ADR-037 conversation-settings block
+# from user-facing output (history + preview). The anchor matches EXACTLY the block that the server
+# itself emits in orchestrator._render_context_block (ADR-037 §3) and joins via _compose_turn0_text
+# (ADR-039 §3). It is applied at the serialization boundary only — stored chat_steps.payload and the
+# model replay (_build_messages) are NEVER touched, so generation is unchanged (no migration).
+#   - "block\n\nmsg" → "msg"  (normal turn, _compose_turn0_text → f"{block}\n\n{msg}")
+#   - "block"        → ""      (image-only/empty message: _compose_turn0_text returned `block`)
+# The suffix `(?:\n\n|\Z)` matches either the "\n\n" separator or end-of-text (no trailing sep).
+_CONTEXT_BLOCK_RE = re.compile(r"^\[Conversation settings for this message: [^\]]*\](?:\n\n|\Z)")
+
+
+def strip_context_block(text: str) -> str:
+    """Strip the leading ADR-037 conversation-settings block from user-facing text (ADR-042).
+
+    Single source of truth reused by both call-sites — history (``ChatsService._normalize_payload``)
+    and preview (``ChatsRepository._preview``). Strips strictly at the start; if the text does not
+    begin with the server-generated block anchor it is returned unchanged (no-op). Two persisted
+    shapes are handled (ADR-037 §`_compose_turn0_text`): ``block + "\\n\\n" + msg`` → ``msg``; and
+    the image-only/empty-message edge where the persisted text IS the bare block → ``""``.
+    The block content is never logged (ADR-037 §6 / 05-security.md).
+    """
+    return _CONTEXT_BLOCK_RE.sub("", text, count=1)
 
 
 @dataclass(frozen=True)
@@ -151,6 +175,12 @@ class ChatsRepository:
         if step is None:
             return None
         text = _text_from_payload(step.payload)
+        # ADR-042: for a user step, strip the leading ADR-037 conversation-settings block from the
+        # RAW first text block BEFORE _truncate — _truncate collapses "\n\n" → space and would break
+        # the anchor. assistant steps carry no block → not touched. Stored payload is unchanged
+        # (_text_from_payload reads only). Strip first, then truncate.
+        if step.role == "user" and text:
+            text = strip_context_block(text)
         return _truncate(text) if text else None
 
     # ---- single chat ----
