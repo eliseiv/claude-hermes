@@ -29,7 +29,8 @@
 | Тест | Уровень |
 |---|---|
 | `image` (jpeg/png/gif/webp) → корректный Anthropic `image`-блок (base64, media_type из записи) | unit |
-| `document` (PDF) → нативный `document`-блок base64; текст НЕ извлекается | unit |
+| `document` (PDF) на Anthropic → нативный `document`-блок base64; текст НЕ извлекается | unit |
+| `document` (PDF) на OpenAI (`LLM_PROVIDER=openai`) → **НЕ `422`** ([ADR-041](adr/ADR-041-openai-native-pdf-attachment.md), закрывает [TD-023](100-known-tech-debt.md)): content-часть `file` (data-URI) ИЛИ извлечённый `pypdf`-текст как text-блок (фолбэк); turn-0 сборка/плейсхолдеры/персист без изменений (сырой base64 не персистится) | unit |
 | `text` (plain/markdown/csv/json) → `text`-блок с разметкой имени файла; невалидный UTF-8 → `422` | unit |
 | MIME вне allowlist (DOCX/HEIC/zip/octet-stream) → `422 unsupported_media_type` | unit+integration |
 | Рассогласование `type`/`mediaType` ↔ magic bytes (бинарь под видом image/png) → `422` | unit |

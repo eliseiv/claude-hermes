@@ -2,6 +2,10 @@
 
 JWT, владелец = `sub`.
 
+> **Статус транспорта (важно).** Активный MVP-транспорт вложений — **inline base64** в `POST /v1/chat/run` ([ADR-020](../../adr/ADR-020-inline-base64-attachments-mvp.md)), а не двухшаговый upload ниже. Описанный в этом файле `POST /v1/attachments` (multipart) — спроектированный, но **отложенный** путь ([ADR-014](../../adr/ADR-014-multimodal-attachments.md) → Superseded для транспорта; [TD-015](../../100-known-tech-debt.md)). Канонический контракт inline-вложений — [chat-orchestrator/02-api-contracts.md](../chat-orchestrator/02-api-contracts.md) и [API-REFERENCE.md §Вложения](../../API-REFERENCE.md).
+>
+> **PDF на обоих провайдерах.** Класс `document` (`application/pdf`) принимается и на anthropic (нативный `document`-блок), и на OpenAI (content-часть `file` или извлечённый `pypdf`-текст — фолбэк) — [ADR-041](../../adr/ADR-041-openai-native-pdf-attachment.md), закрывает [TD-023](../../100-known-tech-debt.md). Маппинг провайдер-aware ([ADR-033 §5](../../adr/ADR-033-llm-provider-abstraction.md)).
+
 ## POST /v1/attachments
 Загрузка вложения (отдельным транспортом, **до** `/chat/run`).
 

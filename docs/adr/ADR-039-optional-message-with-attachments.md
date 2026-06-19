@@ -91,7 +91,7 @@ def _compose_turn0_text(block: str | None, msg: str) -> str:
 
 Пустой text-блок (`text=""`) **не отправляется ни одному провайдеру** — §2 его не создаёт. Image-only / file-only user-turn:
 - **Anthropic** — user-message из одного `image`/`document` блока валиден;
-- **OpenAI** (ADR-033) — `image_url`-блок без текстового блока валиден; PDF на OpenAI по-прежнему `422` (TD-023) — не меняется.
+- **OpenAI** (ADR-033) — `image_url`-блок без текстового блока валиден; PDF на OpenAI по-прежнему `422` (TD-023) — не меняется *(снято [ADR-041](ADR-041-openai-native-pdf-attachment.md): PDF на OpenAI теперь поддержан, TD-023 Resolved; ослабление обязательности `message` из ADR-039 не затронуто)*.
 
 Маппинг вложений в content-блоки (`attachments.py`) — без изменений. Решение про «не слать пустой text» реализуется в orchestrator (единая turn-0 сборка), а не в клиентах.
 
@@ -124,7 +124,7 @@ def _compose_turn0_text(block: str | None, msg: str) -> str:
 
 Минусы / риски:
 - Появляется ещё одно условное ветвление в turn-0 сборке (text-блок опционален). Митигировано helper'ом `_compose_turn0_text` и инвариантом «user-content непуст».
-- На OpenAI image-only работает; PDF-only по-прежнему `422` (TD-023) — клиент OpenAI-инстанса не должен слать PDF (уже задокументировано).
+- На OpenAI image-only работает; PDF-only по-прежнему `422` (TD-023) — клиент OpenAI-инстанса не должен слать PDF (уже задокументировано) *(снято [ADR-041](ADR-041-openai-native-pdf-attachment.md): PDF-only ход теперь валиден и на OpenAI, TD-023 Resolved)*.
 
 ## Альтернативы
 

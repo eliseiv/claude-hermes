@@ -18,8 +18,9 @@ The content-block mapping is PROVIDER-AWARE (ADR-033 §5), branched AFTER the sh
 - ``anthropic`` (default): image ``{type:image,source:{type:base64,...}}``, document(PDF)
   ``{type:document,...}``, text — as before;
 - ``openai``: image → ``{type:image_url,image_url:{url:"data:<mediaType>;base64,<data>"}}``, text →
-  text block, and **PDF → ValidationFailedError (422 unsupported_media_type)** because OpenAI Chat
-  Completions vision does not accept PDF (TD-023).
+  text block, and **PDF → native ``file`` content-part**
+  ``{type:"file",file:{filename,file_data:"data:application/pdf;base64,<data>"}}`` (ADR-041, closes
+  TD-023 — OpenAI vision now reads PDF; previously this was a 422).
 
 The validated attachments are mapped to content blocks IN MEMORY for the first messages.create call
 only. Raw base64 is NEVER persisted: chat_steps.payload stores a light text placeholder instead
@@ -202,10 +203,18 @@ def _anthropic_content_block(
 
 
 def _openai_content_block(att: AttachmentIn, decoded: bytes, text: str | None) -> dict[str, object]:
-    """OpenAI Chat Completions content block (ADR-033 §5).
+    """OpenAI Chat Completions content block (ADR-033 §5, ADR-041).
 
-    image → ``image_url`` with a base64 data-URI; text → text block; document (PDF) →
-    ValidationFailedError (422 unsupported_media_type) — OpenAI vision does not accept PDF (TD-023).
+    image → ``image_url`` with a base64 data-URI; text → text block; document (PDF) → native
+    Chat Completions ``file`` content-part (ADR-041, closes TD-023).
+
+    PATH CHOSEN — native file-input (ADR-041 §1, primary path), NOT the text-extraction fallback
+    (§2). Confirmed against the INSTALLED openai SDK 1.109.1: ``file`` is a first-class member of
+    ``openai.types.chat.ChatCompletionContentPartParam`` (``File`` TypedDict with required
+    ``type:"file"`` and ``file.{filename,file_data}``), so ``chat.completions.create`` accepts it
+    for the active endpoint. The data-URI form mirrors the image path
+    (``data:<mediaType>;base64,<data>``) and lets OpenAI vision read the PDF (pages text + visual).
+    The fallback (§2, pypdf text-extract) is therefore not taken.
     """
     if att.type == "image":
         return {
@@ -213,8 +222,16 @@ def _openai_content_block(att: AttachmentIn, decoded: bytes, text: str | None) -
             "image_url": {"url": f"data:{att.mediaType};base64,{att.data}"},
         }
     if att.type == "document":
-        # TD-023: OpenAI Chat Completions vision does not accept PDF documents.
-        raise ValidationFailedError(f"unsupported_media_type: {att.mediaType} is not supported")
+        # ADR-041 §1: native OpenAI file-input part. Raw base64 lives in-memory for the first
+        # call only (never persisted — placeholder, ADR-020 §3 / ADR-041 §5).
+        filename = att.filename or "file"
+        return {
+            "type": "file",
+            "file": {
+                "filename": filename,
+                "file_data": f"data:{att.mediaType};base64,{att.data}",
+            },
+        }
     return _text_block(att, text)
 
 
@@ -224,7 +241,8 @@ def _content_block(
     """Build the provider content block for one validated attachment (ADR-033 §5).
 
     Called only AFTER the shared validation. The provider branch is the single place where
-    image/document/text are mapped to the provider wire format; PDF on OpenAI is rejected here.
+    image/document/text are mapped to the provider wire format; PDF on OpenAI is a native
+    ``file`` content-part here (ADR-041), not a rejection.
     """
     if provider == PROVIDER_OPENAI:
         return _openai_content_block(att, decoded, text)
@@ -242,8 +260,9 @@ def prepare_attachments(
     base64 validity, magic-byte/UTF-8/JSON consistency, PDF page-guard — ALL shared across providers
     and run BEFORE the provider branch (ADR-033 §5). The provider then selects the content-block
     shape: ``anthropic`` (default — backward compatible) builds the native image/document/text
-    blocks; ``openai`` builds image_url/text and REJECTS PDF (422 unsupported_media_type, TD-023).
-    Raises ValidationFailedError (-> 422) on any violation. Never logs attachment content.
+    blocks; ``openai`` builds image_url/text and a native ``file`` content-part for PDF (ADR-041,
+    closes TD-023 — PDF is supported, no longer a 422). Raises ValidationFailedError (-> 422) on any
+    violation. Never logs attachment content.
     """
     if len(attachments) > settings.attachment_max_count:
         raise ValidationFailedError("too many attachments")
@@ -276,7 +295,8 @@ def prepare_attachments(
         else:  # text
             text = _decode_text(att.mediaType, decoded)
 
-        # Provider branch (AFTER shared validation): PDF→422 for openai lands here, not a 500.
+        # Provider branch (AFTER shared validation): per-provider PDF mapping lands here
+        # (anthropic document-block / openai native file-part, ADR-041), never a 500.
         content_blocks.append(_content_block(att, decoded, text, provider))
         placeholders.append(_placeholder(att, len(decoded)))
 

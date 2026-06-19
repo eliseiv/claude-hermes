@@ -8,7 +8,7 @@ Real integration with the OpenAI Python SDK (``AsyncOpenAI``) over the Chat Comp
 All OpenAI-specific (de)serialization of the wire format lives INSIDE this client (ADR-033 §3):
 - builds OpenAI Chat Completions ``messages`` from the neutral history (system message, assistant
   ``tool_calls``, ``role=tool`` with ``tool_call_id``) + first-turn attachments (image_url data-URI
-  / text; PDF is rejected upstream in attachments.py, TD-023);
+  / text / native ``file`` content-part for PDF — ADR-041, closes TD-023);
 - serializes tools to ``{type:function,function:{name(underscore),parameters}}``;
 - parses the response: ``finish_reason`` → canonical stop_reason; ``message.tool_calls[]`` → domain
   tool_uses (reverse-mapped name, ``arguments`` JSON parsed to dict; invalid JSON / unknown name →
@@ -212,8 +212,8 @@ class OpenAIClient:
         """Inject first-turn attachment content parts into the last user message (ADR-020/§5).
 
         The OpenAI user content becomes a content-part list: the existing text part(s) followed by
-        the attachment parts (image_url / text). PDF parts never reach here (rejected in
-        attachments.py for openai, TD-023). Mutates the last user message in place.
+        the attachment parts (image_url / text / native ``file`` content-part for PDF — ADR-041,
+        closes TD-023). Mutates the last user message in place.
         """
         if not attachments.content_blocks:
             return

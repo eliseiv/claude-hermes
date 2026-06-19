@@ -22,7 +22,7 @@
 **Turn 0 (новая сессия с `workspace_project_id`):** orchestrator запрашивает у workspaces `(instructions, files)` проекта владельца через `WorkspacesService.context_for_session`:
 1. **`instructions` → system-prompt.** Добавляется **после** base assistant_mode prompt ([ADR-012](../../adr/ADR-012-assistant-mode-vs-billing-mode.md)). Порядок: `base(assistant_mode)` → `\n\n` → `workspace.instructions`. Пустые/`null` → инъекции нет (system-prompt = base, prompt cache не ломается). Провайдер-агностично ([ADR-033](../../adr/ADR-033-llm-provider-abstraction.md)).
 2. **Файлы-знания → контекст первого сообщения.**
-   - document/text (`extracted_text` непуст) → текстовый блок `[Файл проекта: {filename}]\n{extracted_text}`. Работает на обоих провайдерах ([ADR-033](../../adr/ADR-033-llm-provider-abstraction.md)) — это текст, не нативный PDF (PDF→422 на OpenAI [TD-023](../../100-known-tech-debt.md) **не применяется**).
+   - document/text (`extracted_text` непуст) → текстовый блок `[Файл проекта: {filename}]\n{extracted_text}`. Работает на обоих провайдерах ([ADR-033](../../adr/ADR-033-llm-provider-abstraction.md)) by design — это текст, не нативный PDF (inline-PDF на OpenAI отдельно поддержан [ADR-041](../../adr/ADR-041-openai-native-pdf-attachment.md)).
    - image → vision-блок (механика общая с inline-attachments turn-0, провайдер-агностично через клиент).
 3. **Лимит** `WORKSPACE_CONTEXT_MAX_CHARS` (дефолт 200000) на суммарный инжектируемый текст; превышение → усечение `extracted_text` (порядок `created_at` ASC, старые первыми, усекается хвост; точная стратегия при росте — [Q-013-1](../../99-open-questions.md)). Изображения в лимит символов не входят.
 
