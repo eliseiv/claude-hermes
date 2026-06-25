@@ -99,6 +99,12 @@ services:
       - web
       - default
       - hermes-net
+    # uid 10001 (non-root) needs the docker.sock group to provision per-user Hermes instances
+    # via docker-py (ADR-046). DOCKER_SOCK_GID = gid of /var/run/docker.sock on the host
+    # (default 999 = the `docker` group on Ubuntu). Without it api gets PermissionError(13) on
+    # docker.from_env() and /v1/agent/* cannot provision — the product's core path breaks.
+    group_add:
+      - "${DOCKER_SOCK_GID:-999}"
 
   # postgres / redis / migrate: NOT overridden here — inherited from docker-compose.prod.yml
   # (only the internal `default` network, no host ports). Listed in a comment for clarity:
