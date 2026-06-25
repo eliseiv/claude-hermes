@@ -268,7 +268,7 @@ def custom_openapi(app: FastAPI) -> dict[str, Any]:
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
-        title="claude-ios-backend",
+        title="claude-hermes",
         version="0.1.0",
         description=_API_DESCRIPTION,
         openapi_tags=_OPENAPI_TAGS,
