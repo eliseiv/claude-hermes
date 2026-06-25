@@ -105,6 +105,13 @@ services:
     # docker.from_env() and /v1/agent/* cannot provision — the product's core path breaks.
     group_add:
       - "${DOCKER_SOCK_GID:-999}"
+    # Share HERMES_VOLUME_ROOT between api and the Docker daemon host (ADR-046/056). The control
+    # plane os.makedirs(HERMES_VOLUME_ROOT/<user_id>) + writes config.yaml INSIDE api; the daemon
+    # bind-mounts that SAME host path into each Hermes container at /opt/data. Without this shared
+    # bind, api writes into its own root-owned /opt/data layer -> PermissionError. Host dir must be
+    # writable by uid 10001 (chown 10001:10001 on the server). Merges with the inherited docker.sock.
+    volumes:
+      - "${HERMES_VOLUME_ROOT:-/opt/data/hermes}:${HERMES_VOLUME_ROOT:-/opt/data/hermes}"
 
   # postgres / redis / migrate: NOT overridden here — inherited from docker-compose.prod.yml
   # (only the internal `default` network, no host ports). Listed in a comment for clarity:
