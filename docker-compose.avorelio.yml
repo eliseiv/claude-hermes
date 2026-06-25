@@ -130,6 +130,11 @@ networks:
   #   docker network inspect <project>_web -> .[0].IPAM.Config[].Subnet
   web:
     external: false
+    # Pin the network NAME to "web" (no project prefix). The api carries the inherited label
+    # `traefik.docker.network=web` (ADR-017 contract); without this pin Compose would create
+    # `claude-hermes_web`, the label would NOT match, and Traefik would fall back to the wrong
+    # (default) network IP -> 504 to every route. Pinning the name makes the label resolve.
+    name: web
   # `default` stays internal (base). `hermes-net` stays external (ADR-046 invariant — the
   # control plane provisions per-user Hermes containers OUTSIDE this compose project via
   # docker-py and must reach the network under its FLAT name, not `<project>_hermes-net`).
