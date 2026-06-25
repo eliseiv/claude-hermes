@@ -29,7 +29,7 @@ CREATE TABLE auth_refresh_tokens (
 CREATE UNIQUE INDEX ux_refresh_token_hash ON auth_refresh_tokens (token_hash);
 CREATE INDEX ix_refresh_user_device ON auth_refresh_tokens (user_id, device_id);
 ```
-> Opaque refresh-token хранится **только** как хэш. `used_at`/`revoked_at` реализуют single-use rotation и анти-кражу: предъявление токена с непустым `used_at` → reuse → ревокация цепочки (`SET revoked_at=now WHERE user_id=? AND device_id=?`). Истёкшие/использованные/отозванные строки — кандидаты на фоновую очистку ([TD-013](../../100-known-tech-debt.md), не блокер MVP).
+> Opaque refresh-token хранится **только** как хэш. `used_at`/`revoked_at` реализуют single-use rotation и анти-кражу: предъявление токена с непустым `used_at` → reuse → ревокация цепочки (`SET revoked_at=now WHERE user_id=? AND device_id=?`). Истёкшие/использованные/отозванные строки очищаются **фоновой задачей** ([TD-013](../../100-known-tech-debt.md), prod-harden): переиспользует reaper-паттерн ([ADR-046 §5](../../adr/ADR-046-per-user-hermes-runtime.md)) — периодический `DELETE WHERE expires_at < now() OR ((used_at IS NOT NULL OR revoked_at IS NOT NULL) AND COALESCE(used_at, revoked_at) < now() - grace)`. Env: `AUTH_REFRESH_CLEANUP_INTERVAL_SECONDS` (дефолт `3600`), `AUTH_REFRESH_CLEANUP_GRACE_SECONDS` (дефолт `604800` = 7д, чтобы недавно-ротированные оставались доступны reuse-детекту). Контракт auth не меняется; без миграции.
 
 ## 21. auth_identities ([ADR-043](../../adr/ADR-043-sign-in-with-apple.md), миграция `0012`)
 ```sql

@@ -18,6 +18,10 @@ dependencies = [
     # LLM_PROVIDER=openai; the default anthropic path does not import it at runtime.
     "openai>=1.51,<2",
     "httpx>=0.27,<0.28",
+    # ADR-046: Docker SDK (docker-py) for per-user Hermes runtime management (run/start/stop/
+    # remove/inspect) in src/app/hermes_runtime/docker_backend.py (RuntimeBackend impl). Requires
+    # control-plane access to the Docker socket (07-deployment.md, 05-security.md).
+    "docker>=7,<8",
     "pyjwt[crypto]>=2.9,<2.10",
     "cryptography>=43,<44",
     "prometheus-client>=0.21,<0.22",
@@ -74,6 +78,11 @@ strict = true
 module = ["testcontainers.*", "respx.*"]
 ignore_missing_imports = true
 
+# docker-py (ADR-046) ships no py.typed; treat its public API as untyped at the import boundary.
+[[tool.mypy.overrides]]
+module = ["docker.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
@@ -84,3 +93,31 @@ markers = [
 
 [tool.coverage.run]
 source = ["src"]
+# COVERAGE MEASUREMENT CORE: sys.monitoring (PEP 669, Python 3.12+), not the legacy C tracer.
+# ----------------------------------------------------------------------------------------------
+# WINDOWS SEGFAULT ROOT CAUSE (devops, infra fix): the full `--cov` run crashed on Windows with
+# a "Windows fatal exception: access violation" (~23% in), faulthandler upcalls landing in
+# hmac.py digest / cryptography. The SAME suite WITHOUT coverage (`--no-cov`) ran clean — so the
+# crash is the coverage MEASUREMENT BACKEND, not the tests.
+#   The legacy backend installs `sys.settrace` PER THREAD. With `concurrency=["thread"]` it also
+#   hooked the `asyncio.to_thread` ThreadPoolExecutor WORKER THREADS. Those worker threads run
+#   heavy NATIVE C code (cryptography/hmac digest, asyncpg, pydantic-core). A C-level trace
+#   callback firing across native (re-entrant) C frames on the Windows runtime is the access
+#   violation. This is a known class of native crash with settrace-based coverage on Windows.
+#
+# FIX: use the sys.monitoring core (`COVERAGE_CORE=sysmon`, exposed in config as `core`). It is
+# an interpreter-level monitoring API (PEP 669), NOT a per-thread C settrace hook, so it does not
+# wrap native C frames the way settrace does — the access violation disappears. It is also faster.
+# Requires coverage >= 7.4 (we have 7.14.0 in uv.lock) and Python >= 3.12 (target runtime).
+#
+# `concurrency` is INTENTIONALLY REMOVED: with sysmon, monitoring is process/interpreter-wide and
+# is NOT installed per-thread via settrace, so coverage of `asyncio.to_thread` worker-thread code
+# and event-loop coroutines is captured WITHOUT the `["thread"]` concurrency model — and keeping
+# it provided no benefit while it was exactly the per-thread-tracer path that crashed natively on
+# Windows. (Still NOT "greenlet": SQLAlchemy's greenlet bridge is not a coverage scheduling model;
+# still NOT "multiprocessing": no pytest-xdist / multiprocessing test parallelism.)
+#
+# `core` here is the authoritative channel (applies to EVERY invocation incl. a developer's manual
+# narrow `uv run pytest --cov ...`); Makefile/CI ALSO export COVERAGE_CORE=sysmon as belt-and-
+# suspenders for older coverage that does not read the `core` config key.
+core = "sysmon"

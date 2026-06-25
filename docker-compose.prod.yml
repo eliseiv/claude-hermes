@@ -29,8 +29,20 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      # ADR-053 role passwords — consumed by docker/postgres/init/01-roles.sh at FIRST init.
+      # ⚠️ The init script ONLY runs on an EMPTY volume. On an EXISTING prod DB (data already
+      # present) it is NOT executed — apply the roles MANUALLY via the runbook in
+      # docs/07-deployment.md §Роли БД ("CREATE ROLE — prod (existing DB)"). REAL secrets via
+      # the secret manager; must match the role passwords embedded in DATABASE_URL /
+      # DATABASE_URL_MIGRATE.
+      APP_RW_PASSWORD: ${APP_RW_PASSWORD:?set APP_RW_PASSWORD in .env}
+      APP_MIGRATE_PASSWORD: ${APP_MIGRATE_PASSWORD:?set APP_MIGRATE_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # ADR-053 role bootstrap (app_rw / app_migrate). Effective ONLY on a fresh pgdata volume
+      # (Postgres runs initdb scripts once). For an existing prod DB use the manual CREATE ROLE
+      # runbook in docs/07-deployment.md §Роли БД. Read-only mount.
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     # No host port published and NOT on `web`: postgres is reachable only on the internal
     # `default` network by service name (ADR-017 req. 4).
     networks:
@@ -84,6 +96,9 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-claude-ios}-backend:prod
     restart: "no"
     env_file:
+      # Carries DATABASE_URL_MIGRATE (app_migrate role, ADR-053). env.py resolves
+      # DATABASE_URL_MIGRATE first, falling back to DATABASE_URL. The migrate job MUST run under
+      # app_migrate (full DDL) so migration 0016 can REVOKE/GRANT on audit_logs.
       - .env
     command: ["alembic", "upgrade", "head"]
     depends_on:
@@ -138,6 +153,28 @@ services:
     volumes:
       - ./.secrets:/app/.secrets:ro
       - ./certs/appstore:/etc/appstore-certs:ro
+      # --- Hermes runtime control plane: Docker daemon access (ADR-046, 07-deployment.md
+      #     §Hermes runtime; 05-security.md §Multi-tenant изоляция). The control plane manages
+      #     per-user Hermes containers (docker run/start/stop/remove/inspect) via docker-py
+      #     (src/app/hermes_runtime/docker_backend.py -> docker.from_env() reads /var/run/docker.sock).
+      #
+      # ⚠️ SECURITY WARNING — HIGH PRIVILEGE. Access to the Docker daemon ≈ ROOT ON THE HOST
+      #     (05-security.md threat: "Эскалация через Docker socket control plane"). Mitigations
+      #     enforced here / per docs:
+      #       - the socket is mounted ONLY into THIS `api` control-plane container — NEVER into the
+      #         Hermes instances themselves, and never into postgres/redis (05-security.md §70/§259);
+      #       - mounted READ-ONLY (`:ro`): docker-py talks to the daemon over the socket's UNIX
+      #         stream regardless of the file's rw bit, but `:ro` removes write perms on the socket
+      #         inode as defence-in-depth (no truncation/replacement of the socket file);
+      #       - the runtime user is non-root (uid 10001, Dockerfile) — daemon access is via the
+      #         socket, not host root login.
+      #     A TLS-protected REMOTE Docker API is the safer alternative the docs call out
+      #     (07-deployment.md §Hermes runtime / ADR-046 Consequences): to use it instead of the
+      #     socket, REMOVE this mount and set DOCKER_HOST=tcp://<host>:2376 + DOCKER_TLS_VERIFY=1 +
+      #     DOCKER_CERT_PATH in .env (docker.from_env() honours them). Do NOT disable TLS verify.
+      #     On a SHARED server, coordinate socket exposure with the infra owner (isolation from
+      #     neighbouring services — 07-deployment.md §Hermes runtime).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     # api binds inside the container to 0.0.0.0:8000 (Dockerfile CMD / Gunicorn).
     # NO `ports:` mapping — we MUST NOT publish 80/443 or any host port (ADR-017 req. 1:
     # conflict with Traefik). Only `expose` the internal 8000 so Traefik can reach it over
@@ -154,8 +191,15 @@ services:
     networks:
       # `web` — external, shared with Traefik (inbound proxying to api:8000).
       # `default` — internal, for api <-> postgres/redis.
+      # `hermes-net` — external, dedicated control-plane <-> Hermes-instance network (ADR-046,
+      #   07-deployment.md §Hermes runtime). The control plane attaches the per-user Hermes
+      #   containers it provisions to this SAME network (docker-py `network=` from
+      #   HERMES_DOCKER_NETWORK, default `hermes-net`), then reaches them by container DNS name
+      #   (hermes-user-<id>:8642). The instances themselves do NOT publish a host port — access is
+      #   ONLY from this network. `api` must be ON this network to reach them.
       - web
       - default
+      - hermes-net
     # App-level readiness (docs/07-deployment.md: GET /ready checks DB + Redis). This is the
     # in-container probe; Traefik's own health check (if configured by the server owner) hits
     # /healthz over the `web` network.
@@ -202,6 +246,22 @@ networks:
     external: true
   # Internal stack network for api <-> postgres/redis (created/managed by this compose file).
   default:
+  # Dedicated control-plane <-> Hermes-instance network (ADR-046, 07-deployment.md §Hermes runtime,
+  # env HERMES_DOCKER_NETWORK default `hermes-net`). Declared `external: true` for the SAME reason
+  # as `web`: the per-user Hermes containers are created OUTSIDE this compose project (by docker-py
+  # in the control plane), so the network MUST pre-exist and be SHARED across compose & docker-py,
+  # not auto-prefixed with the project name (which would make it `<proj>_hermes-net` and invisible
+  # to docker-py's plain `hermes-net` attach). Create it ONCE on the server (07-deployment.md
+  # §Hermes runtime):  docker network create hermes-net
+  #
+  # MULTI-INSTANCE NOTE (ADR-017 §Мульти-инстанс, Q-046-3): the network NAME is the literal value of
+  # HERMES_DOCKER_NETWORK from .env. For multiple control planes on the shared Docker daemon, give
+  # each instance its OWN network (e.g. HERMES_DOCKER_NETWORK=<proj>-hermes-net created on the
+  # server) so a control plane only sees / reaches ITS OWN Hermes containers. The default
+  # `hermes-net` is correct for a single control plane; see .env.prod.example and Q-046-3.
+  hermes-net:
+    external: true
+    name: ${HERMES_DOCKER_NETWORK:-hermes-net}
 
 volumes:
   pgdata:

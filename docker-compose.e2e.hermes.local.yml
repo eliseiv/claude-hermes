@@ -1,0 +1,25 @@
+# =============================================================================
+# E2E LOCAL fixup override for the REAL-Hermes agent path on Docker Desktop.
+# Compose AFTER the three base/e2e/hermes files:
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml \
+#     -f docker-compose.e2e.hermes.yml -f docker-compose.e2e.hermes.local.yml up -d
+#
+# WHY: the control plane (src/app/hermes_runtime/docker_backend.py::_provision_sync) does
+#   os.makedirs(HERMES_VOLUME_ROOT/<user_id>) + writes config.yaml INSIDE the api container,
+#   then bind-mounts that SAME path (resolved by the Docker daemon) into each Hermes container.
+#   For the config.yaml the api writes to actually land in the Hermes bind-mount, the api
+#   container and the daemon host MUST share HERMES_VOLUME_ROOT. The base/e2e/hermes overrides
+#   give api docker.sock + hermes-net but DO NOT share the volume root, so os.makedirs('/opt/data')
+#   fails with PermissionError(13) for the non-root uid 10001.
+#
+# FIX (local/e2e only): bind the daemon-host (Docker Desktop Linux VM) directory /opt/data/hermes
+#   into api at the SAME path. The dir is pre-created world-writable in the VM:
+#     docker run --rm -v /opt/data:/h alpine sh -c 'mkdir -p /h/hermes && chmod 0777 /h/hermes'
+#   Now api (uid 10001) writes <root>/<id>/config.yaml; the daemon bind-mounts the identical VM
+#   path into hermes-user-<id>:/opt/data — the semantics line up.
+#
+# This is a LOCAL e2e artifact (Docker Desktop). It does not change base/e2e/hermes semantics.
+services:
+  api:
+    volumes:
+      - /opt/data/hermes:/opt/data/hermes

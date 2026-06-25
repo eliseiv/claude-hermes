@@ -1,0 +1,128 @@
+# =============================================================================
+# OVERLAY for the DEDICATED server avorelio (87.239.135.156) — self-hosted Traefik
+# (ADR-057, docs/07-deployment.md §Топология №2). This file is an OVERLAY on top of
+# docker-compose.prod.yml and MUST be merged with it:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env <cmd>
+#
+# WHY A SEPARATE OVERLAY (Q-057-1): the broadnova `.154` topology (docker-compose.prod.yml
+# alone) uses an EXTERNAL Traefik (/opt/edge) and an EXTERNAL `web` network, and has NO
+# `traefik` service. The avorelio `.156` topology needs (a) OUR OWN `traefik` container that
+# owns ports 80/443 and issues Let's Encrypt certs, and (b) an INTERNAL `web` network (no
+# external co-owner). Those two requirements are INCOMPATIBLE with the live `.154` config, so
+# they live in THIS overlay and are merged only on `.156`. The base file is UNCHANGED -> the
+# live broadnova `.154` `compose config` does NOT regress (run WITHOUT this overlay there).
+#
+# DUALITY RESOLUTION (Q-057-1, verified): docker compose deep-merges networks. Setting
+# `external: false` HERE explicitly OVERRIDES the base `web.external: true` (compose then
+# creates `<project>_web` itself). NOTE: merely re-declaring `web: {}` does NOT override
+# (deep-merge keeps the base `external: true`); the explicit `external: false` is REQUIRED.
+# `default` stays internal (base); `hermes-net` stays `external: true` (ADR-046 invariant —
+# the control plane's docker-py must see it under its flat name, NOT `<project>_hermes-net`).
+#
+# Secrets: NONE in this file — only ${VAR} substitutions resolved from /opt/claude-hermes/.env
+# on the server (provisioned from the secret manager; .env is gitignored; never commit it).
+# =============================================================================
+
+services:
+  # OUR self-hosted reverse-proxy + TLS (ADR-057 §1/§2). This is the ONLY service that
+  # publishes host ports. Static config is supplied entirely via CLI flags in `command:`
+  # (ADR-057 §2 — no traefik.yml file). Dynamic routing comes from docker-labels on `api`
+  # (provider docker), reused unchanged from docker-compose.prod.yml.
+  traefik:
+    # PINNED minor (never :latest). Traefik v3.3 line (ADR-057: traefik:v3.x pinned).
+    image: traefik:v3.3
+    restart: unless-stopped
+    # The ONLY service with host ports on the dedicated server. 80 is required for the
+    # ACME HTTP-01 challenge AND the HTTP->HTTPS redirect; 443 serves TLS traffic.
+    ports:
+      - "80:80"
+      - "443:443"
+    command:
+      # --- Docker provider: discover routers/services from container labels only when
+      #     explicitly enabled (exposedbydefault=false -> only `traefik.enable=true` services).
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      # --- Entrypoints: web=:80 (HTTP + ACME HTTP-01), websecure=:443 (TLS).
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # --- Global HTTP->HTTPS redirect on the web entrypoint (only changes the request
+      #     scheme; it does NOT touch RESPONSE headers, so the ADR-010 /v1/preview/* sandbox
+      #     header pass-through is preserved — ADR-057 §4, 07-deployment.md §preview).
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # --- ACME Let's Encrypt resolver `le` (name kept identical to the .154 label contract
+      #     so api's reused labels work unchanged). ACME_EMAIL is MANDATORY -> Traefik
+      #     fail-fast on start if empty (`:?`). HTTP-01 challenge over the web entrypoint
+      #     (needs port 80 publicly reachable + a valid A-record avorelio.shop -> .156).
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL:?set ACME_EMAIL in .env}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      # --- Dashboard/API OFF (ADR-057 §4): not published, no auth surface.
+      - "--api=false"
+      # --- Optional observability (ADR-057 §2): access log + INFO level.
+      - "--accesslog=true"
+      - "--log.level=INFO"
+    volumes:
+      # Docker provider reads the Docker API for service discovery. READ-ONLY (`:ro`):
+      # the provider only READS labels/containers; `:ro` removes write perms on the socket
+      # inode as defence-in-depth. ⚠️ Docker API access ~= root on the host even with `:ro`
+      # (ADR-057 §4 / 05-security.md) — mitigations: dedicated server, discovery-only use,
+      # socket-proxy is the documented hardening задел (Q-057-2), not the start default.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Persistent ACME store. Named volume (NOT a host bind-mount) so acme.json survives
+      # container recreation without a manual `chmod 600` on the host (ADR-057 §2). Traefik
+      # creates the file with 0600 inside the volume on first issuance.
+      - traefik-acme:/letsencrypt
+    networks:
+      # INTERNAL `web` network (overridden to non-external below) — Traefik reaches `api`
+      # over it. (Traefik discovers ALL containers via the Docker socket regardless of
+      # network membership, but it must SHARE `web` with api to ROUTE traffic to it.)
+      - web
+    depends_on:
+      # Best-effort ordering: bring api up before/with traefik so the first ACME issuance
+      # has a backend to route to. Not a hard gate (api has its own healthcheck).
+      - api
+
+  # api OVERRIDE: on `.156` the `web` network is INTERNAL (created by compose), unlike the
+  # external `web` on `.154`. The base file already declares api on web+default+hermes-net
+  # and carries the correct Traefik labels (Host(${SERVICE_DOMAIN})=avorelio.shop,
+  # entrypoints=websecure, tls.certresolver=${TRAEFIK_CERTRESOLVER}=le,
+  # loadbalancer.server.port=8000) — those are REUSED AS-IS (not duplicated here). We only
+  # re-declare the networks so the merged config is explicit; values are identical to base,
+  # so this is a behavioural no-op on the network set (web is internal here purely via the
+  # `networks:` block override at the bottom). NO host `ports:` are added (invariant: only
+  # traefik publishes ports). docker.sock stays `:ro` (inherited from base, ADR-046).
+  api:
+    networks:
+      - web
+      - default
+      - hermes-net
+
+  # postgres / redis / migrate: NOT overridden here — inherited from docker-compose.prod.yml
+  # (only the internal `default` network, no host ports). Listed in a comment for clarity:
+  #   postgres -> default (base)
+  #   redis    -> default (base)
+  #   migrate  -> default (base)
+
+networks:
+  # OVERRIDE the base `web.external: true` -> INTERNAL compose-managed network on `.156`.
+  # On the dedicated server there is NO external co-owner of `web` (no /opt/edge Traefik),
+  # so compose creates `<project>_web` itself (no manual `docker network create web`).
+  # ⚠️ The explicit `external: false` is REQUIRED — a bare `web: {}` would deep-merge and
+  # keep the base `external: true` (verified). With `external: false` the merged `config`
+  # shows `name: <project>_web` and NO `external: true` for web.
+  # TRUSTED_PROXY_IPS in .env must equal this network's subnet:
+  #   docker network inspect <project>_web -> .[0].IPAM.Config[].Subnet
+  web:
+    external: false
+  # `default` stays internal (base). `hermes-net` stays external (ADR-046 invariant — the
+  # control plane provisions per-user Hermes containers OUTSIDE this compose project via
+  # docker-py and must reach the network under its FLAT name, not `<project>_hermes-net`).
+  # Both are inherited from docker-compose.prod.yml and intentionally NOT re-declared.
+
+volumes:
+  # Persistent ACME storage for our Traefik (acme.json). Named volume survives container
+  # recreation (ADR-057 §2). pgdata/redisdata are inherited from the base file.
+  traefik-acme:

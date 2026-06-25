@@ -46,11 +46,22 @@ os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
 # JWT: tokens are signed below with an ephemeral RSA key (_PRIVATE_PEM); the service must
 # verify with the matching JWT_PUBLIC_KEY and the iss/aud baked into make_jwt(). Force a
 # static public-key posture (no JWKS) and a fixed issuer/audience the factory mirrors.
+# NOTE (ADR-044): the JWT contour is DORMANT — the hot client path now authenticates via
+# X-API-Key + X-User-Id. The JWT env/key material is still forced so the dormant-issuer tests
+# (/v1/auth/*, JwtVerifier) keep verifying against a known key, but make_jwt() is NO LONGER the
+# way to authenticate /v1/* (auth_headers below emits the client-contour headers instead).
 _TEST_JWT_ISSUER = "claude-ios-tests"
 _TEST_JWT_AUDIENCE = "claude-ios-tests"
 os.environ["JWT_JWKS_URL"] = ""
 os.environ["JWT_ISSUER"] = _TEST_JWT_ISSUER
 os.environ["JWT_AUDIENCE"] = _TEST_JWT_AUDIENCE
+
+# Client API-KEY auth (ADR-044): the trusted client key authenticating every /v1/* request.
+# Forced (not setdefault) so a root .env value cannot leak in. auth_headers() puts this exact
+# value in X-API-Key; verify_client_api_key() constant-time compares it vs settings.client_api_key.
+_TEST_CLIENT_API_KEY = "test-client-api-key-0123456789abcdef0123456789abcdef"  # >= 32 bytes
+os.environ["CLIENT_API_KEY"] = _TEST_CLIENT_API_KEY
+os.environ["CLIENT_API_KEY_PREV"] = ""
 
 import jwt as pyjwt  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
@@ -143,6 +154,9 @@ async def _engine(_migrated: str):
 
 _TABLES = (
     "audit_logs",
+    # ADR-052 (migration 0015): durable subscription-grant idempotency anchor. FK→users CASCADE,
+    # but listed explicitly so it is reset deterministically between admin-subscription-grant tests.
+    "subscription_grant_events",
     "tool_calls",
     "chat_steps",
     # Workspaces (ADR-036, migration 0011): workspace_files → workspace_projects (CASCADE) and
@@ -473,16 +487,16 @@ async def client(
     orig_other = rate_limit.enforce_other_limits
     rate_limit.enforce_chat_limits = _allow_chat  # type: ignore[assignment]
     rate_limit.enforce_other_limits = _allow_other  # type: ignore[assignment]
-    # The routers imported the names at module load — patch there too.
+    # The routers imported the names at module load — patch there too. The subscription router was
+    # RETIRED (TD-021/ADR-029 revision): POST /v1/subscription/sync no longer exists, so there is no
+    # subscription router to patch here (importing it would ImportError and break the whole suite).
     from app.api_gateway.routers import byok as byok_router
     from app.api_gateway.routers import chat as chat_router
-    from app.api_gateway.routers import subscription as sub_router
     from app.api_gateway.routers import wallet as wallet_router
 
     chat_router.enforce_chat_limits = _allow_chat  # type: ignore[assignment]
     wallet_router.enforce_other_limits = _allow_other  # type: ignore[assignment]
     byok_router.enforce_other_limits = _allow_other  # type: ignore[assignment]
-    sub_router.enforce_other_limits = _allow_other  # type: ignore[assignment]
 
     app = create_app()
     app.dependency_overrides[deps.get_db] = _override_db
@@ -496,7 +510,6 @@ async def client(
     chat_router.enforce_chat_limits = orig_chat  # type: ignore[assignment]
     wallet_router.enforce_other_limits = orig_other  # type: ignore[assignment]
     byok_router.enforce_other_limits = orig_other  # type: ignore[assignment]
-    sub_router.enforce_other_limits = orig_other  # type: ignore[assignment]
 
 
 # ----------------------------- DB seeding helpers -----------------------------
@@ -566,4 +579,15 @@ async def seed_user(
 
 
 def auth_headers(user_id: uuid.UUID | str, **kwargs: Any) -> dict[str, str]:
-    return {"Authorization": f"Bearer {make_jwt(user_id, **kwargs)}"}
+    """Client-contour auth headers for /v1/* requests (ADR-044): X-API-Key + X-User-Id.
+
+    Replaces the former ``Authorization: Bearer <jwt>`` header — the JWT contour is dormant
+    (ADR-044 §4) and no longer authenticates /v1/*. The trusted client key authenticates the
+    request; ``X-User-Id`` carries the trusted subject identity.
+
+    ``**kwargs`` is accepted and ignored for backward-compatibility with the few call sites that
+    still pass JWT-only options (``expired=`` / ``device_id=``); those notions have no meaning on
+    the client contour (there is no token to expire), so callers relying on them are migrated
+    individually. The subject UUID is the only thing that maps across both models.
+    """
+    return {"X-API-Key": _TEST_CLIENT_API_KEY, "X-User-Id": str(user_id)}

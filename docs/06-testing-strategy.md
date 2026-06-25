@@ -11,6 +11,12 @@
 - Глобальный минимум: **80%** (`--cov-fail-under=80`, см. [02-tech-stack.md](02-tech-stack.md)).
 - Критические пакеты (`policy`, `wallet`, `byok`) — целевое покрытие **≥ 95%**, проверяется per-package в CI.
 
+### Coverage measurement core — `sys.monitoring` (sysmon), Windows-обязательно
+- Coverage использует **`sys.monitoring` (PEP 669, Python 3.12+)** как measurement core, **не** legacy C-tracer (`settrace`): `[tool.coverage.run] core = "sysmon"` в `pyproject.toml` + `COVERAGE_CORE=sysmon` в Makefile/CI (belt-and-suspenders для старых coverage без чтения config-ключа `core`).
+- **Почему обязательно (Windows):** legacy backend ставит `sys.settrace` **per-thread**; с `concurrency=["thread"]` он оборачивал worker-потоки `asyncio.to_thread` (ThreadPoolExecutor), исполняющие тяжёлый нативный C-код (`cryptography`/`hmac` digest, `asyncpg`, `pydantic-core`). C-level trace на нативных C-frames на Windows давал **access-violation segfault**. Тот же набор без coverage (`--no-cov`) проходил чисто → крэш — в measurement-backend, не в тестах. `sysmon` — interpreter-level API (PEP 669), не per-thread C-hook, нативные C-frames не оборачивает → segfault исчезает (и быстрее). Требует `coverage >= 7.4` (в lock — 7.14.0) и Python ≥ 3.12.
+- **`concurrency=["thread"]` намеренно УДАЛЁН:** с sysmon мониторинг process/interpreter-wide (не per-thread settrace), поэтому покрытие кода worker-потоков `asyncio.to_thread` и корутин event-loop захватывается **без** `["thread"]`; а именно per-thread-tracer-путь и крэшил нативно на Windows. (Не `greenlet`: greenlet-мост SQLAlchemy — не модель планирования coverage.)
+- Подтверждено финальным прогоном (2026-06-24): **1827 passed, 0 failed, coverage 94.5%, без segfault**.
+
 ## Обязательные тест-кейсы (привязка к AC из 00-vision)
 | Тест | AC | Уровень |
 |---|---|---|

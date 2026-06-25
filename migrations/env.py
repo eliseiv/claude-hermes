@@ -26,14 +26,17 @@ def _db_url() -> str:
     Priority: the URL passed via the Alembic Config (alembic.ini `sqlalchemy.url` or a value
     injected programmatically through `config`). This lets migrations run against an arbitrary
     DB handed in via Alembic Config (e2e DB / testcontainers) without depending on env load
-    order. Fallback to `get_settings().database_url` ONLY when the Config key is empty/unset,
-    so the docker-compose `migrate` job (which relies on DATABASE_URL) keeps working.
+    order. Fallback ONLY when the Config key is empty/unset: prefer DATABASE_URL_MIGRATE (the
+    full-privilege `app_migrate` role for DDL — ADR-053 durable append-only audit_logs), falling
+    back to DATABASE_URL when DATABASE_URL_MIGRATE is unset (local single-role / backward-compat),
+    so the docker-compose `migrate` job keeps working with either DSN.
     """
     section = config.get_section(config.config_ini_section, {}) or {}
     configured = config.get_main_option("sqlalchemy.url") or section.get("sqlalchemy.url")
     if configured:
         return configured
-    return get_settings().database_url
+    settings = get_settings()
+    return settings.database_url_migrate or settings.database_url
 
 
 def run_migrations_offline() -> None:

@@ -1,6 +1,6 @@
 # 03 — Data Model
 
-PostgreSQL 16. **21 таблица спроектирована; 15 активны на MVP, 3 отложены** (`snippets`, `attachments`, `device_push_tokens` — миграция `0004` их **не создаёт**). `auth_identities` — Sign in with Apple (миграция `0012`, [ADR-043](adr/ADR-043-sign-in-with-apple.md)), спроектирована, ожидает реализации; `adapty_webhook_events` — миграция `0008`. `workspace_projects`/`workspace_files` — **Поставка 3 (миграция `0011`)**, реализуются ([ADR-036](adr/ADR-036-workspaces-implementation.md), собственное BYTEA-хранение, не зависят от `attachments`). Активные на MVP: 9 базовых + `projects`/`site_files` website-builder + 1 расширения Figma-gap Sprint 1 (`user_preferences`) + 2 встроенного auth-issuer (`auth_devices`, `auth_refresh_tokens`, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)). Отдельно про `attachments`: таблица **спроектирована, но на MVP не создаётся** — двухшаговый transport [ADR-014](adr/ADR-014-multimodal-attachments.md) Superseded ([TD-015](100-known-tech-debt.md)), chat-вложения на MVP реализуются inline base64 без таблицы ([ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md)). UUID v4 (`gen_random_uuid()` из `pgcrypto`). Все timestamp — `timestamptz`, UTC. Деньги/кредиты — целочисленные (минимальная неделимая единица), без float.
+PostgreSQL 16. **23 таблицы спроектированы; 15 активны на MVP, 3 отложены.** `subscription_grant_events` — prod-harden durable idempotency subscription-grant (миграция `0015`, [ADR-052](adr/ADR-052-durable-subscription-idempotency.md)), спроектирована, ожидает реализации. Колонка `wallets.debt` (миграция `0014`, [ADR-051](adr/ADR-051-agent-debt-reconciliation.md)) и durable append-only `audit_logs` (миграция `0016`, [ADR-053](adr/ADR-053-audit-logs-db-append-only.md)) — prod-harden, ожидают реализации. `hermes_instances` — Hermes-интеграция (миграция `0013`, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)), спроектирована, ожидает реализации. (`snippets`, `attachments`, `device_push_tokens` — миграция `0004` их **не создаёт**). `auth_identities` — Sign in with Apple (миграция `0012`, [ADR-043](adr/ADR-043-sign-in-with-apple.md)), спроектирована, ожидает реализации; `adapty_webhook_events` — миграция `0008`. `workspace_projects`/`workspace_files` — **Поставка 3 (миграция `0011`)**, реализуются ([ADR-036](adr/ADR-036-workspaces-implementation.md), собственное BYTEA-хранение, не зависят от `attachments`). Активные на MVP: 9 базовых + `projects`/`site_files` website-builder + 1 расширения Figma-gap Sprint 1 (`user_preferences`) + 2 встроенного auth-issuer (`auth_devices`, `auth_refresh_tokens`, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)). Отдельно про `attachments`: таблица **спроектирована, но на MVP не создаётся** — двухшаговый transport [ADR-014](adr/ADR-014-multimodal-attachments.md) Superseded ([TD-015](100-known-tech-debt.md)), chat-вложения на MVP реализуются inline base64 без таблицы ([ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md)). UUID v4 (`gen_random_uuid()` из `pgcrypto`). Все timestamp — `timestamptz`, UTC. Деньги/кредиты — целочисленные (минимальная неделимая единица), без float.
 
 > Расширение (2026-06-02, Figma-gap, см. [figma-gap-analysis.md](figma-gap-analysis.md)): новые таблицы и колонки спроектированы как expand-only миграции (`0004`+). Затронутые ADR: [ADR-012](adr/ADR-012-assistant-mode-vs-billing-mode.md) (`assistant_mode`), [ADR-013](adr/ADR-013-workspace-projects-vs-website-builder.md) (workspaces), [ADR-014](adr/ADR-014-multimodal-attachments.md) (attachments — **спроектирована, реализация отложена**, transport Superseded → [TD-015](100-known-tech-debt.md); MVP — inline base64 [ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md)), [ADR-015](adr/ADR-015-consumable-token-iap.md) (consumable IAP — без новой таблицы). На MVP миграция `0004` создаёт только Sprint-1 объекты (`user_preferences`, поля `chat_sessions`/`users`); `workspace_projects`/`workspace_files`/`snippets`/`attachments`/`device_push_tokens` — Sprint-2/3, **не созданы**.
 
@@ -30,6 +30,7 @@ erDiagram
     users ||--o{ auth_devices : "identified by"
     auth_devices ||--o{ auth_refresh_tokens : issues
     users ||--o{ auth_identities : "linked via"
+    users ||--o| hermes_instances : "runs"
 
     users { uuid id PK }
     subscriptions { uuid user_id FK }
@@ -51,6 +52,7 @@ erDiagram
     auth_devices { text device_id PK }
     auth_refresh_tokens { uuid id PK }
     auth_identities { uuid id PK }
+    hermes_instances { uuid user_id FK }
 ```
 
 ## Enum-типы
@@ -107,10 +109,13 @@ CREATE INDEX ix_subscriptions_expires_at ON subscriptions (expires_at);
 CREATE TABLE wallets (
     user_id     UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     balance     BIGINT NOT NULL DEFAULT 0,
+    debt        BIGINT NOT NULL DEFAULT 0,  -- ADR-051: накопленная несписанная дельта агентного прогона (кредиты), миграция 0013→0014
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT ck_wallets_balance_nonneg CHECK (balance >= 0)  -- AC-3: no negative
+    CONSTRAINT ck_wallets_balance_nonneg CHECK (balance >= 0),  -- AC-3: no negative
+    CONSTRAINT ck_wallets_debt_nonneg    CHECK (debt >= 0)      -- ADR-051: долг неотрицателен
 );
 ```
+> **`debt` ([ADR-051](adr/ADR-051-agent-debt-reconciliation.md), миграция `0014`, expand-only).** Реконсиляция несписанной дельты агентного прогона ([ADR-047 §6](adr/ADR-047-usage-based-billing-for-agent.md), [TD-029](100-known-tech-debt.md)). При `InsufficientCredits` на агентном `run.completed` `consume` списывает доступный `balance` (частично, ledger-debit) и **недобор `delta=amount-balance` → `debt += delta`** (НЕ ledger-строка — ledger остаётся чистым, сверка `balance == Σ(credit)−Σ(debit)` не нарушается). Clawback при `WalletService.grant`: `repaid=min(grant_amount, debt)`, `debt -= repaid`, `balance += grant_amount - repaid` (атомарно с INSERT credit-tx). Policy-блок `/v1/agent/run` при `debt>0` (`blockReason=debt_outstanding`). Флаг `AGENT_DEBT_RECONCILE_ENABLED` (дефолт `true`); при `false` — `debt` не учитывается (поведение ADR-047 §6). Колонка создаётся независимо от флага.
 
 ### 4. ledger_transactions
 ```sql
@@ -223,7 +228,7 @@ CREATE TABLE audit_logs (
 CREATE INDEX ix_audit_user_created ON audit_logs (user_id, created_at DESC);
 CREATE INDEX ix_audit_event_type ON audit_logs (event_type, created_at DESC);
 ```
-> Append-only на уровне приложения (нет UPDATE/DELETE из кода). Жёсткий запрет ревизий — потенциальный TD, см. [100-known-tech-debt.md](100-known-tech-debt.md#td-001).
+> Append-only **durable на уровне БД** ([ADR-053](adr/ADR-053-audit-logs-db-append-only.md), миграция `0016`, закрывает [TD-001](100-known-tech-debt.md)): defense-in-depth — (1) runtime-роль `app_rw` (least-privilege: `GRANT INSERT,SELECT`, **`REVOKE UPDATE,DELETE,TRUNCATE`**) отдельно от миграционной роли `app_migrate`; (2) BEFORE-триггер `audit_logs_no_mutate()` на UPDATE/DELETE (`RAISE EXCEPTION`). INSERT/SELECT не затронуты. Erasure — out-of-band под привилегированной ролью с `DISABLE TRIGGER`. Требует разведения runtime/migration ролей (`app_rw`=`DATABASE_URL` / `app_migrate`=`DATABASE_URL_MIGRATE`), провижинятся devops до миграции `0016` (init-скрипт `docker/postgres/init/01-roles.sh` для свежего тома + ручная процедура для существующего; `migrations/env.py`: Alembic Config > `DATABASE_URL_MIGRATE` > `DATABASE_URL`) — [07-deployment.md §Роли БД](07-deployment.md). Распространение на `ledger_transactions`/hash-chain — [Q-053-1](99-open-questions.md).
 
 ### 10. projects (website-builder)
 ```sql
@@ -413,6 +418,48 @@ CREATE INDEX ix_adapty_webhook_events_user_id ON adapty_webhook_events (user_id)
 ```
 > Журнал обработанных событий Adapty и **единая точка дедупликации**: `INSERT ... ON CONFLICT (event_id) DO NOTHING RETURNING event_id` в одной транзакции с upsert `subscriptions` + `WalletService.grant(idempotency_key="adapty-event:{event_id}")`. Повтор `event_id` → ничего не вставлено → `200 duplicate` без побочных эффектов. Двойная UNIQUE-граница (этот PK + `ux_ledger_idempotency`) исключает двойное начисление. `payload` хранит распарсенный объект (не сырые байты); bearer-секрет в нём отсутствует (он в заголовке). Детали — [modules/billing-adapty/04-data-model.md](modules/billing-adapty/04-data-model.md).
 
+## Таблица durable idempotency subscription-grant (миграция `0015`, [ADR-052](adr/ADR-052-durable-subscription-idempotency.md), модуль `admin`/`subscription`)
+
+### 23. subscription_grant_events (модуль `subscription`)
+> **Prod-harden (миграция `0015`, цепочка `0014`→`0015`, single head).** Durable idempotency-якорь admin-операций `POST /v1/admin/subscription/grant` **вне ledger** ([ADR-052](adr/ADR-052-durable-subscription-idempotency.md), закрывает [TD-030](100-known-tech-debt.md)). Делает строгий `409` на «тот же `idempotencyKey`, другой payload» достижимым для **обоих** путей `grantCredits` (в т.ч. `grantCredits=false`, где ledger-строки нет).
+```sql
+CREATE TABLE subscription_grant_events (
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,                 -- admin idempotencyKey операции
+    payload_hash    TEXT NOT NULL,                 -- sha256(plan ‖ ISO8601 expiresAt ‖ grantCredits)
+    plan            TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    grant_credits   BOOLEAN NOT NULL,
+    ledger_tx_id    UUID,                          -- id credit-tx при grantCredits=true (nullable)
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX ux_subscription_grant_idempotency ON subscription_grant_events (user_id, idempotency_key);
+```
+> Алгоритм (одна транзакция, образец `adapty_webhook_events`): `INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING RETURNING ...`. Конфликт + совпавший `payload_hash` → `idempotentReplay=true` (без upsert/grant). Конфликт + другой `payload_hash` → строгий `409`. Новая вставка → upsert `subscriptions` + опц. `WalletService.grant("admin-sub-grant:{idempotencyKey}")` + audit `admin_subscription_grant`. При `grantCredits=true` — двойная UNIQUE-граница (эта таблица + `ux_ledger_idempotency`). Детали — [ADR-052](adr/ADR-052-durable-subscription-idempotency.md), [modules/admin/02-api-contracts.md](modules/admin/02-api-contracts.md), [modules/subscription/02-api-contracts.md](modules/subscription/02-api-contracts.md).
+
+## Таблица per-user Hermes runtime (миграция `0013`, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md), модуль `hermes-runtime`)
+
+### 22. hermes_instances (модуль `hermes-runtime`)
+> **Hermes-интеграция (миграция `0013`, цепочка `0012`→`0013`, single head).** Реестр персональных Hermes-инстансов (контейнер + том `HERMES_HOME` на пользователя, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)). Один инстанс на пользователя (`user_id` — PK). `API_SERVER_KEY` хранится **только** зашифрованным envelope-схемой через существующий `byok.kms` ([ADR-003](adr/ADR-003-byok-envelope-encryption.md)) — plaintext никогда. Порт инстанса на хост **не публикуется**; адресация — по `endpoint` (DNS контейнера в docker-сети control plane).
+```sql
+CREATE TYPE hermes_instance_status AS ENUM ('provisioning', 'running', 'stopped');
+
+CREATE TABLE hermes_instances (
+    user_id        UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    container_id   TEXT,                                  -- id Docker-контейнера (NULL в provisioning до запуска)
+    endpoint       TEXT,                                  -- DNS-имя:порт в docker-сети, напр. 'hermes-user-<id>:8642'
+    api_key_enc    BYTEA NOT NULL,                        -- API_SERVER_KEY, AES-256-GCM(key) (envelope, ADR-003)
+    encrypted_dek  BYTEA NOT NULL,                        -- DEK, зашифрованный KMS (envelope, ADR-003)
+    nonce          BYTEA NOT NULL,                        -- AES-GCM nonce
+    status         hermes_instance_status NOT NULL DEFAULT 'provisioning',
+    port           INTEGER,                               -- nullable: порт НЕ публикуется на хост (резерв под альт. RuntimeBackend)
+    last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(),    -- для гибернации (stop_idle по HERMES_IDLE_TIMEOUT_SECONDS)
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_hermes_instances_status_active ON hermes_instances (status, last_active_at);
+```
+> `api_key_enc`/`encrypted_dek`/`nonce` — envelope encryption per-instance `API_SERVER_KEY` (тот же интерфейс `KmsClient`, что BYOK, [ADR-003](adr/ADR-003-byok-envelope-encryption.md)); plaintext ключ — только in-memory на время прокси-вызова ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)). `status`: `provisioning` (контейнер создаётся) → `running` (доступен) → `stopped` (гибернация; том сохранён, будится `ensure_running`). `ix_hermes_instances_status_active` обслуживает фоновый reaper (`stop_idle`: `status='running' AND last_active_at < threshold`). Хранение `HERMES_HOME` (тома) — вне БД; политика удаления неактивных томов — [Q-046-2](99-open-questions.md). Детали — [modules/hermes-runtime/04-data-model.md](modules/hermes-runtime/04-data-model.md).
+
 ## Таблица Sign in with Apple (миграция `0012`, [ADR-043](adr/ADR-043-sign-in-with-apple.md), модуль `auth`)
 
 ### 21. auth_identities (модуль `auth`)
@@ -435,7 +482,7 @@ CREATE INDEX ix_auth_identities_user ON auth_identities (user_id);
 - **Изоляция website-builder:** `site_files` → `projects` → `users` (FK `ON DELETE CASCADE`); доступ к файлам только через
   проект владельца. `projects.user_id` всегда соответствует существующей строке `users` (lazy-provisioning, [ADR-007](adr/ADR-007-lazy-user-provisioning.md)). Лимиты файла/проекта/числа файлов и path-traversal guard — на уровне приложения ([modules/website-builder/05-security.md](modules/website-builder/05-security.md)).
 - Идемпотентность списания — `ux_ledger_idempotency (user_id, idempotency_key)`. Для credits-debit `idempotency_key` = `messageStepId` (= `chat_steps.message_step_id`/`tool_calls.message_step_id`), единый на пользовательский message-шаг; гарантирует ровно 1 debit на шаг независимо от числа tool-раундов и re-entry. Это **не** `requestId` Gateway.
-- `users.trial_used` переключается в `TRUE` ровно один раз (атомарный `UPDATE ... WHERE trial_used = FALSE`).
+- `users.trial_used` переключается в `TRUE` ровно один раз (атомарный `UPDATE ... WHERE trial_used = FALSE`). **Сериализация trial-гонки ([ADR-054](adr/ADR-054-trial-claim-reconcile.md), закрывает [TD-006](100-known-tech-debt.md)):** на trial-allow ветке `/chat/run` этот условный UPDATE выполняется **claim'ом до генерации** (отдельная короткая транзакция — арбитр гонки параллельных первых запросов; `affected=0` → второй запрос блокируется `trial_used`); при неуспехе генерации claim **откатывается** (`UPDATE ... SET trial_used=FALSE WHERE trial_used=TRUE` — trial сгорает только при успехе). НЕ advisory lock и НЕ одна транзакция с generate-loop (совместимо с commit-до-LLM, MAJOR-4).
 - **Двойственность tool-id (ADR-008):** `tool_calls.id` (UUID) — публичный доменный `toolCallId` для iOS-контракта; `tool_calls.provider_tool_use_id` (TEXT, `toolu_...`) — внутренний id для согласованности истории Anthropic. Связь 1:1 в пределах записи. Наружу (`toolCall.id` в ответах API, `/chat/tool-result` request) фигурирует **только** доменный UUID; в `tool_result.tool_use_id` запроса к Anthropic — **только** `provider_tool_use_id`. Реплеемые `chat_steps.payload` хранят raw anthropic id и согласованы с `provider_tool_use_id` по построению.
 - **Порядок шагов сессии (ADR-021):** реконструкция истории (`list_steps`) и поиск следующего шага (`next_step_after`) сортируют `chat_steps` по `seq` (монотонный identity), **НЕ** по `(created_at, id)`. `created_at` — информационный transaction-time timestamp, не порядковый ключ (несколько шагов одной транзакции имеют равный `created_at`; UUID-`id` не монотонный). `seq` гарантирует порядок вставки `tool_use` < `tool_result` в server-side tool-loop (устранён orphan tool_result → Anthropic 400, BUG-5).
 - **Нормализация content-блоков (ADR-021):** в `chat_steps.payload` хранятся только wire-валидные поля Anthropic Messages API; служебные поля SDK (`caller` и т.п.) вырезаются перед персистом и не попадают в реплей к Anthropic. Raw `tool_use.id` сохраняется дословно (ADR-008).
@@ -443,8 +490,9 @@ CREATE INDEX ix_auth_identities_user ON auth_identities (user_id);
 - Любая FK-зависимая вставка (`subscriptions`/`wallets`/`byok_keys`/`ledger_transactions`/`chat_sessions`/`audit_logs`/`user_preferences`/`workspace_projects`/`snippets`/`attachments`/`device_push_tokens`/`auth_identities`) выполняется только после того, как строка `users` для `sub` гарантированно существует. Исключение для `auth_identities` ([ADR-043](adr/ADR-043-sign-in-with-apple.md)): родительская `users` создаётся в том же потоке Apple-входа (привязка к существующему device-`userId` ИЛИ явный `INSERT users(uuid4())` для нового аккаунта) — FK гарантируется до INSERT identity (родительская `users` создаётся в потоке Apple-входа), а **не** lazy-провижинингом gateway. Прямой FK-violation на отсутствующем `users` — дефект провижининга.
 - **`adapty_webhook_events` — исключение из lazy-provisioning:** вебхук Adapty НЕ провижинит `users` (нет доверенного JWT-`sub`). `customer_user_id` из тела события сначала проверяется по существующим `users`; отсутствующий → `200 ignored/user_not_found`, без вставки `users`/`adapty_webhook_events` ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)). FK гарантируется явной проверкой существования пользователя ДО INSERT, а не провижинингом.
 - **Изоляция расширения (Figma-gap):** `workspace_files` → `workspace_projects` → `users` (BYTEA-контент в `workspace_files`, [ADR-036](adr/ADR-036-workspaces-implementation.md), без FK на `attachments`); `snippets`/`attachments`/`device_push_tokens` → `users` (все FK `ON DELETE CASCADE`). Доступ только владельца (`user_id == sub`). `chat_sessions.workspace_project_id` — `ON DELETE SET NULL` (чат переживает удаление workspace, [ADR-036 §5](adr/ADR-036-workspaces-implementation.md)); `attachments.session_id` — `ON DELETE SET NULL`.
+- **Изоляция Hermes-инстансов ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md)):** `hermes_instances` → `users` (FK `ON DELETE CASCADE`); один инстанс на пользователя (`user_id` PK). `API_SERVER_KEY` хранится **только** зашифрованным (`api_key_enc`/`encrypted_dek`/`nonce`, envelope [ADR-003](adr/ADR-003-byok-envelope-encryption.md)) — plaintext в БД запрещён (как BYOK-ключ). В `endpoint`/`container_id`/`port` секретов нет. Контейнер + том `HERMES_HOME` на пользователя обеспечивают изоляцию данных/памяти/навыков между пользователями. Доступ к инстансу — только из docker-сети control plane (порт не публикуется на хост). FK гарантируется lazy-provisioning ([ADR-007](adr/ADR-007-lazy-user-provisioning.md)): строка `users` создаётся в `get_current_user` до `ensure_running`.
 - **Терминология mode (ADR-012):** `chat_sessions.mode` (enum `chat_mode`) = `billing_mode` (credits|byok, способ оплаты); `chat_sessions.assistant_mode` (enum `assistant_mode`) = тип ассистента (chat|code). Это **разные ортогональные** поля. `chat_sessions.project_id` (TEXT, website-builder) ≠ `chat_sessions.workspace_project_id` (UUID FK, рабочее пространство) ([ADR-013](adr/ADR-013-workspace-projects-vs-website-builder.md)).
-- **Источники credit-tx (ADR-006 + ADR-015 + ADR-029):** `ledger_transactions.type='credit'` создаётся (а) StoreKit subscription period grant (idempotency = `sub-grant:{transactionId}`), (б) consumable token purchase (idempotency = consumable `transactionId`, `meta.source='token_purchase'`), либо (в) **Adapty subscription grant** (idempotency = `adapty-event:{event_id}`, `reason='adapty_subscription'`, [ADR-029](adr/ADR-029-adapty-subscription-webhook.md)). Все идемпотентны по `ux_ledger_idempotency`. **Инвариант анти-double-grant:** ключи путей (а) и (в) **различны** (`sub-grant:*` vs `adapty-event:*`), поэтому одна покупка, прошедшая ОБА пути, начислится **дважды** — клиент обязан использовать ОДИН путь подписок (см. [05-security.md](05-security.md), [ADR-029](adr/ADR-029-adapty-subscription-webhook.md)). Списание (`type='debit'`) — без изменений (1 кредит = 1 сообщение).
+- **Источники credit-tx (ADR-006 + ADR-015 + ADR-029 + ADR-048):** `ledger_transactions.type='credit'` создаётся (а) StoreKit subscription period grant (idempotency = `sub-grant:{transactionId}`), (б) consumable token purchase (idempotency = consumable `transactionId`, `meta.source='token_purchase'`), (в) **Adapty subscription grant** (idempotency = `adapty-event:{event_id}`, `reason='adapty_subscription'`, [ADR-029](adr/ADR-029-adapty-subscription-webhook.md)), либо (г) **admin grant** ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)): ручное начисление через `POST /v1/admin/credits/grant` (idempotency = admin `idempotencyKey`, `meta.source='admin_grant'`) и опциональный грант кредитов периода при `POST /v1/admin/subscription/grant` (idempotency = admin subscription-grant ключ, `reason='admin_subscription'`). Все идемпотентны по `ux_ledger_idempotency`. **Инвариант анти-double-grant:** ключи путей (а), (в) и (г) **различны** (`sub-grant:*` vs `adapty-event:*` vs admin `idempotencyKey`/subscription-grant ключ), поэтому одна покупка/выдача, прошедшая несколько путей, начислится **многократно** — клиент обязан использовать ОДИН путь подписок, admin-грант — отдельный операторский путь (см. [05-security.md](05-security.md), [ADR-029](adr/ADR-029-adapty-subscription-webhook.md), [ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)). Списание (`type='debit'`): для `/v1/chat/*` — `idempotency_key=messageStepId`, `meta.source` chat-debit, фиксированное `amount=1` (1 кредит = 1 сообщение). Для `/v1/agent/*` ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)) — отдельный класс **agent-debit**: `idempotency_key=runId`, `meta.source='agent_run'`, usage-based `amount` (= `ceil` по формуле коэффициентов input/output токенов, мин. 1 при ненулевом usage — [ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)), списывается на `run.completed`. **«1 кредит = 1 сообщение» верно ТОЛЬКО для `/v1/chat/*` debit; для `/v1/agent/*` биллинг usage-based ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)).** **Реконсиляция недобора agent-debit ([ADR-051](adr/ADR-051-agent-debt-reconciliation.md)):** при `amount > balance` на агентном пути `consume` списывает доступный `balance` (частичный ledger-debit) и недобор кладёт в `wallets.debt` (НЕ ledger-строка); clawback при следующем `grant` (`repaid=min(grant_amount, debt)` до увеличения `balance`, в той же транзакции, что INSERT credit-tx — ledger фиксирует полную сумму grant). Это **не нарушает** инвариант анти-double-grant и сверку `balance == Σ(credit)−Σ(debit)`: `debt` — отдельный агрегат `wallets`, погашение долга снижает прирост `balance`, но ledger-сумма начисления неизменна.
 
 ## Расширения PostgreSQL
 ```sql

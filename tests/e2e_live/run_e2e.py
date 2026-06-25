@@ -10,8 +10,9 @@ import json
 import sys
 import time
 import uuid
+from pathlib import Path
 
-sys.path.insert(0, "D:/BA/claude-ios/tests/e2e_live")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from conftest_live import (  # noqa: E402
     ENV,
     auth,

@@ -96,6 +96,35 @@ def get_jwt_verifier() -> JwtVerifier:
     return _verifier_singleton
 
 
+def _client_api_key_matches(presented: str) -> bool:
+    """Constant-time compare the presented X-API-Key against the active client key(s) (ADR-044).
+
+    Accepts a match with CLIENT_API_KEY or (during rotation) CLIENT_API_KEY_PREV. Both comparisons
+    are constant-time (``hmac.compare_digest``). An empty/unset configured key never matches (so a
+    blank header can never authenticate). Both candidates are always evaluated to avoid early-exit
+    timing leaks, mirroring ``_admin_token_matches`` (ADR-044 §1, ADR-009 §3/§5).
+    """
+    settings = get_settings()
+    matched = False
+    for candidate in (settings.client_api_key, settings.client_api_key_prev):
+        if candidate and hmac.compare_digest(presented, candidate):
+            matched = True
+    return matched
+
+
+def verify_client_api_key(presented: str | None) -> None:
+    """Authenticate the client contour by the trusted X-API-Key (ADR-044 §1).
+
+    Pure, side-effect-free (no DB, no logging of the key) so it stays unit-testable in isolation
+    and mirrors the admin path (``_admin_token_matches`` / ``require_admin``). A missing or
+    mismatching key raises 401 without revealing the reason (the key is the only auth factor; the
+    subject identity comes separately from ``X-User-Id`` in ``get_current_user``). The key is never
+    logged (redaction allowlist covers ``X-API-Key``, ADR-044 §3).
+    """
+    if presented is None or not _client_api_key_matches(presented):
+        raise UnauthorizedError("invalid client api key")
+
+
 def _admin_token_matches(presented: str) -> bool:
     """Constant-time compare the presented X-Admin-Token against the active admin secret(s).
 

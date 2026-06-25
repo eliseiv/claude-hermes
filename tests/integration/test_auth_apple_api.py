@@ -181,11 +181,13 @@ async def test_apple_access_token_round_trips_through_verifier(apple_client: Asy
     assert str(verified.user_id) == body["userId"]
     assert verified.device_id == "dev-apple-rt"
 
-    # And it authenticates a protected /v1/* endpoint (reaches business logic).
+    # ADR-044 §4: the Apple/JWT contour is DORMANT. OUR access token still verifies through the
+    # JwtVerifier (above), but a Bearer JWT alone (no X-API-Key) NO LONGER authorizes /v1/* — the
+    # hot client path is X-API-Key + X-User-Id. So a Bearer-only request is rejected → 401.
     r2 = await apple_client.get(
         "/v1/tools", headers={"Authorization": f"Bearer {body['accessToken']}"}
     )
-    assert r2.status_code == 200, r2.text
+    assert r2.status_code == 401, r2.text
 
 
 @pytest.mark.asyncio

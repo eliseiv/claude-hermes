@@ -25,8 +25,13 @@ type: ## mypy src
 test: ## pytest
 	uv run pytest
 
+# COVERAGE_CORE=sysmon: PEP 669 sys.monitoring backend instead of the legacy per-thread C
+# settrace tracer. Fixes a Windows "access violation" segfault during `--cov` (settrace firing
+# across native C frames — cryptography/hmac/asyncpg — in asyncio.to_thread worker threads).
+# Authoritative setting lives in pyproject [tool.coverage.run] core; this export is a fallback
+# for coverage versions that ignore the `core` config key. See pyproject for the full root cause.
 test-cov: ## pytest with global 80% coverage gate
-	uv run pytest --cov=src --cov-report=term-missing --cov-fail-under=80
+	COVERAGE_CORE=sysmon uv run pytest --cov=src --cov-report=term-missing --cov-fail-under=80
 
 migrate: ## alembic upgrade head
 	uv run alembic upgrade head

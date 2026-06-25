@@ -5,6 +5,8 @@
 - Связанные: [ADR-002](ADR-002-access-policy-state-machine.md), [ADR-005](ADR-005-idempotency-ledger.md)
 - Закрывает: [Q-004-1](../99-open-questions.md), [Q-006-1](../99-open-questions.md)
 
+> **Ревизия 2026-06-23 → [ADR-047](ADR-047-usage-based-billing-for-agent.md):** [ADR-047](ADR-047-usage-based-billing-for-agent.md) частично-суперсидит ADR-006 **для контура `/v1/agent/*`** ([ADR-045](ADR-045-hermes-as-agent-proxy.md)): там биллинг **usage-based** (списание по реальному usage токенов, idempotency по `runId`), а не «1 кредит = 1 сообщение». Тело ADR-006 **неизменно** (immutability) и продолжает действовать для `/v1/chat/*` (1 кредит = 1 завершённый message-шаг) и для grant при подписке (§2, общий механизм). Пометка добавлена для трассируемости (образец ADR-037→ADR-042).
+
 ## Context
 
 Две связанные открытые продуктовые неопределённости блокировали финализацию биллинга:

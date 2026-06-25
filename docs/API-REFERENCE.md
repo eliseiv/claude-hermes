@@ -14,7 +14,7 @@
 2. [Аутентификация и заголовки](#2-аутентификация-и-заголовки)
 3. [Коды ответа (общие)](#3-коды-ответа-общие)
 4. Эндпоинты по модулям:
-   - [Auth](#21-auth-выпуск-токена) · [Chat](#4-chat) · [Tools](#22-tools-каталог-инструментов) · [Models](#24-models-список-моделей-инстанса) · [Presets](#25-presets-пресеты-промтов) · [Policy](#5-policy) · [Wallet](#6-wallet) · [Subscription](#7-subscription) · [BYOK](#8-byok) · [Admin](#9-admin) · [Website-builder / Preview](#10-website-builder--preview) · [Health / Docs](#11-health--docs) · [Chats](#17-chats) · [Profile](#18-profile) · [Preferences](#19-preferences) · [Tokens](#20-tokens)
+   - [Agent (Hermes)](#26-agent-hermes) · [Auth](#21-auth-выпуск-токена) · [Chat](#4-chat) · [Tools](#22-tools-каталог-инструментов) · [Models](#24-models-список-моделей-инстанса) · [Presets](#25-presets-пресеты-промтов) · [Policy](#5-policy) · [Wallet](#6-wallet) · [Subscription](#7-subscription) · [BYOK](#8-byok) · [Admin](#9-admin) · [Website-builder / Preview](#10-website-builder--preview) · [Health / Docs](#11-health--docs) · [Chats](#17-chats) · [Profile](#18-profile) · [Preferences](#19-preferences) · [Tokens](#20-tokens)
 5. [blockReason — справочник (9 значений)](#12-blockreason--справочник)
 6. [Tool-протокол: client-side vs server-side](#13-tool-протокол)
 7. [Монетизация (кратко)](#14-монетизация-кратко)
@@ -37,9 +37,12 @@
 
 ### Независимые контуры авторизации
 
+> **⚠️ Hermes-интеграция ([ADR-044](adr/ADR-044-client-api-key-auth.md)) — активный клиентский контур.** Клиентская авторизация `/v1/*` переведена с JWT Bearer на **клиентский API-KEY**: заголовок `X-API-Key: <CLIENT_API_KEY>` + идентичность субъекта `X-User-Id: <uuid>` (UUID доверяется, т.к. ключ доверенный). Прежний JWT-контур ([ADR-018](adr/ADR-018-embedded-auth-issuer.md))/Apple ([ADR-043](adr/ADR-043-sign-in-with-apple.md)) **«дремлют»** — код и `/v1/auth/*` сохранены, но клиент их не использует. Таблица ниже отражает активный контур.
+
 | Контур | Кто использует | Механизм | Заголовок | Swagger security scheme |
 |---|---|---|---|---|
-| **Пользовательский** | iOS-приложение, эндпоинты `/v1/*` (кроме `/v1/auth/*`, admin, preview, adapty-webhook) | JWT Bearer (RS256) | `Authorization: Bearer <JWT>` | `bearerAuth` (http bearer, format JWT) |
+| **Пользовательский (активный, [ADR-044](adr/ADR-044-client-api-key-auth.md))** | iOS-приложение, эндпоинты `/v1/*` (кроме admin, preview, adapty-webhook) | клиентский API-KEY + идентичность | `X-API-Key: <CLIENT_API_KEY>` + `X-User-Id: <uuid>` | `clientApiKey` + `userId` (оба apiKey, header) |
+| **Пользовательский (спящий, [ADR-018](adr/ADR-018-embedded-auth-issuer.md))** | не используется клиентом при Hermes-интеграции | JWT Bearer (RS256) | `Authorization: Bearer <JWT>` | `bearerAuth` (http bearer, format JWT) — не навешан на `/v1/*` |
 | **Admin** | Операторские/саппорт-инструменты, `/v1/admin/*` | статический секрет | `X-Admin-Token: <ADMIN_API_SECRET>` | `adminToken` (apiKey, header `X-Admin-Token`) |
 | **Preview** | Браузер (открывает превью сайта) | подпись внутри URL (HMAC+TTL) | нет — авторизация в самой ссылке | — (публичный по signed URL) |
 | **Adapty webhook** | Сервис Adapty (M2M), `/v1/billing/adapty/webhook` | статический bearer-секрет (без HMAC-подписи payload) | `Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>` | отдельная http-bearer схема ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)) |
@@ -106,6 +109,36 @@
 `code` ∈ `unauthorized | forbidden | not_found | conflict | payload_too_large | validation_error | rate_limited | internal_error | upstream_error`.
 
 > Бизнес-блокировки **не** используют этот формат — они приходят как `200` со `status="blocked"`.
+
+---
+
+## 26. Agent (Hermes)
+
+> **Headline-фича (Hermes-интеграция, [ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)).** Контур `/v1/agent/*` проксирует чат к персональному **автономному агенту Hermes** пользователя (свой tool-loop/память/навыки). Биллинг — по реальному usage прогона ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)). Простой per-turn чат `/v1/chat/*` (раздел 4) остаётся отдельно. Заголовки: `X-API-Key` + `X-User-Id` (раздел 2).
+
+### POST /v1/agent/run
+Запуск автономного прогона агента.
+
+**Заголовки:** `X-API-Key: <CLIENT_API_KEY>` (обязателен), `X-User-Id: <uuid>` (обязателен), `Content-Type: application/json`.
+
+**Request:** `{ "message": "string", "sessionId": "string|null", "model": "string|null" }`.
+
+**Response:**
+- `202 {"runId": "string", "status": "queued|running"}` — прогон запущен.
+- `200 {"status": "blocked", "blockReason": "credits_empty|subscription_expired|trial_used"}` — бизнес-блокировка ([ADR-004](adr/ADR-004-blocked-http-200.md)): 0 кредитов при активной подписке / подписка истекла / без подписки и trial израсходован (policy-gate до прогона). Достижимый набор и источник истины — [modules/agent-proxy/02-api-contracts.md §Достижимый набор](modules/agent-proxy/02-api-contracts.md) (Policy Engine, [ADR-002](adr/ADR-002-access-policy-state-machine.md)); `subscription_required` на этом пути недостижим (byok-only).
+- `401` — нет/неверный `X-API-Key` или нет/невалидный `X-User-Id`.
+- `502` — Hermes-инстанс недоступен.
+
+### GET /v1/agent/runs/{runId}/events  (SSE)
+Поток событий прогона (ретрансляция из Hermes): `run.queued|run.running|message.delta|tool.started|tool.completed|approval.request|run.completed|run.failed`. На `run.completed{usage}` backend списывает кредиты по usage (идемпотентно по `runId`). `run.failed` → без списания. Заголовки: `X-API-Key` + `X-User-Id`.
+
+### POST /v1/agent/runs/{runId}/approval
+Подтверждение действия агента, ожидающего approval: `{ "choice": "string" }` (passthrough к Hermes).
+
+### POST /v1/agent/runs/{runId}/stop
+Остановка прогона (passthrough к Hermes).
+
+> Маппинг и детали — [modules/agent-proxy/02-api-contracts.md](modules/agent-proxy/02-api-contracts.md). Монетизация агента — usage-based ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)), в отличие от «1 кредит = 1 сообщение» для `/v1/chat/*` ([ADR-006](adr/ADR-006-credit-billing-and-subscription-grant.md)).
 
 ---
 
@@ -266,7 +299,9 @@
 
 ## 7. Subscription
 
-### POST /v1/subscription/sync
+> ⚠️ **`POST /v1/subscription/sync` РЕТИРУЕТСЯ (prod-harden, [TD-021](100-known-tech-debt.md)/[Q-029-2](99-open-questions.md), ревизия [ADR-029](adr/ADR-029-adapty-subscription-webhook.md)).** Для изолированного claude-hermes подписки идут **только** через Adapty-вебхук (§7a). StoreKit-путь подписок удаляется backend'ом (роут + ветка кода). Раздел ниже оставлен для трассируемости до удаления. `/v1/tokens/purchase` (consumable, §20) сохраняется.
+
+### POST /v1/subscription/sync  (РЕТИРУЕТСЯ)
 Синхронизация статуса подписки по StoreKit-транзакции. Сервер верифицирует транзакцию (подпись/App Store Server API), не доверяя клиенту. При активации/продлении начисляется фиксированный пакет кредитов.
 
 **Заголовки:** `Authorization: Bearer <JWT>`.
@@ -288,7 +323,7 @@
 
 **Коды:** `200`; `401`; `403`; `422` (невалидная/поддельная транзакция — подписка не меняется); `429`; `502/5xx` (ошибка App Store API).
 
-> **Сосуществование с Adapty ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)):** `/v1/subscription/sync` **остаётся рабочим**, но источник истины по подпискам теперь — Adapty-вебхук (§7a). Клиент использует **ОДИН** путь подписок: на Adapty-сборке iOS **не** вызывает `sync` (иначе двойное начисление — разные idempotency-ключи).
+> **Источник истины подписок — Adapty ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md), §7a).** StoreKit-путь подписок `/v1/subscription/sync` **ретируется** ([TD-021](100-known-tech-debt.md)/[Q-029-2](99-open-questions.md)) — для claude-hermes остаётся единственный путь подписок (Adapty), двойное начисление устранено by construction.
 
 ---
 
@@ -366,8 +401,21 @@
 
 Операторские/саппорт-действия. **Авторизация — только `X-Admin-Token`** (пользовательский JWT не подходит). Отдельный rate limit (дефолт 10 req/min per source IP), тело ≤ 8 KB, строгая валидация. Admin-эндпоинты **не** создают пользователей.
 
-### POST /v1/admin/wallet/grant
-Ручное начисление кредитов пользователю (саппорт/компенсация).
+> **Hermes-интеграция ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)):** добавлены/уточнены два admin-эндпоинта. `POST /v1/admin/credits/grant` (= `wallet/grant`, реюз/переименование — приведение пути; контракт тела/ответа ниже идентичен) и **новый** `POST /v1/admin/subscription/grant` (ручная выдача подписки). Защита — тот же `X-Admin-Token` ([ADR-009](adr/ADR-009-admin-token-auth.md), неизменна).
+
+### POST /v1/admin/subscription/grant (Hermes-интеграция, [ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md))
+Ручная выдача/активация подписки пользователю (доступ без покупки через App Store/Adapty).
+
+**Заголовки:** `X-Admin-Token: <ADMIN_API_SECRET>` (обязателен), `Content-Type: application/json`.
+
+**Request:** `{ "userId": "uuid", "plan": "string", "expiresAt": "ISO8601", "idempotencyKey": "string", "reason": "string", "grantCredits": true|false }`.
+
+**Response (200):** `{ "status": "active", "plan": "string", "expiresAt": "ISO8601", "creditsGranted": int|null, "ledgerTxId": "uuid|null" }`.
+
+**Правила:** upsert `subscriptions`→active; опц. грант `SUBSCRIPTION_CREDITS_PER_PERIOD` (идемпотентно); audit `admin_subscription_grant`; несуществующий `userId` → `404 user_not_found` (admin не создаёт пользователей, [Q-009-2](99-open-questions.md)). После выдачи подписки `POST /v1/agent/run` проходит policy.
+
+### POST /v1/admin/credits/grant  (= /v1/admin/wallet/grant)
+Ручное начисление кредитов пользователю (саппорт/компенсация). Путь приведён к `credits/grant` ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)); `wallet/grant` — алиас на переходный период ([Q-048-1](99-open-questions.md)). Контракт тела/ответа — ниже.
 
 **Заголовки:** `X-Admin-Token: <ADMIN_API_SECRET>` (обязателен), `Content-Type: application/json`.
 

@@ -9,12 +9,15 @@ from __future__ import annotations
 import subprocess
 import time
 import uuid
+from pathlib import Path
 
 import httpx
 import jwt
 
 BASE = "http://127.0.0.1:8000"
-ROOT = "D:/BA/claude-ios"
+# Repo root resolved relative to this file (tests/e2e_live/ -> repo root), so the
+# helpers work in any checkout/fork copy without hardcoding an absolute path.
+ROOT = Path(__file__).resolve().parents[2].as_posix()
 COMPOSE = [
     "docker",
     "compose",

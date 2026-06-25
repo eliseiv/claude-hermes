@@ -2,6 +2,7 @@
 
 - Статус: Accepted
 - Дата: 2026-06-12
+- Ревизия 2026-06-24: `/v1/subscription/sync` ретирован (см. [INDEX §Ревизии](INDEX.md#ревизии) / [Q-029-2](../99-open-questions.md) / [TD-021](../100-known-tech-debt.md)); Adapty — единственный путь подписок. Тело ADR не переписано (immutability).
 - Связано: [ADR-006](ADR-006-credit-billing-and-subscription-grant.md) (грант кредитов на период подписки), [ADR-005](ADR-005-idempotency-ledger.md) (идемпотентность ledger), [ADR-009](ADR-009-admin-token-auth.md) (образец статической bearer-авторизации, constant-time), [ADR-015](ADR-015-consumable-token-iap.md) (consumable token IAP — НЕ через Adapty), [ADR-017](ADR-017-shared-server-traefik-deploy.md) (per-instance секреты), [ADR-002](ADR-002-access-policy-state-machine.md) (состояние подписки в Policy).
 - Модуль: [modules/billing-adapty/](../modules/billing-adapty/README.md)
 

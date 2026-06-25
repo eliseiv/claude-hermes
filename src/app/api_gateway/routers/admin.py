@@ -22,6 +22,8 @@ from app.schemas.admin import (
     AdminGrantRequest,
     AdminGrantResponse,
     AdminLedgerTxView,
+    AdminSubscriptionGrantRequest,
+    AdminSubscriptionGrantResponse,
     AdminWalletResponse,
 )
 
@@ -53,21 +55,10 @@ async def _enforce_admin_rate_limit(request: Request) -> None:
         raise RateLimitedError("admin rate limit exceeded")
 
 
-@router.post(
-    "/wallet/grant",
-    response_model=AdminGrantResponse,
-    summary="Начислить кредиты пользователю",
-    description=(
-        "Начисляет кредиты пользователю (саппорт/компенсация). Авторизация — заголовок "
-        "`X-Admin-Token`. Идемпотентно по `idempotencyKey`: повтор с тем же payload не "
-        "начислит дважды (`idempotentReplay=true`); тот же ключ с другим `amount` — `409`. "
-        "Несуществующий `userId` — `404 user_not_found` (admin не создаёт пользователей)."
-    ),
-)
-async def admin_wallet_grant(
+async def _admin_credits_grant(
     request: Request,
-    admin: Annotated[AdminService, Depends(get_admin_service)],
-    body: Annotated[AdminGrantRequest, Body()],
+    admin: AdminService,
+    body: AdminGrantRequest,
 ) -> AdminGrantResponse:
     _enforce_admin_body_size(request)
     await _enforce_admin_rate_limit(request)
@@ -79,6 +70,79 @@ async def admin_wallet_grant(
     )
     return AdminGrantResponse(
         newBalance=result.new_balance,
+        ledgerTxId=result.ledger_tx_id,
+        idempotentReplay=result.idempotent_replay,
+    )
+
+
+@router.post(
+    "/credits/grant",
+    response_model=AdminGrantResponse,
+    summary="Начислить кредиты пользователю",
+    description=(
+        "Начисляет кредиты пользователю (саппорт/компенсация). Авторизация — заголовок "
+        "`X-Admin-Token`. Идемпотентно по `idempotencyKey`: повтор с тем же payload не "
+        "начислит дважды (`idempotentReplay=true`); тот же ключ с другим `amount` — `409`. "
+        "Несуществующий `userId` — `404 user_not_found` (admin не создаёт пользователей)."
+    ),
+)
+async def admin_credits_grant(
+    request: Request,
+    admin: Annotated[AdminService, Depends(get_admin_service)],
+    body: Annotated[AdminGrantRequest, Body()],
+) -> AdminGrantResponse:
+    return await _admin_credits_grant(request, admin, body)
+
+
+@router.post(
+    "/wallet/grant",
+    response_model=AdminGrantResponse,
+    summary="Начислить кредиты пользователю (переходный алиас)",
+    description=(
+        "Переходный алиас канонического `POST /v1/admin/credits/grant` (обратная "
+        "совместимость, ADR-048 §1). Тело/ответ/правила идентичны. Будет ретирован."
+    ),
+)
+async def admin_wallet_grant(
+    request: Request,
+    admin: Annotated[AdminService, Depends(get_admin_service)],
+    body: Annotated[AdminGrantRequest, Body()],
+) -> AdminGrantResponse:
+    return await _admin_credits_grant(request, admin, body)
+
+
+@router.post(
+    "/subscription/grant",
+    response_model=AdminSubscriptionGrantResponse,
+    summary="Выдать/активировать подписку пользователю",
+    description=(
+        "Ручная активация подписки без покупки через App Store/Adapty (саппорт/компенсация/"
+        "тестовый доступ). Авторизация — заголовок `X-Admin-Token`. Upsert подписки в `active`; "
+        "при `grantCredits=true` дополнительно начисляет кредиты периода. Идемпотентно по "
+        "`idempotencyKey`; тот же ключ с другим payload — `409`. Несуществующий `userId` — "
+        "`404 user_not_found`. `expiresAt` должен быть в будущем."
+    ),
+)
+async def admin_subscription_grant(
+    request: Request,
+    admin: Annotated[AdminService, Depends(get_admin_service)],
+    body: Annotated[AdminSubscriptionGrantRequest, Body()],
+) -> AdminSubscriptionGrantResponse:
+    _enforce_admin_body_size(request)
+    await _enforce_admin_rate_limit(request)
+    result = await admin.subscription_grant(
+        user_id=body.userId,
+        plan=body.plan,
+        expires_at=body.expiresAt,
+        grant_credits=body.grantCredits,
+        idempotency_key=body.idempotencyKey,
+        reason=body.reason,
+    )
+    return AdminSubscriptionGrantResponse(
+        status="active",
+        plan=result.plan,
+        expiresAt=result.expires_at,
+        creditsGranted=result.credits_granted,
         ledgerTxId=result.ledger_tx_id,
         idempotentReplay=result.idempotent_replay,
     )
@@ -104,6 +168,7 @@ async def admin_wallet_view(
     return AdminWalletResponse(
         userId=view.user_id,
         balance=view.balance,
+        debt=view.debt,
         lastTransactions=[
             AdminLedgerTxView(
                 id=tx.id,

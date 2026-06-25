@@ -10,8 +10,16 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-claude_ios}
+      # Consumed by docker/postgres/init/01-roles.sh (ADR-053). Local-dev placeholders;
+      # in prod set real secrets via the secret manager. Must match the passwords embedded in
+      # DATABASE_URL (app_rw) / DATABASE_URL_MIGRATE (app_migrate).
+      APP_RW_PASSWORD: ${APP_RW_PASSWORD:-app_rw}
+      APP_MIGRATE_PASSWORD: ${APP_MIGRATE_PASSWORD:-app_migrate}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # ADR-053 role bootstrap. Runs ONLY on first init of an EMPTY pgdata volume
+      # (creates app_rw / app_migrate before the migrate job). Read-only.
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     # Bound to localhost only — not exposed beyond the host (05-security.md).
     ports:
       - "127.0.0.1:5432:5432"
@@ -48,7 +56,11 @@ services:
       - path: .env
         required: false
     environment:
+      # Migrations run under app_migrate (ADR-053). env.py resolves DATABASE_URL_MIGRATE first,
+      # falling back to DATABASE_URL. Local default uses the app_migrate role created by the init
+      # script; on a single-role local setup you may instead point this at the postgres superuser.
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/claude_ios}
+      DATABASE_URL_MIGRATE: ${DATABASE_URL_MIGRATE:-postgresql+asyncpg://app_migrate:${APP_MIGRATE_PASSWORD:-app_migrate}@postgres:5432/${POSTGRES_DB:-claude_ios}}
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,7 +78,8 @@ services:
         required: false
     environment:
       # In-compose service hostnames override localhost defaults from .env.
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@postgres:5432/claude_ios}
+      # Runtime uses the least-privilege app_rw role (ADR-053). Override via .env if desired.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://app_rw:${APP_RW_PASSWORD:-app_rw}@postgres:5432/${POSTGRES_DB:-claude_ios}}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     ports:
       - "127.0.0.1:8000:8000"

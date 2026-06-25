@@ -8,13 +8,13 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import Depends, Request
-from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import AdminService
-from app.api_gateway.auth import AuthenticatedUser, get_jwt_verifier
-from app.api_gateway.openapi_security import bearer_scheme
+from app.agent_proxy.service import AgentProxyService
+from app.api_gateway.auth import AuthenticatedUser, get_jwt_verifier, verify_client_api_key
+from app.api_gateway.openapi_security import client_api_key_scheme, user_id_scheme
 from app.audit.service import AuditService
 from app.auth.apple import get_apple_verifier
 from app.auth.issuer import TokenIssuer
@@ -30,7 +30,10 @@ from app.chats.repository import ChatsRepository
 from app.chats.service import ChatsService
 from app.config import get_settings
 from app.db import session_scope
-from app.errors import ForbiddenError, UnauthorizedError
+from app.errors import UnauthorizedError
+from app.hermes_runtime.docker_backend import DockerBackend, RuntimeBackend
+from app.hermes_runtime.manager import HermesInstanceManager
+from app.hermes_runtime.registry import HermesInstanceRegistry
 from app.observability.context import set_user_id
 from app.preferences.service import PreferencesService
 from app.profile.service import ProfileService
@@ -80,29 +83,42 @@ async def provision_user(session: AsyncSession, user_id: uuid.UUID) -> None:
 
 async def get_current_user(
     session: Annotated[AsyncSession, Depends(get_db)],
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
+    api_key: Annotated[str | None, Depends(client_api_key_scheme)] = None,
+    x_user_id: Annotated[str | None, Depends(user_id_scheme)] = None,
 ) -> AuthenticatedUser:
-    """Authenticate the request and lazily provision the user (ADR-007).
+    """Authenticate the client contour and lazily provision the user (ADR-044, ADR-007).
 
     Single point through which all authenticated ``/v1/*`` requests pass, so the lazy
-    provisioning here uniformly covers every write endpoint without per-flow duplication.
-    Provisioning happens only *after* full JWT verification (an invalid/expired token raises
-    401 before any row is created) and *before* the subject is used downstream.
+    provisioning here uniformly covers every endpoint without per-flow duplication.
 
-    The credentials come from ``bearer_scheme`` (HTTPBearer, ``auto_error=False``), which is a
-    ``SecurityBase``: it contributes the ``bearerAuth`` security scheme to OpenAPI (lock icon /
-    Authorize button) *without* adding a separate ``authorization`` header parameter to every
-    operation. ``auto_error=False`` keeps the scheme from raising on a missing/malformed header
-    — the real 401 stays in ``verify_bearer_token`` so behaviour is unchanged (08-api-doc R2).
+    Auth model (ADR-044): the trusted client key ``X-API-Key`` authenticates the request
+    (``verify_client_api_key``, constant-time, 401 on miss); the subject identity is the
+    ``X-User-Id`` header (UUID), trusted because the client key is trusted. Both arrive via
+    ``SecurityBase`` schemes (``client_api_key_scheme`` / ``user_id_scheme``, ``APIKeyHeader``,
+    ``auto_error=False``): they contribute the ``clientApiKey`` + ``userId`` security schemes to
+    OpenAPI (lock icon / Authorize) *without* adding duplicate header parameters to the operation.
+    ``auto_error=False`` keeps them from raising on a missing/malformed header — the real 401 stays
+    here so behaviour is explicit (08-api-doc R2).
+
+    Provisioning happens only *after* the key is verified and the subject UUID is parsed (an
+    invalid key or missing/malformed ``X-User-Id`` raises 401 before any row is created) and
+    *before* the subject is used downstream. The JWT/Apple contour stays dormant (ADR-044 §4): the
+    source of identity moves from JWT ``sub`` to ``X-User-Id``; provisioning semantics are intact.
     """
-    # Re-assemble the canonical "Bearer <token>" string so verify_bearer_token keeps its public
-    # signature (a Header-shaped value) and its 401 semantics (missing/non-Bearer/invalid token).
-    authorization = f"Bearer {credentials.credentials}" if credentials is not None else None
-    user = verify_bearer_token(authorization)
+    # 1) Authenticate the request by the trusted client key (401 on missing/mismatch).
+    verify_client_api_key(api_key)
+    # 2) Resolve the trusted subject from X-User-Id (no subject => 401, like a missing identity).
+    if not x_user_id:
+        raise UnauthorizedError("missing user id")
+    try:
+        user_id = uuid.UUID(x_user_id.strip())
+    except ValueError as exc:
+        raise UnauthorizedError("user id is not a valid uuid") from exc
+    user = AuthenticatedUser(user_id=user_id, device_id=None)
     set_user_id(str(user.user_id))
     # FastAPI caches `get_db` per request, so `session` is the exact session the service
     # dependencies (orchestrator/wallet/subscription/byok) receive — the upsert lands in the
-    # same transaction as their FK-bearing inserts.
+    # same transaction as their FK-bearing inserts (ADR-044 §2, unchanged from ADR-007).
     await provision_user(session, user.user_id)
     return user
 
@@ -112,9 +128,16 @@ DbSession = Annotated[AsyncSession, Depends(get_db)]
 
 
 def require_owner(body_user_id: uuid.UUID, current: AuthenticatedUser) -> None:
-    """userId in the body must equal sub (403 otherwise) — 05-security.md."""
-    if body_user_id != current.user_id:
-        raise ForbiddenError("userId does not match authenticated subject")
+    """No-op on the client contour (ADR-044 §3).
+
+    With a single trusted client key the subject is ``X-User-Id`` by definition, so the old
+    "body ``userId`` must equal ``sub``" cross-check has no meaning — there is no independently
+    authenticated ``sub`` to disagree with. The symbol is kept (not removed) so the existing
+    router call sites (byok/chat/subscription/token_purchase/wallet) keep importing it without
+    change; it deliberately performs no check. The dormant JWT contour (ADR-044 §4) does not run
+    this path on the hot client path.
+    """
+    return None
 
 
 _token_issuer_singleton: TokenIssuer | None = None
@@ -146,11 +169,14 @@ def get_byok_service(session: DbSession) -> BYOKService:
 
 
 def get_subscription_service(session: DbSession) -> SubscriptionService:
+    # ADR-029/TD-021: the StoreKit sync path is retired; SubscriptionService no longer needs the
+    # verifier (only admin_grant remains, ADR-048/052). The shared verifier still serves token
+    # purchase (get_token_purchase_service).
+    audit = AuditService(session)
     return SubscriptionService(
         session,
-        get_storekit_verifier(),
-        WalletService(session, AuditService(session)),
-        AuditService(session),
+        WalletService(session, audit),
+        audit,
     )
 
 
@@ -174,7 +200,9 @@ def get_adapty_webhook_service(session: DbSession) -> AdaptyWebhookService:
 
 def get_admin_service(session: DbSession) -> AdminService:
     audit = AuditService(session)
-    return AdminService(session, WalletService(session, audit), audit)
+    wallet = WalletService(session, audit)
+    subscription = SubscriptionService(session, wallet, audit)
+    return AdminService(session, wallet, audit, subscription)
 
 
 def get_chats_service(session: DbSession) -> ChatsService:
@@ -216,6 +244,57 @@ def get_orchestrator(session: DbSession) -> ChatOrchestrator:
         preferences=PreferencesService(session),
         # ADR-036: workspace context provider (instructions + knowledge files) for workspace chats.
         workspaces=WorkspacesService(WorkspacesRepository(session)),
+    )
+
+
+_hermes_backend_singleton: RuntimeBackend | None = None
+
+
+def get_hermes_backend() -> RuntimeBackend:
+    """Process-wide RuntimeBackend (ADR-046). MVP fixes DockerBackend (docker-py).
+
+    Singleton so the docker-py client (and its connection) is reused across requests and the
+    reaper. A future config-selected backend (Modal/Daytona) plugs in here without touching the
+    manager/registry.
+    """
+    global _hermes_backend_singleton
+    if _hermes_backend_singleton is None:
+        _hermes_backend_singleton = DockerBackend(
+            health_timeout_seconds=get_settings().hermes_health_timeout_seconds
+        )
+    return _hermes_backend_singleton
+
+
+def get_hermes_manager(session: DbSession) -> HermesInstanceManager:
+    """Wire the per-user Hermes runtime manager (ADR-046): registry + backend + KMS + settings.
+
+    Per-session (like the other service factories) so registry writes land in the request/reaper
+    transaction. The backend is a process-wide singleton; the KMS client reuses the BYOK KMS
+    (ADR-003) — no new crypto infrastructure.
+    """
+    return HermesInstanceManager(
+        session=session,
+        registry=HermesInstanceRegistry(session),
+        backend=get_hermes_backend(),
+        kms=get_kms_client(),
+        settings=get_settings(),
+    )
+
+
+def get_agent_proxy_service(session: DbSession) -> AgentProxyService:
+    """Wire the agent-proxy service (ADR-045/047): manager + wallet + audit + settings.
+
+    Per-session like the other service factories so the policy read, the wallet debit (on
+    ``run.completed``) and the audit rows land in the same request transaction. The Hermes
+    instance manager and KMS reuse the existing per-user runtime wiring (ADR-046).
+    """
+    audit = AuditService(session)
+    return AgentProxyService(
+        session=session,
+        manager=get_hermes_manager(session),
+        wallet=WalletService(session, audit),
+        audit=audit,
+        settings=get_settings(),
     )
 
 

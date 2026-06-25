@@ -25,7 +25,7 @@
 }
 ```
 - `amount` > 0, **целые кредиты** (BIGINT, без дробей). При штатном вызове из Orchestrator для `mode=credits` всегда `amount=1` (1 кредит = 1 сообщение, [ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)). Сам контракт допускает любое целое > 0.
-- `meta.usage` (inputTokens/outputTokens/model) хранится для аудита и **не влияет** на `amount`.
+- `meta.usage` (inputTokens/outputTokens/model) хранится для аудита и **не влияет** на `amount`. Token-каунты (`inputTokens`/`outputTokens`/`totalTokens`) — биллинг-аналитика, НЕ секрет: redaction-allowlist ([ADR-049](../../adr/ADR-049-redaction-usage-token-counts-allowlist.md)) исключает их из `*token*`-денилиста, поэтому они сохраняются в `meta`/логах как есть.
 - `requestId` — **публичное имя поля идемпотентности** этого контракта (сохранено из ТЗ §4.5 «повторный requestId не списывает повторно»). Для chat-debit Orchestrator передаёт сюда `messageStepId` — идентификатор пользовательского message-шага, единый на все его tool-раунды и re-entry из `/chat/tool-result` ([ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md)). Используется как `idempotency_key` debit. **Это не gateway correlation `requestId`** (`X-Request-Id`, per-HTTP-request, логи/трейсы — см. [api-gateway/02-api-contracts.md](../api-gateway/02-api-contracts.md)); тот в это поле не передаётся.
 
 ### Response (200)

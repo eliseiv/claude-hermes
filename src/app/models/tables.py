@@ -37,6 +37,8 @@ CHAT_ROLE = ("user", "assistant", "tool")
 TOOL_CALL_STATUS = ("pending", "completed", "errored")
 # ADR-012: assistant type (chat|code) — orthogonal to chat_mode (billing).
 ASSISTANT_MODE = ("chat", "code")
+# ADR-046: per-user Hermes runtime lifecycle: provisioning → running → stopped (hibernation).
+HERMES_INSTANCE_STATUS = ("provisioning", "running", "stopped")
 
 _subscription_status_enum = Enum(
     *SUBSCRIPTION_STATUS, name="subscription_status", create_type=False
@@ -47,6 +49,9 @@ _chat_mode_enum = Enum(*CHAT_MODE, name="chat_mode", create_type=False)
 _chat_role_enum = Enum(*CHAT_ROLE, name="chat_role", create_type=False)
 _tool_call_status_enum = Enum(*TOOL_CALL_STATUS, name="tool_call_status", create_type=False)
 _assistant_mode_enum = Enum(*ASSISTANT_MODE, name="assistant_mode", create_type=False)
+_hermes_instance_status_enum = Enum(
+    *HERMES_INSTANCE_STATUS, name="hermes_instance_status", create_type=False
+)
 
 _uuid_default = sa_text("gen_random_uuid()")
 _now = sa_text("now()")
@@ -93,11 +98,19 @@ class Wallet(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
     balance: Mapped[int] = mapped_column(BIGINT, nullable=False, server_default=sa_text("0"))
+    # ADR-051 (migration 0014): accumulated uncharged agent-run delta (credits). A SEPARATE
+    # aggregate from balance (NOT a ledger row), so balance == Σ(credit)−Σ(debit) holds. Grows on
+    # an agent-run shortfall (consume splits: partial debit + remainder → debt); cleared by clawback
+    # on the next grant. Gated at runtime by AGENT_DEBT_RECONCILE_ENABLED; the column always exists.
+    debt: Mapped[int] = mapped_column(BIGINT, nullable=False, server_default=sa_text("0"))
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=_now
     )
 
-    __table_args__ = (CheckConstraint("balance >= 0", name="ck_wallets_balance_nonneg"),)
+    __table_args__ = (
+        CheckConstraint("balance >= 0", name="ck_wallets_balance_nonneg"),
+        CheckConstraint("debt >= 0", name="ck_wallets_debt_nonneg"),
+    )
 
 
 class LedgerTransaction(Base):
@@ -390,6 +403,50 @@ class AdaptyWebhookEvent(Base):
     __table_args__ = (Index("ix_adapty_webhook_events_user_id", "user_id"),)
 
 
+class SubscriptionGrantEvent(Base):
+    """Durable idempotency anchor for admin subscription-grant (ADR-052, migration 0015, §23).
+
+    Lives OUTSIDE the ledger so a strict 409 on "same idempotencyKey, different payload" is
+    reachable for BOTH ``grantCredits`` paths (incl. ``grantCredits=false`` where no ledger row
+    exists). Dedup point: ``UNIQUE (user_id, idempotency_key)`` via
+    ``INSERT ... ON CONFLICT DO NOTHING RETURNING ...`` (pattern of ``adapty_webhook_events``).
+    ``payload_hash`` (sha256 of plan ‖ ISO8601 expiresAt ‖ grantCredits) is the payload-conflict
+    source of truth — covers the full subscription payload, not only the ledger ``amount``.
+    """
+
+    __tablename__ = "subscription_grant_events"
+
+    # Composite-natural-key table without a surrogate PK: the unique index
+    # (user_id, idempotency_key) is the anchor. SQLAlchemy needs a primary key on the ORM model;
+    # (user_id, idempotency_key) mirror the UNIQUE index and are both NOT NULL, so they form a valid
+    # mapper PK without changing the DDL (the migration creates the UNIQUE index, not a PK
+    # constraint — both enforce uniqueness; the ORM PK here is mapper-only, same columns).
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    payload_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    plan: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    grant_credits: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # id of the credit-tx at grant_credits=true (nullable).
+    ledger_tx_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+
+    __table_args__ = (
+        Index(
+            "ux_subscription_grant_idempotency",
+            "user_id",
+            "idempotency_key",
+            unique=True,
+        ),
+    )
+
+
 class WorkspaceProject(Base):
     """A workspace («рабочее пространство», iOS «Project») — ADR-036 §2.
 
@@ -496,4 +553,46 @@ class AuthIdentity(Base):
             unique=True,
         ),
         Index("ix_auth_identities_user", "user_id"),
+    )
+
+
+class HermesInstance(Base):
+    """Registry row for a user's personal Hermes runtime container (ADR-046, §22).
+
+    One row per user (``user_id`` PK ⇒ exactly one instance per user). The instance's
+    ``API_SERVER_KEY`` is stored ONLY envelope-encrypted (``api_key_enc``/``encrypted_dek``/
+    ``nonce``, ADR-003) — plaintext is never persisted. Addressing is by ``endpoint`` (the
+    container's DNS name in the control-plane docker network); the host port is not published.
+    """
+
+    __tablename__ = "hermes_instances"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    # NULL in `provisioning` until the container is created.
+    container_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # DNS name:port in the docker network, e.g. 'hermes-user-<id>:8642'.
+    endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Envelope-encrypted API_SERVER_KEY (ADR-003): plaintext never stored.
+    api_key_enc: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    encrypted_dek: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    status: Mapped[str] = mapped_column(
+        _hermes_instance_status_enum,
+        nullable=False,
+        server_default=sa_text("'provisioning'"),
+    )
+    # nullable: the host port is NOT published (reserved for alternative RuntimeBackends).
+    port: Mapped[int | None] = mapped_column(nullable=True)
+    last_active_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+
+    __table_args__ = (
+        # Serves the background reaper (stop_idle: status='running' AND last_active_at < threshold).
+        Index("ix_hermes_instances_status_active", "status", "last_active_at"),
     )

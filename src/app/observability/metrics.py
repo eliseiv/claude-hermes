@@ -37,6 +37,13 @@ admin_grant_total = Counter(
     "Count of admin credit-grant attempts by result.",
     ["result"],
 )
+# Admin subscription grant (ADR-048 §2, ADM-11): manual subscription activation outcomes
+# by result (success | conflict | not_found).
+admin_subscription_grant_total = Counter(
+    "admin_subscription_grant_total",
+    "Count of admin subscription-grant attempts by result.",
+    ["result"],
+)
 # Token purchase (ADR-015): consumable purchase outcomes by result
 # (granted | replay | unknown_product | invalid_transaction | forbidden).
 token_purchase_total = Counter(

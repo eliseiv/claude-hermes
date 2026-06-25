@@ -63,6 +63,15 @@ jobs:
     runs-on: ubuntu-latest
     # Integration/e2e use testcontainers, which need a Docker daemon (present on
     # ubuntu-latest runners). No service containers declared: testcontainers manages them.
+    #
+    # COVERAGE_CORE=sysmon (PEP 669 sys.monitoring) instead of the legacy per-thread C settrace
+    # tracer. Primary motive is a Windows `--cov` access-violation segfault (settrace firing across
+    # native C frames in asyncio.to_thread worker threads); harmless and faster on Linux runners
+    # too. Authoritative setting is pyproject [tool.coverage.run] core="sysmon" — this job-level
+    # env is a belt-and-suspenders fallback covering BOTH coverage steps below for any coverage
+    # build that ignores the `core` config key.
+    env:
+      COVERAGE_CORE: sysmon
     steps:
       - uses: actions/checkout@v4
 
@@ -151,9 +160,10 @@ jobs:
   # instance `claude-ios:claude-ios` -> `-p claude-ios` is the SAME project name as the previous
   # deploy with no `-p` (basename of /opt/claude-ios) => a NO-OP for broadnova.shop (backward-
   # compat). The other instances `avelyra:avelyra` (avelyraweb.shop), `orvianix:orvianix`
-  # (orvianix.shop, OpenAI) and `veltrio:veltrio` (veltriohub.shop, OpenAI) are provisioned on the
-  # server (clone .env + .secrets/ per docs/07-deployment.md §Процедура провижининга клона) and are
-  # in the loop, so every push to main auto-deploys ALL instances.
+  # (orvianix.shop, OpenAI), `veltrio:veltrio` (veltriohub.shop, OpenAI) and the NEW independent
+  # `claude-hermes:claude-hermes` (/opt/claude-hermes, Hermes-per-user control plane, ADR-046) are
+  # provisioned on the server (clone .env + .secrets/ per docs/07-deployment.md §Процедура
+  # провижининга клона) and are in the loop, so every push to main auto-deploys ALL instances.
   #
   # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
   #   SSH_HOST=87.239.135.154 / SSH_USER=root / SSH_PRIVATE_KEY (public half in server authorized_keys)
@@ -243,8 +253,12 @@ jobs:
             # instance `orvianix:orvianix` (orvianix.shop) and the fourth `veltrio:veltrio`
             # (veltriohub.shop) are OpenAI clones (ADR-033: LLM_PROVIDER=openai + OPENAI_* in their
             # own /opt/<dir>/.env) — same code, same per-instance deploy/readiness/smoke; only their
-            # .env differs.
-            INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio"
+            # .env differs. The fifth `claude-hermes:claude-hermes` (ADR-046 Hermes-per-user control
+            # plane) is a NEW INDEPENDENT instance in /opt/claude-hermes with its own .env + dedicated
+            # Hermes docker-network (claude-hermes-hermes-net) and volume root — same code/deploy path;
+            # see the §claude-hermes clone block in .env.prod.example. Added LAST so claude-ios stays
+            # first (backward-compat for the live broadnova.shop).
+            INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio claude-hermes:claude-hermes"
             FAILED=""   # collect instances that REALLY failed; job goes red at the end if non-empty
             for entry in $INSTANCES; do
               dir="${entry%%:*}"; proj="${entry##*:}"
@@ -321,3 +335,127 @@ jobs:
               exit 1
             fi
             echo "[deploy] all instances deployed and healthy"
+
+  # ---------------------------------------------------------------------------------------------
+  # Gated deploy №2 — DEDICATED server avorelio (87.239.135.156) + OUR self-hosted Traefik
+  # (docs/07-deployment.md §Топология №2, ADR-057). This is an INDEPENDENT deploy target, NOT a
+  # member of the broadnova `.154` INSTANCES-loop above: a DIFFERENT server (SSH_HOST_AVORELIO),
+  # a DIFFERENT compose `-f` set (prod + the docker-compose.avorelio.yml overlay that adds OUR
+  # traefik + an internal `web` network), and a single instance in /opt/claude-hermes. It runs
+  # in PARALLEL with the broadnova `deploy` job (no `needs` between them) and does NOT touch the
+  # broadnova `.154` loop — so broadnova does NOT regress.
+  #
+  # Same hard CI gate as the broadnova deploy: `needs: [quality, test, build-image]` + the
+  # main-branch / success() guard, so it only runs on a green push to main (ADR-057 §5).
+  #
+  # Image is BUILT ON THE SERVER from sources (no registry/immutable tag, ADR-057 §5 == ADR-017).
+  #
+  # Flow: SSH to .156 -> cd /opt/claude-hermes -> git pull --ff-only ->
+  #   compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml build api migrate ->
+  #   run --rm migrate -> up -d --no-build -> readiness gate (claude-hermes-api-1 healthy =
+  #   compose healthcheck GET /ready: db+redis) -> NON-FATAL public smoke https://avorelio.shop/healthz.
+  # Same hardened pattern as broadnova: script_stop:false, `set -uo pipefail` (NO `-e`), readiness
+  # via `docker inspect ... .State.Health.Status`. NOTE: on the FIRST deploy OUR Traefik issues the
+  # Let's Encrypt cert for avorelio.shop (HTTP-01 over port 80) — DNS/ACME may still be settling, so
+  # the public smoke is NON-FATAL (warning), exactly like broadnova.
+  #
+  # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
+  #   SSH_HOST_AVORELIO=87.239.135.156   (SEPARATE from broadnova SSH_HOST=87.239.135.154)
+  #   SSH_USER=root
+  #   SSH_PRIVATE_KEY  (public half in .156's ~/.ssh/authorized_keys)
+  # The server's /opt/claude-hermes/.env (incl. ACME_EMAIL, SERVICE_DOMAIN=avorelio.shop,
+  # TRAEFIK_CERTRESOLVER=le, DB/LLM secrets) is provisioned ON THE SERVER from the secret manager
+  # (ADR-057 §5), NOT through GitHub Secrets. `.env` is gitignored and survives `git pull`.
+  #
+  # ROLLBACK (no registry/immutable tag), on .156 in /opt/claude-hermes:
+  #   git log --oneline -n 5 ; git checkout <prev-commit>
+  #   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env build api migrate
+  #   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env run --rm migrate  # if needed (expand/contract)
+  #   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env up -d --no-build
+  # The traefik container is NOT changed on rollback (its image is pinned, config lives in the
+  # compose overlay). Schema is NOT reverted (expand/contract keeps old code compatible).
+  deploy-avorelio:
+    name: ssh deploy (dedicated .156 + self-hosted Traefik)
+    runs-on: ubuntu-latest
+    needs: [quality, test, build-image]
+    if: ${{ github.ref == 'refs/heads/main' && success() }}
+    environment: production
+    permissions:
+      contents: read
+    # Independent in-flight guard for THIS target (separate from broadnova's deploy-production).
+    concurrency:
+      group: deploy-avorelio
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH (avorelio .156)
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST_AVORELIO }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # Same hardened design as the broadnova deploy: script_stop MUST be false so the remote
+          # shell behaviour is governed solely by our `set -uo pipefail` (NO `-e`). Real failures
+          # (build/migrate/api-not-healthy) are caught by explicit rc checks + the readiness gate
+          # and turn the job red via the final `exit 1`; the spurious fused exit code of
+          # `up --build` is not trusted (we split build/migrate/up).
+          script_stop: false
+          script: |
+            set -uo pipefail   # NO `-e` on purpose (consistent with the broadnova deploy job)
+            DIR=/opt/claude-hermes
+            PROJ=claude-hermes
+            COMPOSE="docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env"
+            echo "[avorelio] === dir=$DIR project=$PROJ (self-hosted Traefik) ==="
+            cd "$DIR" || { echo "::error title=cd failed::$DIR missing on .156"; exit 1; }
+            echo "[avorelio] git pull --ff-only"
+            if ! git pull --ff-only; then
+              echo "::error title=git pull failed::ff-only pull failed in $DIR"; exit 1
+            fi
+            # (1) Build api + migrate images on the server (REAL build failure => fail).
+            echo "[avorelio] build api migrate (image built on the server)"
+            if ! $COMPOSE build api migrate; then
+              echo "::error title=build failed::docker compose build returned non-zero"; exit 1
+            fi
+            # (2) Migrate explicitly BEFORE api (REAL migration failure => fail).
+            echo "[avorelio] migrate (alembic upgrade head)"
+            if ! $COMPOSE run --rm migrate; then
+              echo "::error title=migrate failed::alembic upgrade head returned non-zero"; exit 1
+            fi
+            # (3) Start the whole stack (traefik + api + postgres + redis). No build here.
+            #     rc recorded but NOT trusted (one-shot migrate dep / BuildKit session can make
+            #     `up` non-zero benignly) — the readiness gate (4) is the source of truth.
+            echo "[avorelio] up -d --no-build (rc recorded, not trusted; readiness gate decides)"
+            up_rc=0
+            $COMPOSE up -d --no-build || up_rc=$?
+            echo "[avorelio] up rc=$up_rc (informational)"
+            # (4) Deterministic readiness gate: api MUST become healthy (compose healthcheck =
+            #     GET /ready: db+redis). Container name is ${PROJ}-api-1 == claude-hermes-api-1.
+            echo "[avorelio] readiness gate: api container health"
+            ready=0
+            for i in $(seq 1 30); do
+              h="$(docker inspect "${PROJ}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
+              if [ "$h" = "healthy" ]; then echo "[avorelio] api healthy ($i)"; ready=1; break; fi
+              echo "[avorelio] api health=$h ($i/30) — retrying in 2s"; sleep 2
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "::error title=api not healthy::api did not become healthy within ~60s (up rc=$up_rc). Last logs:"
+              docker logs "${PROJ}-api-1" --tail 40 2>&1 || true
+              exit 1
+            fi
+            # Public smoke through OUR Traefik (TLS + Host routing) on avorelio.shop. NON-FATAL:
+            # on the first deploy OUR Traefik is still issuing the Let's Encrypt cert (HTTP-01),
+            # and DNS/A-record may still be settling — retry 12 x 5s = 60s, then ::warning:: only.
+            url="https://avorelio.shop/healthz"
+            echo "[avorelio:smoke] GET $url"
+            smoke_ok=0
+            for i in $(seq 1 12); do
+              if curl -fsS --max-time 5 "$url" >/dev/null; then
+                echo "[avorelio:smoke] healthz OK"; smoke_ok=1; break
+              fi
+              echo "[avorelio:smoke] not ready ($i/12) — retrying in 5s"; sleep 5
+            done
+            if [ "$smoke_ok" -ne 1 ]; then
+              echo "::warning title=Smoke /healthz not green (avorelio)::$url did not return 200 within 60s. The deploy (build+migrate+up) succeeded and api is healthy in-container; OUR Traefik's Let's Encrypt issuance (HTTP-01, resolver 'le') or the avorelio.shop A-record may still be settling on the first deploy. Re-run this workflow once they are ready."
+            fi
+            echo "[avorelio] prune dangling build layers (best-effort)"
+            docker image prune -f || true
+            echo "[avorelio] deployed and healthy"

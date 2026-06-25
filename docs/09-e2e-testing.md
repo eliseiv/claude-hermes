@@ -19,6 +19,7 @@ unit/integration-пирамиду из [06-testing-strategy.md](06-testing-strat
 | **KMS (BYOK envelope)** | `LocalKmsClient` (реальный AES-256-GCM) | Уже реализованный дефолт для local/CI ([05-security.md](05-security.md)). Не stub — настоящее шифрование под `KMS_LOCAL_MASTER_KEY`. |
 | **PostgreSQL 16, Redis 7** | **Реальные** контейнеры | По [06-testing-strategy.md](06-testing-strategy.md): БД и Redis не мокаются. |
 | **JWT-издатель** | Локальная RS256-пара (test JWKS / статичный публичный ключ через `JWT_*`) | Токены подписываются тестовым приватным ключом; сервис верифицирует публичным. Прод-поведение проверки не меняется. |
+| **Hermes runtime (`/v1/agent/*`)** | **Реальный** Hermes-инстанс из **публичного** образа `HERMES_IMAGE`, провижинится control plane через `docker.sock` (override `docker-compose.e2e.hermes.yml`) | Агентный путь `/v1/agent/*` ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)/[ADR-046](adr/ADR-046-per-user-hermes-runtime.md)) тестируется против **реального** Hermes (путь «а» ADR-046: control plane сам провижинит per-user контейнер через docker.sock по первому запросу). Образ — публичный pinned из registry (не `latest`, не сборка из исходников). Требует override + предусловий на хосте daemon (§3.3). |
 
 ### 1.1 Anthropic в e2e
 - Используется реальный `ANTHROPIC_API_KEY` (предоставляет пользователь), передаётся через env.
@@ -135,6 +136,22 @@ docker compose -f docker-compose.yml -f docker-compose.e2e.yml up -d
 - **`docker-compose.e2e.yml`** — отдельный e2e-артефакт, **не меняет** base `docker-compose.yml`. Он лишь снимает публикацию хост-портов `postgres` (5432) и `redis` (6379) через `ports: !reset []`, потому что на части хостов нативные PostgreSQL/Redis уже занимают эти порты. `api`/`migrate` обращаются к `postgres`/`redis` по имени сервиса во внутренней compose-сети, публикация хост-портов им не нужна. `api` сохраняет `127.0.0.1:8000` для доступа qa/smoke.
 - **Требуется Docker Compose v2.24+** — синтаксис `!reset []` (очистка унаследованного списка `ports`) появился в v2.24. Минимальная версия compose согласована с [07-deployment.md](07-deployment.md#локальный-подъём-и-e2e-override).
 - Старт e2e — после `api` → `service_healthy` (см. §3.2).
+
+#### Агентный путь `/v1/agent/*` — реальный Hermes (override `docker-compose.e2e.hermes.yml`)
+Для e2e агентного пути `/v1/agent/*` против **реального** Hermes (а не stub) добавляется третий override [`docker-compose.e2e.hermes.yml`](../docker-compose.e2e.hermes.yml) — он даёт `api` доступ к `docker.sock:ro` и подключает его к сети `hermes-net`, чтобы control plane сам провижинил per-user Hermes-инстанс из **публичного** образа `HERMES_IMAGE` (путь «а» [ADR-046](adr/ADR-046-per-user-hermes-runtime.md): инстанс создаётся on-demand по первому запросу `/v1/agent/*`; статический `hermes`-сервис не объявляется). Базовый `docker-compose.yml` + `docker-compose.e2e.yml` этого **не** дают (только prod-стек wires Docker-доступ Hermes) — поэтому нужен именно этот override.
+
+```
+docker compose -f docker-compose.yml -f docker-compose.e2e.yml -f docker-compose.e2e.hermes.yml up -d
+```
+
+**Предусловия (на хосте Docker daemon, до bring-up):**
+- `docker network create hermes-net` (или своя сеть из `HERMES_DOCKER_NETWORK`; `external: true` — compose её не создаёт);
+- `docker pull nousresearch/hermes-agent:<pinned-tag>` + задать этот ref в `HERMES_IMAGE` (пусто → `provision` fail-fast; **не `latest`**, сборки из исходников нет);
+- конфигурация LLM инстанса ([ADR-055](adr/ADR-055-hermes-instance-llm-config-contract.md)) в `.env` — `HERMES_LLM_PROVIDER` (валидный, НЕ `openai`/`auto`) + `HERMES_LLM_API_KEY` (ключ соответствует провайдеру) + `HERMES_MODEL` («голое» имя модели, непусто). **Рекомендуемые значения для прогона с имеющимся `ANTHROPIC_API_KEY`:** `HERMES_LLM_PROVIDER=anthropic`, `HERMES_LLM_API_KEY=<тот же ANTHROPIC_API_KEY>` (прокинется в инстанс как `ANTHROPIC_API_KEY`), `HERMES_MODEL=claude-3-5-haiku-latest` (валидный Anthropic-id; control plane соберёт `model.default=anthropic/claude-3-5-haiku-latest`). `HERMES_LLM_BASE_URL` — НЕ задавать (anthropic direct). **Альтернатива — прогон с OpenAI-ключом через провайдер `custom`** ([ADR-055 §6](adr/ADR-055-hermes-instance-llm-config-contract.md); у Hermes НЕТ direct-`openai` Chat-провайдера — OpenAI Chat API доступен через OpenAI-compatible `custom`): `HERMES_LLM_PROVIDER=custom`, `HERMES_LLM_BASE_URL=https://api.openai.com/v1` (обязателен — `custom` ∈ `HERMES_PROVIDERS_REQUIRING_BASE_URL`), `HERMES_MODEL=gpt-4o-mini` (или `gpt-4o`; control plane соберёт `model.default=custom/gpt-4o-mini`), `HERMES_LLM_API_KEY=<OpenAI-ключ>`. Ключ для `custom` пойдёт **не** в env `<PROVIDER>_API_KEY` (образ его игнорирует), а в `config.yaml model.api_key="${HERMES_INSTANCE_LLM_KEY}"` через env `HERMES_INSTANCE_LLM_KEY` (§6). Любое пустое/невалидное → `provision` fail-fast (не 401 в рантайме);
+- `HERMES_VOLUME_ROOT` — путь, **существующий и writable на хосте daemon** (на Docker Desktop хост daemon — Linux-VM, не Windows-FS; per-user `<root>/<user_id>` bind-mount'ится в `/opt/data`; дефолт `/opt/data/hermes`);
+- `DOCKER_SOCK_GID` — GID сокета `/var/run/docker.sock` на хосте daemon (`api` под non-root uid 10001 без членства в группе сокета получит `PermissionError(13)`). Определить: `docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine stat -c '%g' /var/run/docker.sock`; override прокидывает значение в `group_add` (дефолт `0`).
+
+⚠️ `docker.sock` — высокая привилегия (≈ root на хосте даже `:ro`); override монтирует сокет **только** в `api` (не в `postgres`/`redis`/Hermes-инстансы), зеркалит prod-митигации. Только для локалки/e2e на доверенной машине — **не** prod-артефакт. Детали — [07-deployment.md §E2E с реальным Hermes](07-deployment.md#e2e-с-реальным-hermes--override-docker-composee2ehermesyml-агентный-путь-v1agent).
 
 ---
 

@@ -63,6 +63,42 @@ class ChatRepository:
         )
         return updated is not None
 
+    async def claim_trial(self, user_id: uuid.UUID) -> bool:
+        """Claim the lifetime trial BEFORE generation in its own short transaction (ADR-054 §1).
+
+        The atomic conditional UPDATE is the SINGLE arbiter of the trial race (no advisory lock):
+        ``UPDATE users SET trial_used=TRUE WHERE id=:uid AND trial_used=FALSE RETURNING id`` then
+        COMMIT. Returns True when THIS call won the trial (affected=1 → claimed_trial); False when
+        the trial was already taken (a parallel first request or a past turn) → the caller blocks
+        with blockReason=trial_used WITHOUT generating. Committed immediately so concurrent claims
+        serialize on the users row-lock and resolve at once — compatible with MAJOR-4 (this is NOT
+        the generate transaction). Any pending writes in the session (the user message-step) are
+        committed together, which is correct on the proceed path. A lazy-provisioned user (no row
+        yet) → affected=0 → not eligible here; the trial flows only for an existing user row.
+        """
+        claimed = await self.mark_trial_used(user_id)
+        await self._session.commit()
+        return claimed
+
+    async def reconcile_trial(self, user_id: uuid.UUID) -> bool:
+        """Roll back a trial claim on an unsuccessful turn, in its own short transaction (§2/§2a).
+
+        ``UPDATE users SET trial_used=FALSE WHERE id=:uid AND trial_used=TRUE`` then COMMIT —
+        restores the trial so it "burns only on a SUCCESSFUL generation" (symmetry with ADR-025
+        max_tokens). Idempotent and never touches a foreign trial: the ``WHERE trial_used=TRUE``
+        guard plus the caller's claimed-trial flag / is_inflight_trial_turn signal ensure only this
+        user's own just-claimed trial is reset. Returns True if it flipped a row, else False.
+        """
+        updated = await self._session.scalar(
+            text(
+                "UPDATE users SET trial_used = FALSE "
+                "WHERE id = :uid AND trial_used = TRUE RETURNING id"
+            ),
+            {"uid": str(user_id)},
+        )
+        await self._session.commit()
+        return updated is not None
+
     async def get_session(self, session_id: uuid.UUID, user_id: uuid.UUID) -> ChatSession | None:
         row = await self._session.scalar(
             select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user_id)

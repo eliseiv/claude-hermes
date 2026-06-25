@@ -14,8 +14,10 @@
 
 ## Out of scope (этой итерации)
 - **Consumable-пакеты токенов через Adapty.** Остаются на `/v1/tokens/purchase` ([ADR-015](../../adr/ADR-015-consumable-token-iap.md)). Перенос — [Q-029-1](../../99-open-questions.md), [TD-020](../../100-known-tech-debt.md).
-- **Ретирование `/v1/subscription/sync`** (StoreKit JWS). Эндпоинт остаётся рабочим; источник истины по подпискам = Adapty. Отложено — [Q-029-2](../../99-open-questions.md), [TD-021](../../100-known-tech-debt.md).
 - Webhook на нашей стороне → Adapty (исходящие вызовы Adapty API). Не требуется.
 
+## Ретирование `/v1/subscription/sync` (prod-harden, [TD-021](../../100-known-tech-debt.md)/[Q-029-2](../../99-open-questions.md))
+StoreKit-путь подписок `POST /v1/subscription/sync` **ретируется** (ревизия [ADR-029](../../adr/ADR-029-adapty-subscription-webhook.md)): роут + подписочная ветка кода удаляются backend'ом. Adapty-вебхук — **единственный** путь подписок claude-hermes → анти-double-grant **by construction** (второго пути нет). `/v1/tokens/purchase` (consumable) сохраняется.
+
 ## Ключевой инвариант (анти-double-grant)
-Клиент использует **ОДИН** путь биллинга подписок. На Adapty-сборке iOS шлёт только Adapty-события и **не** вызывает `/v1/subscription/sync`. Иначе — разные idempotency-ключи → двойное начисление (см. [05-security.md](../../05-security.md), [01-context.md](01-context.md)).
+После ретирования `/v1/subscription/sync` путь подписок один (Adapty) → двойное начисление невозможно конструктивно. В пределах Adapty-пути — двойная UNIQUE-граница (`adapty_webhook_events.event_id` + ledger `adapty-event:{event_id}`).

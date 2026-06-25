@@ -93,12 +93,43 @@ def test_db_url_prefers_config_section_when_no_main() -> None:
     assert module._db_url() == injected
 
 
+def _expected_fallback() -> str:
+    # ADR-053 (TD-001): the Config-empty fallback prefers DATABASE_URL_MIGRATE (full-privilege
+    # app_migrate role for DDL), falling back to DATABASE_URL when the migrate DSN is unset.
+    settings = get_settings()
+    return settings.database_url_migrate or settings.database_url
+
+
 def test_db_url_falls_back_to_settings_when_config_empty() -> None:
     module = _load_env_with_config(_FakeConfig(main_url=None, section_url=None))
-    assert module._db_url() == get_settings().database_url
+    assert module._db_url() == _expected_fallback()
 
 
 def test_db_url_ignores_empty_string_config() -> None:
     """An empty (falsy) Config value must not shadow the settings fallback."""
     module = _load_env_with_config(_FakeConfig(main_url="", section_url=""))
-    assert module._db_url() == get_settings().database_url
+    assert module._db_url() == _expected_fallback()
+
+
+def test_db_url_fallback_prefers_migrate_dsn_over_runtime(monkeypatch: Any) -> None:
+    """ADR-053: when both DSNs are set and Config is empty, the MIGRATE dsn wins (DDL role)."""
+    monkeypatch.setenv("DATABASE_URL_MIGRATE", "postgresql+asyncpg://m:m@migrate-host:5432/db")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://r:r@runtime-host:5432/db")
+    get_settings.cache_clear()
+    try:
+        module = _load_env_with_config(_FakeConfig(main_url=None, section_url=None))
+        assert module._db_url() == "postgresql+asyncpg://m:m@migrate-host:5432/db"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_db_url_fallback_uses_runtime_when_migrate_unset(monkeypatch: Any) -> None:
+    """ADR-053: with DATABASE_URL_MIGRATE unset, the Config-empty fallback uses DATABASE_URL."""
+    monkeypatch.setenv("DATABASE_URL_MIGRATE", "")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://r:r@runtime-only:5432/db")
+    get_settings.cache_clear()
+    try:
+        module = _load_env_with_config(_FakeConfig(main_url=None, section_url=None))
+        assert module._db_url() == "postgresql+asyncpg://r:r@runtime-only:5432/db"
+    finally:
+        get_settings.cache_clear()

@@ -9,7 +9,7 @@ from __future__ import annotations
 import ipaddress
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -23,9 +23,19 @@ class Settings(BaseSettings):
     )
 
     # --- Storage ---
+    # Runtime DSN — least-privilege role `app_rw` (ADR-053, durable append-only audit_logs:
+    # INSERT,SELECT on audit_logs, no UPDATE/DELETE/TRUNCATE). Used by the api process.
     database_url: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/claude_ios",
         alias="DATABASE_URL",
+    )
+    # Migration DSN — full-privilege role `app_migrate` (ADR-053): DDL incl. audit_logs schema
+    # edits/rollbacks and trigger toggling. Used ONLY by the `migrate` job (alembic upgrade head),
+    # never by the runtime api. Default mirrors database_url (local single-role `postgres`); in prod
+    # it points at `app_migrate`. migrations/env.py falls back DATABASE_URL_MIGRATE -> DATABASE_URL.
+    database_url_migrate: str = Field(
+        default="postgresql+asyncpg://postgres:postgres@localhost:5432/claude_ios",
+        alias="DATABASE_URL_MIGRATE",
     )
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
 
@@ -93,6 +103,16 @@ class Settings(BaseSettings):
     auth_rate_limit_per_ip: int = Field(default=10, alias="AUTH_RATE_LIMIT_PER_IP")
     # Toggle GET /v1/auth/jwks (public, non-secret). Default true.
     auth_jwks_enabled: bool = Field(default=True, alias="AUTH_JWKS_ENABLED")
+    # TD-013: background cleanup of auth_refresh_tokens (reaper pattern, ADR-046 §5). Poll interval
+    # (default 1h) and the grace period (default 7d) kept for used/revoked rows so recently-rotated
+    # tokens stay available to reuse-detect before deletion. Expired rows are deleted regardless of
+    # grace. State lives in the DB → survives restart. No migration; auth contract unchanged.
+    auth_refresh_cleanup_interval_seconds: int = Field(
+        default=3600, alias="AUTH_REFRESH_CLEANUP_INTERVAL_SECONDS"
+    )
+    auth_refresh_cleanup_grace_seconds: int = Field(
+        default=604800, alias="AUTH_REFRESH_CLEANUP_GRACE_SECONDS"
+    )
 
     # --- KMS (envelope encryption, ADR-003, Q-002-1) ---
     kms_key_id: str = Field(default="", alias="KMS_KEY_ID")
@@ -169,6 +189,17 @@ class Settings(BaseSettings):
     admin_rate_limit_per_min: int = Field(default=10, alias="ADMIN_RATE_LIMIT_PER_MIN")
     # Body size limit for admin endpoints (<= 8 KB, ADR-009 §6).
     admin_size_limit_body: int = Field(default=8 * 1024, alias="ADMIN_SIZE_LIMIT_BODY")
+
+    # --- Client API-KEY auth (ADR-044) ---
+    # Single trusted CLIENT key (X-API-Key) authenticating every user-facing /v1/* request of the
+    # Hermes-integration client contour. High-entropy (>= 32 bytes), only via secret manager / env,
+    # never in code/repo/image. Compared constant-time (hmac.compare_digest); an empty/unset value
+    # never matches. High-privilege secret (knowledge of it = acting as ANY X-User-Id) — under
+    # redaction (X-API-Key denylist), separate from JWT/KMS/ADMIN/PREVIEW secrets and per-instance
+    # (ADR-017). CLIENT_API_KEY_PREV is the previous key kept valid during rotation (grace period);
+    # both are compared constant-time, any match is accepted (ADR-044 §1, mirrors ADR-009 §5).
+    client_api_key: str = Field(default="", alias="CLIENT_API_KEY")
+    client_api_key_prev: str = Field(default="", alias="CLIENT_API_KEY_PREV")
 
     # --- Website builder / preview (ADR-010, ADR-011, WB-2) ---
     # Isolated HMAC secret for signed preview URLs. Separate from JWT/KMS/ADMIN secrets.
@@ -266,10 +297,127 @@ class Settings(BaseSettings):
     # false in prod so the API surface is not publicly exposed (05-security.md).
     docs_enabled: bool = Field(default=True, alias="DOCS_ENABLED")
 
+    # --- Hermes runtime (per-user agent containers, ADR-046, 07-deployment.md) ---
+    # Docker image + pinned tag of the Hermes agent (NOT `latest`, for reproducibility). Empty
+    # default => provisioning fails fast (misconfiguration) rather than pulling an unknown image.
+    # Per-instance. Not a secret.
+    hermes_image: str = Field(default="", alias="HERMES_IMAGE")
+    # Dedicated docker network connecting the control plane to Hermes instances. Instances do NOT
+    # publish a host port — access is only from this network; addressing is by container DNS name.
+    hermes_docker_network: str = Field(default="hermes-net", alias="HERMES_DOCKER_NETWORK")
+    # Host root path for per-user HERMES_HOME volumes (mounted to /opt/data in the instance). The
+    # volume survives hibernation (stop/start). Per-instance.
+    hermes_volume_root: str = Field(default="/opt/data/hermes", alias="HERMES_VOLUME_ROOT")
+    # Safe toolset written to the instance config.yaml (platform_toolsets.api_server). Comma-
+    # separated; default excludes terminal/browser/code_execution/computer_use (05-security.md).
+    # Configurable (groundwork for tiers). Parsed by hermes_default_toolset().
+    hermes_default_toolset_raw: str = Field(
+        default="web,file,vision,skills,todo", alias="HERMES_DEFAULT_TOOLSET"
+    )
+    # Hibernation threshold: a container whose last_active_at is older is stopped by the reaper
+    # (stop_idle). Woken on demand by ensure_running. Default 30 min.
+    hermes_idle_timeout_seconds: int = Field(default=1800, alias="HERMES_IDLE_TIMEOUT_SECONDS")
+    # Reaper poll interval (lifespan background task). Independent of the idle threshold; default
+    # 5 min. The reaper survives process restarts (state lives in hermes_instances, not memory).
+    hermes_reaper_interval_seconds: int = Field(default=300, alias="HERMES_REAPER_INTERVAL_SECONDS")
+    # LLM provider configured INSIDE the Hermes instance, written to config.yaml `model.provider`
+    # (ADR-055; the image resolves the provider from config.yaml, NOT from env). Independent of our
+    # LLM_PROVIDER (ADR-033). MUST be a CONCRETE provider from the image allowlist
+    # (HERMES_PROVIDER_ALLOWLIST) and NOT `auto` (auto defaults to openrouter base_url → 401).
+    # `openai` is invalid (no direct provider — use openrouter/custom). Default anthropic.
+    # Validated fail-fast at provisioning.
+    hermes_llm_provider: str = Field(default="anthropic", alias="HERMES_LLM_PROVIDER")
+    # Service LLM API key supplied to the instance (mapped to the provider's key-env via
+    # HERMES_PROVIDER_KEY_ENV, ADR-055 §4). SECRET — never logged (redaction `*key*`). Empty =>
+    # provisioning fails fast.
+    hermes_llm_api_key: str = Field(default="", alias="HERMES_LLM_API_KEY")
+    # BARE model name of the Hermes instance (ADR-055 §3), e.g. `claude-3-5-haiku-latest` — WITHOUT
+    # a provider prefix. The control plane assembles config.yaml `model.default` =
+    # "<HERMES_LLM_PROVIDER>/<HERMES_MODEL>". The image ignores env `LLM_MODEL` → model is only set
+    # via config.yaml. Empty => provisioning fails fast (empty model = the "Model: (empty)" bug).
+    hermes_model: str = Field(default="", alias="HERMES_MODEL")
+    # base_url for the instance LLM endpoint → config.yaml `model.base_url` (NOT env, ADR-055 §4).
+    # REQUIRED for providers in HERMES_PROVIDERS_REQUIRING_BASE_URL (custom/azure-foundry); optional
+    # for lmstudio; leave empty for the rest (the base_url line is then omitted → image default).
+    hermes_llm_base_url: str = Field(default="", alias="HERMES_LLM_BASE_URL")
+    # Per-instance API_SERVER_KEY length in bytes (CSPRNG). >=16 chars after base64url encoding;
+    # 32 bytes ⇒ 43-char token (ADR-046 §1). Configurable, never below 16 bytes.
+    hermes_api_key_bytes: int = Field(default=32, alias="HERMES_API_KEY_BYTES")
+    # TD-031: max age of a `provisioning` row before ensure_running treats it as stale and replays
+    # (deprovision + provision) instead of using the incomplete row (endpoint=NULL/DNS-fallback). A
+    # crash between create_provisioning and mark_running leaves such a row; the threshold is well
+    # above a normal provision (default 120s). A fresh provisioning row (younger) is left as-is
+    # (concurrent-start, current behaviour). Configurable; per-instance.
+    hermes_provisioning_stale_seconds: int = Field(
+        default=120, alias="HERMES_PROVISIONING_STALE_SECONDS"
+    )
+    # ADR-056 §1: cold-start readiness gate. After `docker run`, provision polls the instance
+    # GET /health until 200 before mark_running. Total budget (default 90s — above the ~30-40s
+    # cold-start with margin) and poll interval (default 2s). Invariant (ADR-056 §3): the stale
+    # threshold MUST exceed this budget so a live readiness-wait is not mistaken for a stale crash
+    # residue (validated below, fail-fast). Per-instance.
+    hermes_provision_ready_timeout_seconds: int = Field(
+        default=90, alias="HERMES_PROVISION_READY_TIMEOUT_SECONDS"
+    )
+    hermes_provision_ready_interval_seconds: int = Field(
+        default=2, alias="HERMES_PROVISION_READY_INTERVAL_SECONDS"
+    )
+    # ADR-056 §4(1): UID/GID passed to the Hermes container (HERMES_UID/HERMES_GID env). The image's
+    # s6 stage2 chowns its /opt/data (the bind-mounted host volume) to these → the volume owner
+    # matches the api process (which writes config.yaml), removing the reuse PermissionError. MUST
+    # equal the api container's uid/gid (docker-compose); default 10001/10001 (05-security.md).
+    hermes_uid: int = Field(default=10001, alias="HERMES_UID")
+    hermes_gid: int = Field(default=10001, alias="HERMES_GID")
+    # Health-probe timeout (GET /health of the instance), seconds.
+    hermes_health_timeout_seconds: float = Field(default=5.0, alias="HERMES_HEALTH_TIMEOUT_SECONDS")
+    # Proxy/SSE timeouts to a Hermes instance (ADR-045 §6). The non-streaming launch (POST /v1/runs)
+    # uses a bounded timeout; the SSE relay (GET .../events) disables the READ timeout (long-lived
+    # stream) but keeps connect/write bounded so a dead instance still fails fast.
+    hermes_proxy_timeout_seconds: float = Field(default=30.0, alias="HERMES_PROXY_TIMEOUT_SECONDS")
+    hermes_sse_connect_timeout_seconds: float = Field(
+        default=10.0, alias="HERMES_SSE_CONNECT_TIMEOUT_SECONDS"
+    )
+
+    # --- Agent usage-based billing (ADR-047, agent-proxy) ---
+    # Credits charged per 1000 tokens for an agent run (/v1/agent/*). Conversion:
+    #   amount = ceil(input/1000*CREDITS_PER_1K_INPUT + output/1000*CREDITS_PER_1K_OUTPUT)
+    # with a floor of 1 credit on any non-zero usage (ADR-047 §2; credits are integers,
+    # 03-data-model.md). Defaults are the tariff baseline (Q-047-1); per-instance, not secrets.
+    credits_per_1k_input: float = Field(default=1.0, alias="CREDITS_PER_1K_INPUT")
+    credits_per_1k_output: float = Field(default=5.0, alias="CREDITS_PER_1K_OUTPUT")
+
+    # --- Agent debt reconciliation (ADR-051) ---
+    # Gate for the agent-run debt reconciliation: partial-debit + wallets.debt on a shortfall
+    # (WalletService.consume), clawback on grant, and the policy-gate debt_outstanding block.
+    # Default true. When false, the ADR-047 §6 behaviour holds (full savepoint rollback on insuff.
+    # balance, audit-only, no debt accounting, no policy block). The wallets.debt column exists
+    # regardless of this flag (migration 0014). NOTE: this gates EMISSION only — the enum/achievable
+    # set of blockReason ALWAYS includes debt_outstanding (agent-proxy/02, ADR-051 §4).
+    agent_debt_reconcile_enabled: bool = Field(default=True, alias="AGENT_DEBT_RECONCILE_ENABLED")
+
     # --- Observability ---
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     otel_exporter_otlp_endpoint: str = Field(default="", alias="OTEL_EXPORTER_OTLP_ENDPOINT")
     metrics_scrape_token: str = Field(default="", alias="METRICS_SCRAPE_TOKEN")
+
+    @model_validator(mode="after")
+    def _validate_hermes_provision_invariant(self) -> Settings:
+        """Fail-fast on the ADR-056 §3 invariant: stale threshold MUST exceed the ready budget.
+
+        ``HERMES_PROVISIONING_STALE_SECONDS`` (TD-031 crash residue threshold) must be strictly
+        greater than ``HERMES_PROVISION_READY_TIMEOUT_SECONDS`` (cold-start readiness budget) so a
+        live readiness-wait (a `provisioning` row legitimately waiting up to the ready budget) is
+        never mistaken for a stale crash residue and concurrently replayed. Validated at settings
+        construction → a misconfiguration fails the process at startup, not at provision time.
+        """
+        if self.hermes_provisioning_stale_seconds <= self.hermes_provision_ready_timeout_seconds:
+            raise ValueError(
+                "HERMES_PROVISIONING_STALE_SECONDS "
+                f"({self.hermes_provisioning_stale_seconds}) must be greater than "
+                "HERMES_PROVISION_READY_TIMEOUT_SECONDS "
+                f"({self.hermes_provision_ready_timeout_seconds}) — ADR-056 §3"
+            )
+        return self
 
     def token_products(self) -> dict[str, int]:
         """Parse TOKEN_PRODUCTS (JSON object productId->credits) into a validated mapping.
@@ -326,6 +474,23 @@ class Settings(BaseSettings):
                 continue
             products[key] = value
         return products
+
+    def hermes_default_toolset(self) -> list[str]:
+        """Parse HERMES_DEFAULT_TOOLSET (comma-separated) into a clean toolset list (ADR-046 §6).
+
+        Whitespace is stripped and empty entries dropped, preserving order and de-duplicating.
+        A blank/unset value falls back to the safe default ``[web, file, vision, skills, todo]``
+        (no terminal/browser/code_execution/computer_use, 05-security.md). Pure (no I/O); cached
+        via get_settings()'s lru_cache.
+        """
+        seen: dict[str, None] = {}
+        for raw in self.hermes_default_toolset_raw.split(","):
+            entry = raw.strip()
+            if entry:
+                seen.setdefault(entry, None)
+        if not seen:
+            return ["web", "file", "vision", "skills", "todo"]
+        return list(seen.keys())
 
     def default_model(self) -> str:
         """Active instance default model (ADR-034 §1): the model used when none is selected.
@@ -483,6 +648,89 @@ PREVIEW_CONTENT_TYPE_ALLOWLIST: frozenset[str] = frozenset(
         "text/plain",
     }
 )
+
+
+# --- Hermes instance LLM provider contract (ADR-055) ----------------------------------------------
+# Closed-set allowlist of valid HERMES_LLM_PROVIDER values — source: the Hermes image
+# cli-config.yaml.example. `auto` is in the image set but is FORBIDDEN for provisioning by the
+# control plane (it defaults to the openrouter base_url → 401); fail-fast validation rejects it
+# separately. `openai` is intentionally absent (no direct provider — OpenAI via openrouter/custom).
+HERMES_PROVIDER_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "auto",
+        "openrouter",
+        "nous",
+        "nous-api",
+        "anthropic",
+        "openai-codex",
+        "copilot",
+        "gemini",
+        "zai",
+        "kimi-coding",
+        "minimax",
+        "minimax-cn",
+        "huggingface",
+        "nvidia",
+        "xiaomi",
+        "arcee",
+        "ollama-cloud",
+        "kilocode",
+        "azure-foundry",
+        "lmstudio",
+        "custom",
+    }
+)
+
+# Provider that is in the image allowlist but is FORBIDDEN for control-plane provisioning (ADR-055
+# §2): `auto` revives the openrouter-default bug. A concrete provider is required.
+HERMES_PROVIDER_FORBIDDEN: frozenset[str] = frozenset({"auto"})
+
+# Explicit map provider → the container env-var name carrying HERMES_LLM_API_KEY (ADR-055 §4). NOT
+# derived as f"{provider.upper()}_API_KEY" — most names differ (gemini→GOOGLE_API_KEY,
+# huggingface→HF_TOKEN, zai→GLM_API_KEY, …). Source: the image cli-config.yaml.example/.env.example.
+# A provider absent here falls back to the conservative "<PROVIDER_UPPER>_API_KEY" (see
+# hermes_provider_key_env) — only providers with a known non-derivable name are listed.
+HERMES_PROVIDER_KEY_ENV: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "gemini": "GOOGLE_API_KEY",
+    "nous-api": "NOUS_API_KEY",
+    "nous": "NOUS_API_KEY",
+    "zai": "GLM_API_KEY",
+    "kimi-coding": "KIMI_API_KEY",
+    "huggingface": "HF_TOKEN",
+    "nvidia": "NVIDIA_API_KEY",
+    "lmstudio": "LM_API_KEY",
+    # NOTE: `custom` is intentionally NOT here — it has no env-key (env_vars=() in the image); its
+    # key is passed via config.yaml model.api_key (ADR-055 §6, HERMES_PROVIDERS_CONFIG_API_KEY).
+}
+
+# ADR-055 §6 (closes Q-055-1): providers that take the LLM key via config.yaml ``model.api_key``
+# (an env-ref), NOT via a ``<PROVIDER>_API_KEY`` env var. Confirmed from the image: `custom`
+# declares env_vars=() and resolves credentials from config.yaml model.api_key only (a passed
+# CUSTOM_API_KEY is ignored → upstream 401). `lmstudio` is NOT here — it reads LM_API_KEY. Keep sync
+# with the image (Q-055-2). The key value itself is supplied to the container via the env-var named
+# below and referenced from config.yaml as "${HERMES_INSTANCE_LLM_KEY}" (never inlined in the file).
+HERMES_PROVIDERS_CONFIG_API_KEY: frozenset[str] = frozenset({"custom"})
+
+# Fixed env-var name carrying the LLM key for config-api-key providers (ADR-055 §6). Neutral name
+# (does not collide with any real provider key-env); config.yaml references it as an ${...} env-ref.
+HERMES_INSTANCE_LLM_KEY_ENV = "HERMES_INSTANCE_LLM_KEY"
+
+# Providers that REQUIRE a model.base_url (ADR-055 §2/§4): provisioning fails fast when
+# HERMES_LLM_BASE_URL is empty for one of these. `lmstudio` accepts an optional base_url (the image
+# has a default 127.0.0.1:1234/v1) and is therefore NOT required here.
+HERMES_PROVIDERS_REQUIRING_BASE_URL: frozenset[str] = frozenset({"custom", "azure-foundry"})
+
+
+def hermes_provider_key_env(provider: str) -> str:
+    """Container env-var name for the instance LLM key, by provider (ADR-055 §4).
+
+    Uses the explicit HERMES_PROVIDER_KEY_ENV map (the image's key-env names are not derivable from
+    the provider id). For a provider not in the map, falls back to the conservative
+    ``<PROVIDER_UPPER>_API_KEY`` (non-secret derivation; the value is still the same secret key).
+    """
+    return HERMES_PROVIDER_KEY_ENV.get(provider, f"{provider.upper()}_API_KEY")
 
 
 @lru_cache

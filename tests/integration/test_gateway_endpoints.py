@@ -10,6 +10,7 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.conftest import FakeAnthropicClient, auth_headers, seed_user
@@ -41,6 +42,41 @@ async def test_wallet_consume_endpoint(
     )
     assert r.status_code == 200
     assert r.json()["newBalance"] == 2
+
+
+@pytest.mark.asyncio
+async def test_wallet_consume_insufficient_returns_409_and_rolls_back(
+    client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    """Chat path regression (ADR-047 §6): consume over balance → 409 insufficient_credits and the
+    HTTP request transaction rolls back wholesale — no debit row committed, balance untouched.
+
+    Exercised end-to-end through the real ``client`` fixture, whose dependency-override session
+    COMMITs on success / ROLLBACKs on exception (mirrors the chat HTTP request scope). The
+    savepoint fix means no orphan debit row even though consume INSERTed before the conditional
+    UPDATE matched 0 rows.
+    """
+    async with db_sessionmaker() as s:
+        uid = await seed_user(s, subscription="active", balance=2)
+    r = await client.post(
+        "/v1/wallet/consume",
+        json={"userId": str(uid), "requestId": str(uuid.uuid4()), "amount": 5, "meta": {}},
+        headers=auth_headers(uid),
+    )
+    assert r.status_code == 409, r.text
+    assert r.json()["error"]["code"] == "insufficient_credits"
+
+    # Fresh session: the HTTP tx rolled back → balance untouched, no debit row (no orphan).
+    async with db_sessionmaker() as check:
+        bal = await check.scalar(
+            text("SELECT balance FROM wallets WHERE user_id = :u"), {"u": str(uid)}
+        )
+        assert int(bal) == 2
+        n = await check.scalar(
+            text("SELECT count(*) FROM ledger_transactions WHERE user_id=:u AND type='debit'"),
+            {"u": str(uid)},
+        )
+        assert int(n) == 0
 
 
 @pytest.mark.asyncio

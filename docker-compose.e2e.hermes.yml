@@ -1,0 +1,79 @@
+# =============================================================================
+# E2E Hermes-runtime override — REAL per-user Hermes instances for /v1/agent/* e2e.
+# Compose with:  docker-compose.yml + docker-compose.e2e.yml + THIS file
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml -f docker-compose.e2e.hermes.yml up -d
+#
+# WHY (the gap this closes): the base docker-compose.yml (local/single-host) does NOT give `api`
+# access to the Docker daemon, and does NOT attach it to the Hermes control-plane network. So the
+# agent path /v1/agent/* cannot provision/reach a real Hermes instance in local/e2e — only the
+# prod stack (docker-compose.prod.yml) wires those. docker-compose.e2e.yml only removes host-port
+# publishing for postgres/redis; it does not add Hermes wiring. This override adds EXACTLY the two
+# things the control plane needs to provision and reach a REAL Hermes instance, mirroring prod:
+#   1. /var/run/docker.sock mounted :ro into api ONLY (ADR-046, 05-security.md §Multi-tenant) —
+#      the control plane (src/app/hermes_runtime/docker_backend.py -> docker.from_env()) drives
+#      `docker run/start/stop/inspect` of per-user Hermes containers through it.
+#   2. api attached to the dedicated `hermes-net` network so it can reach the Hermes containers it
+#      provisions BY DNS NAME (hermes-user-<id>:8642). The control plane attaches each provisioned
+#      Hermes container to the SAME network (docker-py network= from HERMES_DOCKER_NETWORK), so the
+#      network MUST pre-exist and be shared between compose and docker-py — hence `external: true`
+#      (NOT auto-prefixed with the project name, which docker-py's plain `hermes-net` could not see).
+#
+# CHOSEN MODEL = docs path (a): the control plane PROVISIONS the real Hermes instance itself via
+# docker.sock on the first /v1/agent/* request (ADR-046 §provision). We do NOT declare a static
+# `hermes` service here — that would collide with the control plane's own container naming
+# (hermes-user-<id>) and lifecycle (provision/hibernate/reap). e2e just gives api sock+network;
+# the REAL instance is created on demand from the PUBLIC registry image (HERMES_IMAGE).
+#
+# ⚠️ SECURITY: docker.sock is HIGH PRIVILEGE (~root on host) even when :ro. Mounted into `api`
+# ONLY — never into postgres/redis or the Hermes instances. This override is for LOCAL/E2E on a
+# trusted machine; it mirrors the prod mitigations (sock only in api, non-root uid 10001, instance
+# toolset excludes terminal/code_execution). Do NOT use this override as a prod artifact.
+#
+# PRECONDITIONS (must be done ON THE DOCKER DAEMON HOST before bring-up — see docs/09-e2e-testing.md):
+#   1. Create the shared Hermes network once:   docker network create hermes-net
+#      (or set HERMES_DOCKER_NETWORK to a pre-created network and update `name:` below via .env).
+#   2. Pull the PUBLIC Hermes image so provisioning can start it (no `:latest`):
+#        docker pull nousresearch/hermes-agent:<pinned-tag>
+#      and set HERMES_IMAGE to that exact ref in .env (empty => provisioning fails fast).
+#   3. Set HERMES_LLM_API_KEY (+ HERMES_LLM_PROVIDER/HERMES_MODEL) in .env — the instance's own LLM
+#      key (SECRET; empty => provisioning fails fast).
+#   4. HERMES_VOLUME_ROOT must be a path that EXISTS and is WRITABLE on the DAEMON host (the per-user
+#      <root>/<user_id> dir is bind-mounted into each instance at /opt/data). On Docker Desktop the
+#      daemon host is the Linux VM, not the Windows filesystem — use a Linux-style path the VM can
+#      write (default /opt/data/hermes). The control plane os.makedirs() it at provision time.
+#   5. SOCKET GID — the api runs as NON-ROOT uid 10001 (Dockerfile), but /var/run/docker.sock is
+#      owned by root:<docker-group>. uid 10001 therefore needs membership in the socket's GID or it
+#      gets PermissionError(13) talking to the daemon. Set DOCKER_SOCK_GID in .env to the socket's
+#      group id on the DAEMON host, discovered with:
+#        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine stat -c '%g' /var/run/docker.sock
+#      (Docker Desktop/WSL2: often 0; a standard Linux server: the `docker` group gid, e.g. 999/998.)
+#      `group_add` below adds that supplementary group to uid 10001 (DEFAULT 0 — adjust per host).
+#      This is the e2e equivalent of the prod operational note (07-deployment.md §Hermes runtime:
+#      "Доступ к группе docker для uid 10001 ... — операционная настройка хоста").
+#
+# Base/e2e semantics are UNCHANGED for everyone not using this override.
+
+services:
+  api:
+    # Inherit everything from base (build, env_file, healthcheck, depends_on, 127.0.0.1:8000 port).
+    # ADD docker.sock (:ro) so the control plane can provision/manage real Hermes instances.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # uid 10001 (non-root) needs the socket's group to read it (see PRECONDITION 5). DOCKER_SOCK_GID
+    # = the gid of /var/run/docker.sock on the daemon host (default 0 — set per host in .env).
+    group_add:
+      - "${DOCKER_SOCK_GID:-0}"
+    # ADD the dedicated control-plane <-> Hermes-instance network (in ADDITION to the base
+    # compose default network used to reach postgres/redis by service name). Compose merges this
+    # list with the base; api stays reachable to postgres/redis AND gains hermes-net.
+    networks:
+      - default
+      - hermes-net
+
+networks:
+  # Dedicated control-plane <-> Hermes-instance network. external:true — created once on the daemon
+  # host (`docker network create hermes-net`) and shared with the containers docker-py provisions
+  # (which attach by the literal HERMES_DOCKER_NETWORK name, default `hermes-net`). Matches prod.
+  hermes-net:
+    external: true
+    name: ${HERMES_DOCKER_NETWORK:-hermes-net}

@@ -58,7 +58,8 @@ async def get_wallet(
     wallet: Annotated[WalletService, Depends(get_wallet_service)],
 ) -> WalletResponse:
     last_n = get_settings().wallet_last_transactions
-    balance, txs = await wallet.get_wallet_view(current.user_id, last_n)
+    # debt (ADR-051) is not part of the user-facing /v1/wallet contract — only the admin view.
+    balance, _debt, txs = await wallet.get_wallet_view(current.user_id, last_n)
     return WalletResponse(
         balance=balance,
         lastTransactions=[

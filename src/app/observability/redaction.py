@@ -14,6 +14,32 @@ REDACTED = "***REDACTED***"
 # Substrings (lowercased) that mark a value as sensitive.
 _DENY_SUBSTRINGS = ("key", "token", "secret", "password", "authorization", "credential")
 
+# Closed-set allowlist of usage token-COUNT keys (lowercased), ADR-049. These are integer billing
+# analytics of real model consumption — NOT secrets — and MUST survive redaction so usage is
+# preserved in audit (billing_debit_insufficient/billing_debit/agent_run) and
+# ledger_transactions.meta.usage for reconciliation (ADR-047 §6, TD-029 / Q-047-2). Both casings:
+# snake_case (agent path, Hermes wire) and camelCase (chat path; key is lowercased before lookup).
+# Exact-match only — the "token" denylist substring still redacts ALL real token secrets.
+_USAGE_COUNT_ALLOWLIST = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "inputtokens",
+    "outputtokens",
+    "totaltokens",
+)
+
+# Closed-set allowlist of the idempotency dedup-key name (lowercased), ADR-050. The
+# idempotencyKey/idempotency_key is a client/operator dedup identifier (ADR-005), NOT a secret:
+# knowing it grants no access. The admin audit contract (admin/02-api-contracts.md,
+# admin/06-rbac.md, ADR-048 §2) REQUIRES audit events admin_grant/admin_subscription_grant to CARRY
+# this value for operation traceability, but the "key" denylist substring would otherwise redact
+# it. Carve-out by exact match (both casings: camelCase wire/audit + snake_case meta) — checked
+# FIRST so the substring rule still redacts every real key-secret (api_key/API_SERVER_KEY/
+# CLIENT_API_KEY/encrypted_key/encrypted_dek). Closed set of one name: by construction no real
+# secret is named idempotency_key.
+_IDEMPOTENCY_KEY_ALLOWLIST = ("idempotencykey", "idempotency_key")
+
 # Explicit field names (lowercased) that carry raw secrets/payloads.
 # x-admin-token is also matched by the "token" substring below; listed here explicitly so
 # the admin secret is unambiguously redacted from logs/audit (ADR-009 §6).
@@ -25,6 +51,7 @@ _DENY_EXACT = (
     "dek",
     "nonce",
     "encrypted_key",
+    "encrypted_dek",
     "x-admin-token",
     "x_admin_token",
 )
@@ -32,6 +59,18 @@ _DENY_EXACT = (
 
 def _is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
+    # Usage token-counts (input_tokens/output_tokens/total_tokens, both casings) are billing
+    # analytics, not secrets — exact-match carve-out checked FIRST so the "token" denylist substring
+    # does not redact them (ADR-049; required by ADR-047 §6 / agent-proxy/05-events.md). Closed set:
+    # by construction no real secret is named as a usage count, so this opens no secret.
+    if lowered in _USAGE_COUNT_ALLOWLIST:
+        return False
+    # Idempotency dedup-key (idempotencyKey/idempotency_key, both casings) is a non-secret dedup
+    # identifier — exact-match carve-out checked FIRST so the "key" denylist substring does not
+    # redact it (ADR-050; required by the admin audit contract / ADR-048 §2). Closed set: by
+    # construction no real secret is named idempotency_key, so this opens no secret.
+    if lowered in _IDEMPOTENCY_KEY_ALLOWLIST:
+        return False
     # Status fields (e.g. keyStatus = valid|invalid|missing) are non-sensitive metadata and
     # must survive redaction (AC-7 audit byok_change); the raw BYOK key is never in such a field.
     if lowered.endswith("status"):

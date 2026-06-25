@@ -41,6 +41,11 @@ class BlockReason(str, enum.Enum):
     byok_invalid = "byok_invalid"
     rate_limited = "rate_limited"
     policy_denied = "policy_denied"
+    # ADR-051: agent path only — wallets.debt > 0 (unsettled agent-run delta). NOT returned by
+    # evaluate() (debt is not part of PolicyState / the chat policy); it is set by the agent
+    # policy-gate (AgentProxyService.run) BEFORE the run, gated by AGENT_DEBT_RECONCILE_ENABLED.
+    # Excluded from /policy/effective.reasons[] (agent-specific, not a chat-path reason).
+    debt_outstanding = "debt_outstanding"
     # ADR-025: response truncated by the output-token limit (stop_reason="max_tokens"). NOT a
     # policy reason and NOT a gateway concern — it is an orchestration outcome that fires AFTER
     # generation begins. `evaluate()` never returns it; it is set only by the orchestrator. Unlike

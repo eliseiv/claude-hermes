@@ -20,7 +20,11 @@ from app.observability.redaction import assert_no_secrets
 # eventType catalog (audit/02-api-contracts.md)
 EVENT_TOOL_MUTATION = "tool_mutation"
 EVENT_BILLING_DEBIT = "billing_debit"
+EVENT_BILLING_DEBIT_INSUFFICIENT = "billing_debit_insufficient"
 EVENT_BILLING_CREDIT = "billing_credit"
+# ADR-051 §3: debt clawback on a credit grant (repaid part of wallets.debt before increasing
+# balance). Written by WalletService.grant only when repaid > 0.
+EVENT_BILLING_DEBT_REPAID = "billing_debt_repaid"
 EVENT_POLICY_DECISION = "policy_decision"
 EVENT_BYOK_CHANGE = "byok_change"
 EVENT_SUBSCRIPTION_CHANGE = "subscription_change"
@@ -29,6 +33,7 @@ EVENT_CHAT_STEP = "chat_step"
 EVENT_TOOL_CALL_INITIATED = "tool_call_initiated"
 EVENT_TOOL_CALL_COMPLETED = "tool_call_completed"
 EVENT_ADMIN_GRANT = "admin_grant"
+EVENT_ADMIN_SUBSCRIPTION_GRANT = "admin_subscription_grant"
 
 
 @dataclass(frozen=True)

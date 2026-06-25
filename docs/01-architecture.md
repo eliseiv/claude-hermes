@@ -5,6 +5,8 @@
 
 > **Позиционирование ([ADR-022](adr/ADR-022-optional-project-and-tool-gating.md)).** Основная задача сервиса — **агрегатор Claude для iOS («чистый чат»)**: работает без проекта (`projectId` опционален) и без website-инструментов. Генерация сайтов (Website Builder, server-side `site.*`) — **опциональная, второстепенная** фича, активируемая наличием `projectId` у сессии.
 
+> **Hermes-as-agent ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md), [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)).** Поверх сервиса добавлен **control plane для автономного агента Hermes**: каждый подписчик получает персональный Hermes-инстанс (Docker-контейнер + том `HERMES_HOME`), а чат проксируется к нему через новый контур `/v1/agent/*` (`POST /v1/runs` + SSE). Hermes — **полноценный агент** (свой tool-loop/память/навыки), НЕ замена `LLMClient`. `claude-hermes` отвечает за auth ([ADR-044](adr/ADR-044-client-api-key-auth.md)) + policy + billing по usage ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)) + жизненный цикл инстансов ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md)). Существующий `/v1/chat/*` остаётся «простым чатом». Поток — [§Поток /v1/agent/run (Hermes-as-agent)](#поток-v1agentrun-hermes-as-agent).
+
 > **Провайдер-абстракция LLM ([ADR-033](adr/ADR-033-llm-provider-abstraction.md)).** Узел «Anthropic API» на диаграмме — частный случай абстрактного **LLM-провайдера**. Chat Orchestrator вызывает нейтральный `LLMClient` (реализации: `AnthropicClient` / `OpenAIClient`), выбираемый env **`LLM_PROVIDER`, дефолт `anthropic`**. Сервис разворачивается мульти-инстансно на разных провайдерах **одним кодом** (не форк): anthropic-инстансы (`broadnova.shop`/`avelyraweb.shop`) + OpenAI-инстанс (3-й, Chat Completions API). **Один провайдер на инстанс** — БД хранит wire-формат своего провайдера. Провайдер-специфичная (де)сериализация — внутри клиента; orchestrator/персист провайдер-агностичны. Детали — [chat-orchestrator/03-architecture.md §Провайдер-абстракция LLM](modules/chat-orchestrator/03-architecture.md#провайдер-абстракция-llm-anthropic--openai-adr-033).
 
 ```mermaid
@@ -63,8 +65,8 @@ flowchart TB
     end
 ```
 
-## Модули (18 + наблюдаемость)
-> 9 базовых/реализованных (1–9) + 8 расширения Figma-gap (10–17, спроектированы — backend по спринтам, см. [figma-gap-analysis.md](figma-gap-analysis.md)) + Auth (18, встроенный issuer — спроектирован, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)).
+## Модули (20 + наблюдаемость)
+> 9 базовых/реализованных (1–9) + 8 расширения Figma-gap (10–17, спроектированы — backend по спринтам, см. [figma-gap-analysis.md](figma-gap-analysis.md)) + Auth (18, встроенный issuer — спроектирован, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)) + Hermes-интеграция (19 Hermes Runtime, 20 Agent Proxy — спроектированы, [ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)/[ADR-046](adr/ADR-046-per-user-hermes-runtime.md)).
 
 | # | Модуль | Ответственность | Документация |
 |---|---|---|---|
@@ -85,6 +87,8 @@ flowchart TB
 | 15 | **Attachments** | Мультимодальные вложения. **MVP — inline base64 в `/chat/run`** ([ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md), реализует chat-orchestrator); двухшаговая модель upload→ссылка ([ADR-014](adr/ADR-014-multimodal-attachments.md)) **отложена** ([TD-015](100-known-tech-debt.md)). | [modules/attachments](modules/attachments/README.md) |
 | 16 | **Token Purchase** | Consumable StoreKit IAP → идемпотентный grant кредитов ([ADR-015](adr/ADR-015-consumable-token-iap.md)), отдельно от подписки. | [modules/token-purchase](modules/token-purchase/README.md) |
 | 17 | **Notifications** | Toggle (в preferences) + регистрация APNs device-токена. Отправка push → [TD-011](100-known-tech-debt.md). | [modules/notifications](modules/notifications/README.md) |
+| 19 | **Hermes Runtime** ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md)) | Жизненный цикл per-user Hermes-инстансов: `HermesInstanceManager` (provision/ensure_running/stop_idle/deprovision/health), `docker_backend` (расширяемый `RuntimeBackend`), `registry` (таблица `hermes_instances`), гибернация + фоновый reaper в `lifespan`. Шифрование `API_SERVER_KEY` через `byok.kms`. | [modules/hermes-runtime](modules/hermes-runtime/README.md) |
+| 20 | **Agent Proxy** ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)) | Контур `/v1/agent/*`: прокси к Hermes `POST /v1/runs`, SSE-ретрансляция событий на iOS, policy-gate до прогона, биллинг по usage на `run.completed` ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)). `httpx.AsyncClient`. | [modules/agent-proxy](modules/agent-proxy/README.md) |
 | 18 | **Auth** | **Встроенный issuer** ([ADR-018](adr/ADR-018-embedded-auth-issuer.md), закрывает [Q-005-1](99-open-questions.md)): выпуск RS256 JWT (`/v1/auth/register|token|refresh`, `jwks`), device-based identity, refresh-rotation. **Sign in with Apple** ([ADR-043](adr/ADR-043-sign-in-with-apple.md), закрывает [Q-018-2](99-open-questions.md)): `/v1/auth/apple` — верификация Apple identity token → НАША пара, кросс-девайс аккаунт (`auth_identities`). Верификация НАШИХ токенов — существующим `JwtVerifier` (API Gateway). | [modules/auth](modules/auth/README.md) |
 | — | **Observability** | Cross-cutting: метрики, структурированные логи с correlation id, трейсы, алерты. | этот документ + [05-security.md](05-security.md) |
 
@@ -152,6 +156,57 @@ sequenceDiagram
     A-->>O: assistant_message | tool_use
     Note over O,A: финальный assistant_message → consume(requestId=messageStepId) ровно один раз
     O-->>C: 200 {status, ...}
+```
+
+## Поток /v1/agent/run (Hermes-as-agent)
+
+Контур автономного агента ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md), [ADR-046](adr/ADR-046-per-user-hermes-runtime.md), [ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)). Auth — клиентский `X-API-Key` + `X-User-Id` ([ADR-044](adr/ADR-044-client-api-key-auth.md)). Hermes-инстанс — персональный контейнер в docker-сети control plane (порт не публикуется на хост).
+
+```mermaid
+flowchart TB
+    iOS2[iOS App] -->|X-API-Key + X-User-Id| AGW[API Gateway<br/>verify_client_api_key + lazy provisioning]
+    AGW --> AP[Agent Proxy<br/>/v1/agent/*]
+    AP --> POL2[Policy Engine<br/>BR-2/3/5: подписка+кредиты]
+    AP --> HM[Hermes Runtime<br/>HermesInstanceManager]
+    HM --> REG[(hermes_instances<br/>registry)]
+    HM -->|docker run/start, config.yaml toolset| DOCK[Docker / RuntimeBackend]
+    HM -->|decrypt API_SERVER_KEY| KMS2[(byok.kms / KMS)]
+    AP -->|Authorization: Bearer API_SERVER_KEY<br/>POST /v1/runs, SSE /events| INST[Hermes instance<br/>hermes-user-id:8642<br/>том HERMES_HOME]
+    AP -->|run.completed.usage → consume idempotency=runId| WAL2[Wallet / Ledger]
+    INST -.->|свой LLM_PROVIDER/ключ| LLM2[(LLM провайдер<br/>внутри инстанса)]
+```
+
+```mermaid
+sequenceDiagram
+    participant C as iOS
+    participant GW as API Gateway
+    participant AP as Agent Proxy
+    participant P as Policy Engine
+    participant HM as Hermes Runtime
+    participant I as Hermes instance
+    participant W as Wallet
+
+    C->>GW: POST /v1/agent/run (X-API-Key, X-User-Id, message)
+    GW->>GW: verify_client_api_key + lazy provisioning users (ADR-044/ADR-007)
+    GW->>AP: run(userId, message, sessionId?)
+    AP->>P: evaluate(userId)  // BR-2/3/5
+    alt blocked
+        P-->>AP: blocked(blockReason)
+        AP-->>C: 200 {status: blocked, blockReason}  // ADR-004
+    else allowed
+        AP->>HM: ensure_running(userId)
+        HM-->>AP: InstanceEndpoint(base_url, api_key)  // провижинит/будит контейнер, update last_active_at
+        AP->>I: POST /v1/runs (Bearer API_SERVER_KEY) {input, session_id?, model?}
+        I-->>AP: 202 {run_id, status}
+        AP-->>C: 202 {runId, status}
+        C->>AP: GET /v1/agent/runs/{runId}/events (SSE)
+        AP->>I: GET /v1/runs/{run_id}/events (SSE)
+        I-->>AP: run.running / message.delta / tool.* / approval.request ...
+        AP-->>C: ретрансляция событий
+        I-->>AP: run.completed {usage}
+        AP->>W: consume(userId, amount(usage), idempotency_key=runId)  // ADR-047
+        AP-->>C: run.completed
+    end
 ```
 
 ## Tool-calling протокол: client-side vs server-side ([ADR-011](adr/ADR-011-server-side-tools.md), [ADR-026](adr/ADR-026-global-server-side-tools-and-time-now.md))

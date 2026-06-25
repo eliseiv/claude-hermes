@@ -141,26 +141,28 @@ async def test_register_without_device_id_generates_uuid4(auth_client: AsyncClie
     assert parsed.version == 4
 
 
-# ----------------------------- round-trip: issued token passes /v1/* -----------------------------
+# ----------------------------- round-trip: issuer self-consistency (DORMANT, ADR-044) ----------
 @pytest.mark.asyncio
-async def test_issued_access_token_verifies_and_passes_v1(auth_client: AsyncClient) -> None:
+async def test_issued_access_token_verifies_but_is_dormant_on_v1(auth_client: AsyncClient) -> None:
+    # ADR-018 issuer + JwtVerifier remain a self-consistent loop (the JWT contour is DORMANT, NOT
+    # deleted — ADR-044 §4). But under ADR-044 the issued JWT NO LONGER authorizes /v1/*: the hot
+    # client path is X-API-Key + X-User-Id. A Bearer-only request must be rejected (no X-API-Key).
     reg = await auth_client.post("/v1/auth/register", json={"deviceId": "dev-rt"})
     assert reg.status_code == 200
     body = reg.json()
     token = body["accessToken"]
     user_id = body["userId"]
 
-    # The same JwtVerifier (self-consistent loop) accepts the issued token: sub==userId, device_id.
+    # The same JwtVerifier still accepts the issued token: sub==userId, device_id (dormant module).
     from app.api_gateway.auth import get_jwt_verifier
 
     verified = get_jwt_verifier().verify(token)
     assert str(verified.user_id) == user_id
     assert verified.device_id == "dev-rt"
 
-    # And it is NOT rejected as unauthorized on a protected /v1/* endpoint (reaches business logic).
+    # ADR-044: a JWT alone (no X-API-Key) does NOT pass the client contour → 401.
     r = await auth_client.get("/v1/tools", headers={"Authorization": f"Bearer {token}"})
-    assert r.status_code == 200, r.text
-    assert "tools" in r.json()
+    assert r.status_code == 401, r.text
 
 
 # ----------------------------- idempotency: same deviceId -> same userId, one row --------------
@@ -269,24 +271,24 @@ async def test_jwks_returns_only_public_key(auth_client: AsyncClient) -> None:
         assert forbidden not in key
 
 
-# ----------------------------- ADR-007 lazy fallback -----------------------------
+# ----------------------------- ADR-007 lazy provisioning (channel = X-User-Id, ADR-044) ---------
 @pytest.mark.asyncio
-async def test_token_sub_without_users_row_is_lazily_provisioned(
+async def test_unknown_subject_is_lazily_provisioned_via_user_id(
     auth_client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    # ADR-018 §4 / ADR-007: a verifiable token whose sub has no users row is provisioned lazily on
-    # the first /v1/*. We forge a token for an unknown subject signed by the configured issuer.
-    from app.deps import get_token_issuer
+    # ADR-007 lazy provisioning is preserved, but ADR-044 §2 swaps the identity CHANNEL from the
+    # JWT sub to the trusted X-User-Id. A first /v1/* for an unknown subject still creates its
+    # users row exactly once. (A Bearer JWT is no longer the auth factor; see the round-trip test.)
+    from tests.conftest import auth_headers
 
     unknown = uuid.uuid4()
-    token = get_token_issuer().issue_access_token(user_id=unknown, device_id="dev-lazy")
     async with db_sessionmaker() as s:
         before = await s.execute(
             text("SELECT COUNT(*) FROM users WHERE id = :id"), {"id": str(unknown)}
         )
         assert before.scalar_one() == 0
 
-    r = await auth_client.get("/v1/tools", headers={"Authorization": f"Bearer {token}"})
+    r = await auth_client.get("/v1/tools", headers=auth_headers(unknown))
     assert r.status_code == 200, r.text
 
     async with db_sessionmaker() as s:

@@ -352,13 +352,13 @@ class _TurnOutcome:
 
 @dataclass(frozen=True)
 class _BillingPlan:
-    """How the final assistant_message must be billed (ADR-002 + ADR-005).
+    """How the final assistant_message must be billed (ADR-002 + ADR-005 + ADR-054).
 
-    Exactly one of the two flags is true when billing applies:
     - debit_credits: active subscription + mode=credits → consume 1 credit (idempotent).
-    - mark_trial:    subscription=none + trial_used=false + mode=credits → free trial, flip
-      users.trial_used (idempotent). No debit.
-    BYOK and trial generations are free → both flags false.
+    - mark_trial:    subscription=none + trial_used=false + mode=credits → trial-allow branch.
+      ADR-054: this flag now signals the FREE trial turn and triggers the claim-before-generation
+      (run §1) — it NO LONGER flips users.trial_used at finalize (claim already did it before the
+      LLM call). No debit either way. BYOK and already-trial-used generations → both flags false.
     """
 
     debit_credits: bool
@@ -605,15 +605,34 @@ class ChatOrchestrator:
         if not decision_allow(decision):
             return self._blocked(sess.id, decision.block_reason)
 
+        billing = _billing_plan(effective_mode, state)
+
+        # TD-006 / ADR-054 §1: claim-before-generation. On the trial-allow branch
+        # (billing.mark_trial ⟺ mode=credits, subscription=none, trial_used=false) atomically claim
+        # the lifetime trial in its OWN short transaction BEFORE generating. The conditional UPDATE
+        # is the single arbiter of the trial race (no advisory lock; compatible with MAJOR-4
+        # commit-before-LLM). affected=0 → a parallel first request (or a past turn) already took
+        # the trial → block WITHOUT generating (state is subscription=none + trial_used=true).
+        # affected=1 → this request won → claimed_trial=True; reconcile rolls it back on failure.
+        claimed_trial = False
+        if billing.mark_trial:
+            if not await self._deps.repo.claim_trial(user_id):
+                return self._blocked(sess.id, BlockReason.trial_used)
+            claimed_trial = True
+
         # mode=byok: resolve plaintext key in-memory (CO-6).
         api_key = await self._resolve_api_key(user_id, effective_mode)
 
-        return await self._generate_loop(
+        # ADR-054 §2/§8a: reconcile-rollback wraps the generate-loop. A claimed trial burns ONLY on
+        # a successful final assistant_message; any non-success (blocked/max_tokens, UpstreamError
+        # /502, exception) rolls the claim back so the user keeps the trial (symmetry with ADR-025).
+        return await self._generate_with_trial_reconcile(
+            claimed_trial=claimed_trial,
             user_id=user_id,
             session_id=sess.id,
             message_step_id=message_step_id,
             mode=effective_mode,
-            billing=_billing_plan(effective_mode, state),
+            billing=billing,
             api_key=api_key,
             system_prompt=system_prompt,
             # ADR-022 axis A: offer site.* only when the session has a project.
@@ -717,7 +736,25 @@ class ChatOrchestrator:
         mode = Mode(sess.mode)
         # Re-evaluate policy (access may have changed).
         decision, state = await self._evaluate(user_id, mode, session_id)
-        if not decision_allow(decision):
+
+        # ADR-054 §2a: continuation of an in-progress trial turn that already claimed its trial on
+        # /chat/run (trial_used=true now). Without this, the re-evaluated policy would block the
+        # turn's OWN claim with blockReason=trial_used, tearing the tool-loop mid-turn. The signal
+        # is deterministic from existing state (no migration): credits + subscription=none +
+        # trial_used + an assistant step exists for this message_step_id (by construction this path
+        # is only reached for a turn that returned tool_call). It un-blocks ONLY the false
+        # trial_used of this turn; every other block_reason still blocks.
+        is_inflight_trial_turn = (
+            mode is Mode.credits
+            and state.subscription_status is SubscriptionStatus.none
+            and state.trial_used
+            and (await self._deps.repo.assistant_tool_step_id(session_id, message_step_id))
+            is not None
+        )
+        # Block on any policy denial EXCEPT the false trial_used of this turn's own in-flight claim.
+        if not decision_allow(decision) and not (
+            decision.block_reason is BlockReason.trial_used and is_inflight_trial_turn
+        ):
             return self._blocked(session_id, decision.block_reason)
 
         api_key = await self._resolve_api_key(user_id, mode)
@@ -733,7 +770,12 @@ class ChatOrchestrator:
                 sess.workspace_project_id, user_id
             )
             system_prompt = _system_prompt_with_workspace(sess.assistant_mode, instructions)
-        return await self._generate_loop(
+        # ADR-054 §2a: reconcile the continuation's trial the same way as /chat/run (§8a). The
+        # request-scoped claimed_trial flag does not cross requests, so is_inflight_trial_turn is
+        # the claimed-trial signal here: a non-success continuation of this trial turn rolls the
+        # claim back (the user keeps the trial); a successful assistant_message keeps it.
+        return await self._generate_with_trial_reconcile(
+            claimed_trial=is_inflight_trial_turn,
             user_id=user_id,
             session_id=session_id,
             message_step_id=message_step_id,
@@ -912,6 +954,47 @@ class ChatOrchestrator:
                     )
                 )
         return messages
+
+    async def _generate_with_trial_reconcile(
+        self,
+        *,
+        claimed_trial: bool,
+        user_id: uuid.UUID,
+        **loop_kwargs: Any,
+    ) -> ChatRunOut:
+        """Run the generate-loop and reconcile a claimed trial on a non-success (ADR-054 §2/§8a).
+
+        Wraps :meth:`_generate_loop` with the trial reconcile-rollback. The trial burns ONLY on a
+        successful final ``status=assistant_message``; for any other outcome the just-claimed trial
+        is restored in its own short transaction so the user keeps it (symmetry with ADR-025
+        max_tokens). Outcomes:
+        - returned ``assistant_message`` → success → keep the claim (no reconcile);
+        - returned ``tool_call`` → turn still in progress (not a failure) → keep the claim; the
+          /chat/tool-result continuation finalizes or reconciles it (§2a);
+        - returned ``blocked`` (incl. ``max_tokens``) → failure → reconcile;
+        - raised (UpstreamError/502, any exception, cancellation) → failure → reconcile, re-raise.
+        ``reconcile_trial`` is a no-op when not claimed_trial / trial already FALSE (idempotent).
+        """
+        if not claimed_trial:
+            return await self._generate_loop(user_id=user_id, **loop_kwargs)
+        try:
+            out = await self._generate_loop(user_id=user_id, **loop_kwargs)
+        except BaseException:
+            # Failure (UpstreamError/502, exception, cancellation) → restore the trial, then
+            # re-raise so the gateway error-contract (502 etc.) is unchanged. Own short transaction.
+            # Roll back FIRST: an exception raised between a flush and the next commit inside the
+            # generate-loop (e.g. _handle_tool_use / audit) leaves a pending/failed transaction.
+            # Without this rollback, reconcile_trial.commit() would either flush those partial
+            # tool-loop writes or raise PendingRollbackError masking the original exception.
+            # Rollback discards that aborted unit so reconcile commits ONLY the trial restore. The
+            # dominant path (UpstreamError right after commit-before-LLM) has nothing pending.
+            await self._session.rollback()
+            await self._deps.repo.reconcile_trial(user_id)
+            raise
+        if out.status not in ("assistant_message", "tool_call"):
+            # blocked / max_tokens → not a successful generation → restore the trial (§8a).
+            await self._deps.repo.reconcile_trial(user_id)
+        return out
 
     async def _generate_loop(
         self,
@@ -1106,8 +1189,11 @@ class ChatOrchestrator:
 
         # CO-7 / ADR-002 / ADR-005: bill exactly once on the final assistant_message.
         # - active subscription + credits → consume 1 credit;
-        # - trial (subscription=none, trial_used=false) → free, flip users.trial_used;
-        # - byok / already-trial-used → free, no write.
+        # - byok / trial → free, no debit here.
+        # ADR-054 §3: the trial is NO LONGER flipped here. It is claimed BEFORE generation
+        # (run §1 / claim_trial) and, on a successful assistant_message, simply STAYS TRUE (no
+        # reconcile). billing.mark_trial is still computed (free-turn marker, no debit) but carries
+        # no write at finalize — the old flip-after-success is removed (claim-before replaces it).
         if billing.debit_credits:
             try:
                 await self._debit(
@@ -1121,9 +1207,6 @@ class ChatOrchestrator:
                 # Roll back the assistant-step+audit so the unbillable step is not persisted.
                 await self._session.rollback()
                 return self._blocked(session_id, BlockReason.credits_empty)
-        elif billing.mark_trial:
-            # CRITICAL-1: consume the single lifetime trial atomically (idempotent).
-            await self._deps.repo.mark_trial_used(user_id)
 
         if sess is not None:
             await self._deps.repo.touch_session(sess)

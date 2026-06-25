@@ -65,7 +65,6 @@ async def tp_client(
     """
     from app import deps
     from app.api_gateway import rate_limit
-    from app.api_gateway.routers import subscription as sub_router
     from app.api_gateway.routers import wallet as wallet_router
     from app.main import create_app
     from app.subscription import storekit as storekit_mod
@@ -97,7 +96,6 @@ async def tp_client(
     orig_other = rate_limit.enforce_other_limits
     rate_limit.enforce_other_limits = _allow  # type: ignore[assignment]
     wallet_router.enforce_other_limits = _allow  # type: ignore[assignment]
-    sub_router.enforce_other_limits = _allow  # type: ignore[assignment]
     # token_purchase router imported enforce_other_limits at module load — patch there too.
     from app.api_gateway.routers import token_purchase as tp_router
 
@@ -113,7 +111,6 @@ async def tp_client(
 
     rate_limit.enforce_other_limits = orig_other  # type: ignore[assignment]
     wallet_router.enforce_other_limits = orig_other  # type: ignore[assignment]
-    sub_router.enforce_other_limits = orig_other  # type: ignore[assignment]
     tp_router.enforce_other_limits = orig_tp  # type: ignore[assignment]
     storekit_mod._verifier_singleton = saved_singleton
     get_settings.cache_clear()
@@ -324,21 +321,32 @@ async def test_unknown_product_returns_422(
 
 
 @pytest.mark.asyncio
-async def test_user_id_mismatch_returns_403(
+async def test_body_user_id_mismatch_no_403_runs_on_subject(
     tp_client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
+    # ADR-044 §3: require_owner is a NO-OP — a body `userId` differing from `X-User-Id` must NOT
+    # 403 by-ownership. The operation runs on the X-User-Id subject.
+    #
+    # Masking-regression guard (CU rule): the X-User-Id subject (`subject`) is given an ACTIVE
+    # subscription, so the Q-015-1=B subscription guard PASSES and the purchase succeeds (200) —
+    # this proves the absence of 403 is genuinely "no ownership check", NOT a subscription_required
+    # 403 from an unsubscribed subject (the old test's accidental pass). `body_owner` (a different,
+    # subscribed user) is referenced only in the body; credits MUST land on `subject`, never on it.
     async with db_sessionmaker() as s:
-        owner = await seed_user(s)
-        other = await seed_user(s)
-    jws = make_storekit_jws(transaction_id="tx-403", product_id="tokens_1500")
-    # Authenticated as `other`, but body claims the purchase is for `owner` → 403.
+        subject = await seed_user(s, subscription="active")
+        body_owner = await seed_user(s, subscription="active")
+    jws = make_storekit_jws(transaction_id="tx-mismatch", product_id="tokens_1500")
     r = await tp_client.post(
         "/v1/tokens/purchase",
-        json={"userId": str(owner), "transaction": jws},
-        headers=auth_headers(other),
+        json={"userId": str(body_owner), "transaction": jws},  # body userId != X-User-Id
+        headers=auth_headers(subject),
     )
-    assert r.status_code == 403, r.text
-    assert await _balance(db_sessionmaker, owner) is None
+    assert r.status_code != 403, r.text  # no ownership 403 (the core ADR-044 invariant)
+    assert r.status_code == 200, r.text  # subject is subscribed → purchase proceeds
+    assert r.json()["creditsAdded"] == 1500
+    # The op ran on the X-User-Id subject: credits land on `subject`, NOT on the body's userId.
+    assert await _balance(db_sessionmaker, subject) == 1500
+    assert await _balance(db_sessionmaker, body_owner) is None
 
 
 @pytest.mark.asyncio
