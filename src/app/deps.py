@@ -46,6 +46,11 @@ from app.website.tools import SiteToolHandlers
 from app.workspaces.repository import WorkspacesRepository
 from app.workspaces.service import WorkspacesService
 
+# ADR-058: fixed namespace for deterministic X-User-Id string→UUID mapping.
+# MUST NOT change after launch — changing it shifts every derived users.id
+# (users lose their subscription/credits/agent). Never move to env/Settings.
+HERMES_USER_NAMESPACE = uuid.UUID("638724f1-2181-4d61-96de-5b8eedf7ef7a")
+
 
 async def get_db() -> AsyncIterator[AsyncSession]:
     async for session in session_scope():
@@ -93,27 +98,35 @@ async def get_current_user(
 
     Auth model (ADR-044): the trusted client key ``X-API-Key`` authenticates the request
     (``verify_client_api_key``, constant-time, 401 on miss); the subject identity is the
-    ``X-User-Id`` header (UUID), trusted because the client key is trusted. Both arrive via
+    ``X-User-Id`` header — a stable string identifier (ADR-058), trusted because the client key
+    is trusted. A canonical UUID string is used as-is (backward compatibility); any other
+    non-empty string is deterministically mapped to a stable UUID via
+    ``uuid.uuid5(HERMES_USER_NAMESPACE, raw)`` so the same string always resolves to the same
+    ``users.id``. Both arrive via
     ``SecurityBase`` schemes (``client_api_key_scheme`` / ``user_id_scheme``, ``APIKeyHeader``,
     ``auto_error=False``): they contribute the ``clientApiKey`` + ``userId`` security schemes to
     OpenAPI (lock icon / Authorize) *without* adding duplicate header parameters to the operation.
     ``auto_error=False`` keeps them from raising on a missing/malformed header — the real 401 stays
     here so behaviour is explicit (08-api-doc R2).
 
-    Provisioning happens only *after* the key is verified and the subject UUID is parsed (an
-    invalid key or missing/malformed ``X-User-Id`` raises 401 before any row is created) and
-    *before* the subject is used downstream. The JWT/Apple contour stays dormant (ADR-044 §4): the
-    source of identity moves from JWT ``sub`` to ``X-User-Id``; provisioning semantics are intact.
+    Provisioning happens only *after* the key is verified and the subject UUID is resolved (an
+    invalid key or an empty/whitespace-only ``X-User-Id`` raises 401 before any row is created)
+    and *before* the subject is used downstream. The JWT/Apple contour stays dormant (ADR-044
+    §4): the source of identity moves from JWT ``sub`` to ``X-User-Id``; provisioning semantics
+    are intact.
     """
     # 1) Authenticate the request by the trusted client key (401 on missing/mismatch).
     verify_client_api_key(api_key)
-    # 2) Resolve the trusted subject from X-User-Id (no subject => 401, like a missing identity).
-    if not x_user_id:
+    # 2) Resolve the trusted subject from X-User-Id (ADR-058). Empty/whitespace-only => 401
+    # (no subject, like a missing identity). A canonical UUID string is used as-is (backward
+    # compatibility); any other non-empty string maps to a stable derived UUID via uuid5.
+    raw = x_user_id.strip() if x_user_id else ""
+    if not raw:
         raise UnauthorizedError("missing user id")
     try:
-        user_id = uuid.UUID(x_user_id.strip())
-    except ValueError as exc:
-        raise UnauthorizedError("user id is not a valid uuid") from exc
+        user_id = uuid.UUID(raw)  # canonical UUID string → as-is (backward compatibility)
+    except ValueError:
+        user_id = uuid.uuid5(HERMES_USER_NAMESPACE, raw)  # any other string → stable derived UUID
     user = AuthenticatedUser(user_id=user_id, device_id=None)
     set_user_id(str(user.user_id))
     # FastAPI caches `get_db` per request, so `session` is the exact session the service

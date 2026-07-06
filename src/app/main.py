@@ -102,15 +102,10 @@ Backend-оркестратор Claude для iOS-приложения.
 `{error: {code, message, requestId}}`. Значения `blockReason` см. в описании одноимённого поля.
 """
 
+# ADR-059: Hermes-only public surface — only visible-router tags remain, ordered by the Hermes
+# user scenario. Legacy/dormant tags (Auth, Chat, Tools, Models, Presets, Preview, Chats,
+# Workspaces, Profile, Preferences) are removed: their routers are hidden (no visible operations).
 _OPENAPI_TAGS = [
-    {
-        "name": "Auth",
-        "description": (
-            "Спящий контур выпуска токенов (регистрация устройства, выпуск/обновление токенов, "
-            "JWKS). На горячем клиентском пути не используется; авторизация — `X-API-Key` + "
-            "`X-User-Id`. Без авторизации (публичные)."
-        ),
-    },
     {
         "name": "Agent",
         "description": (
@@ -119,27 +114,6 @@ _OPENAPI_TAGS = [
             "подтверждение (`/approval`) и остановка (`/stop`). Блокировки по бизнес-правилам — "
             "HTTP 200 с `blockReason`."
         ),
-    },
-    {
-        "name": "Chat",
-        "description": (
-            "Диалог с ассистентом и tool-loop. Сценарий: `POST /v1/chat/run` → ответ "
-            "`tool_call` → клиент исполняет инструмент → `POST /v1/chat/tool-result` → "
-            "`assistant_message`. `toolCall.id` передаётся обратно в `toolCallId`. Блокировки "
-            "по бизнес-правилам приходят с HTTP 200 и полем `blockReason`."
-        ),
-    },
-    {
-        "name": "Tools",
-        "description": "Каталог инструментов tool-loop: имя, описание, mutating, место исполнения.",
-    },
-    {
-        "name": "Models",
-        "description": ("Доступные модели активного провайдера инстанса для селектора модели."),
-    },
-    {
-        "name": "Presets",
-        "description": "Пресеты промтов для чипов на главном экране чата.",
     },
     {
         "name": "Policy",
@@ -161,44 +135,18 @@ _OPENAPI_TAGS = [
         "description": "Свой ключ Anthropic: сохранение, включение/выключение, удаление.",
     },
     {
+        "name": "Billing (Adapty)",
+        "description": (
+            "Вебхук Adapty: активация/продление/отмена подписки. Вызывает Adapty, не клиент; "
+            "изолированный bearer-секрет (ADR-029)."
+        ),
+    },
+    {
         "name": "Admin",
         "description": (
             "Операторские действия под заголовком `X-Admin-Token`. Клиентский ключ / "
             "пользовательская идентичность здесь не авторизуют. Начисление кредитов, ручная "
             "выдача/активация подписки и просмотр кошелька."
-        ),
-    },
-    {
-        "name": "Preview",
-        "description": (
-            "Публичная отдача сгенерированных сайтов по подписанной ссылке. Без JWT: "
-            "авторизация в подписи."
-        ),
-    },
-    {
-        "name": "Chats",
-        "description": (
-            "История чатов: список, поиск, шаги, переименование, закрепление, удаление. "
-            "Доступ только владельца; чужой/несуществующий чат — 404."
-        ),
-    },
-    {
-        "name": "Workspaces",
-        "description": (
-            "Рабочие пространства (iOS «Projects»): имя, описание, кастомные инструкции и "
-            "файлы-знания как контекст чатов проекта. Доступ только владельца; чужой/"
-            "несуществующий workspace — 404."
-        ),
-    },
-    {
-        "name": "Profile",
-        "description": "Профиль пользователя: отображаемое имя и `accountId`.",
-    },
-    {
-        "name": "Preferences",
-        "description": (
-            "Пользовательские настройки: дефолтный тип ассистента (chat|code), уведомления и "
-            "дефолты Code-контекста."
         ),
     },
     {
@@ -298,25 +246,30 @@ def create_app() -> FastAPI:
     # ADR-044: the client contour uses X-API-Key + X-User-Id; the legacy JWT/Apple issuer
     # (/v1/auth/*) is not wired (it requires RS256 keys and returns 500 without them). Router
     # intentionally NOT registered. The auth_refresh_tokens cleanup reaper (TD-013) still runs.
+    # ADR-059: Hermes-only public OpenAPI surface. Visible routers are documented; legacy routers
+    # stay fully routed/functional but are hidden from /openapi.json (include_in_schema=False).
     for module in (
-        chat,
         agent,
-        tools,
-        models,
-        presets,
         policy,
         wallet,
         token_purchase,
         byok,
         admin,
-        preview,
-        chats,
-        workspaces,
-        profile,
-        preferences,
         billing_adapty,
     ):
         app.include_router(module.router)
+    for module in (
+        chat,
+        chats,
+        workspaces,
+        tools,
+        models,
+        presets,
+        profile,
+        preferences,
+        preview,
+    ):
+        app.include_router(module.router, include_in_schema=False)
     app.include_router(health.router)
 
     # ADR-044 R2.4: enforce AND for the client contour (clientApiKey + userId) in OpenAPI.

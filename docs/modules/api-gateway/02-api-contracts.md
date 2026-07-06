@@ -3,7 +3,8 @@
 Gateway не добавляет собственных бизнес-endpoint, кроме служебных. Бизнес-контракты — в документах соответствующих модулей. Здесь — сквозные правила и служебные endpoint.
 
 ## Сквозные правила запросов
-- Заголовок `Authorization: Bearer <JWT>` обязателен для всех `/v1/*`, **кроме `/v1/auth/*`** (точка получения токена — выпуск через встроенный issuer, [ADR-018](../../adr/ADR-018-embedded-auth-issuer.md); защита — per-IP rate-limit) и `/v1/preview/*` (signed URL). Все прочие `/v1/*`, включая `GET /v1/tools` ([ADR-019](../../adr/ADR-019-tools-catalog-endpoint.md)), требуют JWT.
+> **⚠️ Активный контур — клиентский API-KEY ([ADR-044](../../adr/ADR-044-client-api-key-auth.md)/[ADR-058](../../adr/ADR-058-x-user-id-string-identity.md)).** На горячем пути `/v1/*` авторизуются `X-API-Key` (`CLIENT_API_KEY`) + `X-User-Id` (идентичность субъекта), а НЕ JWT. Правила ниже про `Authorization: Bearer <JWT>` описывают **спящий** JWT-контур. **HTTP-поверхность `/v1/auth/*` — retired** ([ADR-044 §4a](../../adr/ADR-044-client-api-key-auth.md)): issuer-роутер не смонтирован → любой `/v1/auth/*` даёт `404` (не точка получения токена). Спящий issuer-код/таблицы `auth_*`/reaper сохранены.
+- (Спящий контур) Заголовок `Authorization: Bearer <JWT>` был обязателен для всех `/v1/*`, **кроме `/v1/auth/*`** (точка получения токена — выпуск через встроенный issuer, [ADR-018](../../adr/ADR-018-embedded-auth-issuer.md); защита — per-IP rate-limit) и `/v1/preview/*` (signed URL). Все прочие `/v1/*`, включая `GET /v1/tools` ([ADR-019](../../adr/ADR-019-tools-catalog-endpoint.md)), требовали JWT.
 - Заголовок `X-Device-Id` опционален для `/v1/chat/*`. Он работает как override `device_id` для per-device rate limit; при отсутствии используется `device_id` из JWT-claim (fallback `x_device_id or current.device_id`). Если ни заголовка, ни claim нет — `device_id = None`, и per-device бакет лимита не применяется (остаются per-user и per-IP лимиты).
 - Заголовок `X-Request-Id` опционален; если отсутствует — Gateway генерирует `requestId` (UUID) и возвращает в ответе `X-Request-Id`. Это **correlation id** одного HTTP-запроса (логи/трейсы). Он **НЕ** является ключом идемпотентности биллинга: идемпотентность credits-debit строится на `messageStepId` (см. [ADR-005](../../adr/ADR-005-idempotency-ledger.md), [chat-orchestrator](../chat-orchestrator/03-architecture.md)). Совпадение имени с публичным полем `requestId` контракта `/wallet/consume` не означает совпадения значений — в это поле Orchestrator кладёт `messageStepId`.
 - `Content-Type: application/json` для POST.
@@ -12,8 +13,9 @@ Gateway не добавляет собственных бизнес-endpoint, к
 ## Карта маршрутов
 | Метод | Путь | Модуль | Контракт |
 |---|---|---|---|
-| POST | /v1/auth/register, /v1/auth/token, /v1/auth/refresh | auth | [link](../auth/02-api-contracts.md) |
-| GET | /v1/auth/jwks | auth | [link](../auth/02-api-contracts.md) |
+| ~~POST~~ | ~~/v1/auth/register, /v1/auth/token, /v1/auth/refresh~~ | auth — **retired (не смонтирован → 404, [ADR-044 §4a](../../adr/ADR-044-client-api-key-auth.md))** | спящий issuer-код; HTTP-поверхность не зарегистрирована в `create_app()`. [contract](../auth/02-api-contracts.md) |
+| ~~GET~~ | ~~/v1/auth/jwks~~ | auth — **retired (не смонтирован → 404, [ADR-044 §4a](../../adr/ADR-044-client-api-key-auth.md))** | спящий issuer-код; HTTP-поверхность не зарегистрирована. [contract](../auth/02-api-contracts.md) |
+| ~~POST~~ | ~~/v1/auth/apple~~ | auth (Apple, [ADR-043](../../adr/ADR-043-sign-in-with-apple.md)) — **retired (не смонтирован → 404, [ADR-044 §4a](../../adr/ADR-044-client-api-key-auth.md))** | спящий Apple-верификатор; HTTP-поверхность не зарегистрирована. [contract](../auth/02-api-contracts.md) |
 | POST | /v1/chat/run | chat-orchestrator | [link](../chat-orchestrator/02-api-contracts.md) |
 | POST | /v1/chat/tool-result | chat-orchestrator | [link](../chat-orchestrator/02-api-contracts.md) |
 | GET | /v1/tools | chat-orchestrator | [link](../chat-orchestrator/02-api-contracts.md#get-v1tools--каталог-инструментов-adr-019) |

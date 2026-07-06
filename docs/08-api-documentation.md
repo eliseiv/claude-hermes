@@ -29,7 +29,7 @@ Swagger UI должен позволять тестировщику автори
 ### R2.1. `clientApiKey` + `userId` — клиентская auth (Hermes-интеграция, [ADR-044](adr/ADR-044-client-api-key-auth.md))
 - **Две `APIKeyHeader`-схемы** (заменяют прежний `bearerAuth` для клиентского контура; механизм FastAPI — `fastapi.security.APIKeyHeader`, объявлено в `src/app/api_gateway/openapi_security.py`):
   - `clientApiKey` — `type: apiKey`, `in: header`, `name: X-API-Key`. Единый клиентский ключ. `description` (RU): «Клиентский API-ключ. Вставьте `CLIENT_API_KEY` в заголовок `X-API-Key` через Authorize — применится ко всем `/v1/*` клиентского контура».
-  - `userId` — `type: apiKey`, `in: header`, `name: X-User-Id`. Идентичность субъекта (UUID). `description` (RU): «UUID пользователя. Идентичность доверяется (ключ доверенный). Обязателен вместе с `X-API-Key`».
+  - `userId` — `type: apiKey`, `in: header`, `name: X-User-Id`. Идентичность субъекта — **стабильный строковый идентификатор** ([ADR-058](adr/ADR-058-x-user-id-string-identity.md)): каноническая UUID-строка используется как есть, иная непустая строка детерминированно маппится в `users.id` (`uuid5`); пустой/whitespace → `401`. `description` (RU): «Стабильный идентификатор пользователя. Идентичность доверяется (ключ доверенный). Обязателен вместе с `X-API-Key`».
 - **Требуется** (обе схемы) для пользовательских `/v1/*`: `agent` (`/v1/agent/run`, `/v1/agent/runs/{runId}/events|approval|stop`), `chat` (`/v1/chat/run`, `/v1/chat/tool-result`), `GET /v1/tools`, `policy`, `wallet`, `subscription`, `byok`, `chats`, `profile`, `preferences`, `workspaces`, `snippets`, `attachments`, `tokens`, `notifications`. У них в Swagger UI значок замка.
 - **`bearerAuth` (JWT) — «спящий»:** объявление scheme может оставаться в коде (JWT/Apple не удалены, [ADR-044](adr/ADR-044-client-api-key-auth.md)), но **не навешивается** на клиентские операции `/v1/*`. На горячем клиентском пути используется `clientApiKey`+`userId`.
 - **AND-семантика (обе схемы обязательны вместе), НЕ OR ([ADR-044 §5](adr/ADR-044-client-api-key-auth.md)).** Каждый клиентский `/v1/*` требует **одновременно** `X-API-Key` **и** `X-User-Id`; ни один в отдельности доступа не даёт. В OpenAPI это — **один** security-requirement-объект с обоими ключами: `security: [{ "clientApiKey": [], "userId": [] }]` (ключи внутри одного объекта = логическое AND). Форма `[{ "clientApiKey": [] }, { "userId": [] }]` означает OR (достаточно одной схемы) и **противоречит контракту** — это дефект.
@@ -43,7 +43,7 @@ Swagger UI должен позволять тестировщику автори
 
 ### R2.3. Публичные endpoint (без security, без замка)
 - Служебные: `GET /health`, `GET /healthz` (алиас `/health`, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)), `GET /ready`, `GET /metrics` (защищён сетью/scrape-токеном, не входит в Swagger Authorize — см. [07-deployment.md](07-deployment.md#health--readiness)).
-- **Auth-issuer:** `POST /v1/auth/register`, `POST /v1/auth/token`, `POST /v1/auth/refresh`, `GET /v1/auth/jwks` — точка получения токена, защищены per-IP rate-limit ([контракт](modules/api-gateway/02-api-contracts.md)). Без security в OpenAPI — тестировщик вызывает их без авторизации, чтобы получить токен.
+- **Auth-issuer `/v1/auth/*` — retired (не смонтирован), в OpenAPI отсутствует.** Issuer-роутер `/v1/auth/*` НЕ регистрируется в `create_app()` ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)): маршрутов нет, любой вызов → `404`, в схеме операций нет (нечего помечать security). Клиентская идентичность — только `X-API-Key` + `X-User-Id` (R2.1). Спящий issuer/Apple-код и таблицы `auth_*` сохраняются, но HTTP-поверхности нет.
 - Preview: `GET /v1/preview/*` — авторизуются signed URL, не JWT. Без security scheme.
 
 ### R2.4. Общее
@@ -56,7 +56,7 @@ Swagger UI должен позволять тестировщику автори
 | Клиентский | `/v1/*` (кроме admin/auth/preview) | `[{ "clientApiKey": [], "userId": [] }]` (AND — оба ключа в одном объекте) |
 | Admin | `/v1/admin/*` | `[{ "adminToken": [] }]` |
 | Adapty webhook | `POST /v1/billing/adapty/webhook` | `[{ "adaptyWebhook": [] }]` |
-| Public | `/health`, `/healthz`, `/ready`, `/metrics`, `/v1/auth/*`, `/v1/preview/*` | отсутствует (`security` не задан / пустой) |
+| Public | `/health`, `/healthz`, `/ready`, `/metrics`, `/v1/preview/*` | отсутствует (`security` не задан / пустой) |
 
   OR-форма для клиентских операций (`[{clientApiKey:[]},{userId:[]}]`) — **нарушение контракта** ([ADR-044 §5](adr/ADR-044-client-api-key-auth.md)); требует исправления через post-process `custom_openapi()` (R2.1).
 
@@ -68,7 +68,7 @@ Swagger UI обязан быть самодостаточным для ручн�
 1. Открыть `/docs`.
 2. Нажать **Authorize** → заполнить **обе** схемы: `clientApiKey` (вставить `CLIENT_API_KEY` в `X-API-Key`) и `userId` (вставить UUID субъекта в `X-User-Id`). Оба значения тестировщик получает из секрет-менеджера/env (ключ) и выбирает/создаёт сам (`userId` — идентичность доверяется, ключ доверенный).
 3. Тестировать любые `/v1/*` (agent, chat, wallet, chats, profile, preferences, byok, subscription, tokens, `/v1/tools` и др.) — замок закрыт, оба заголовка подставляются автоматически.
-4. **`bearerAuth` (JWT) — спящий** ([ADR-044](adr/ADR-044-client-api-key-auth.md)): на клиентских `/v1/*` не навешан; `/v1/auth/*` остаются public (получение токена), но клиентом при Hermes-интеграции не используются.
+4. **`bearerAuth` (JWT) — спящий** ([ADR-044](adr/ADR-044-client-api-key-auth.md)): на клиентских `/v1/*` не навешан. **`/v1/auth/*` — retired (не смонтирован → `404`, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)):** issuer-роутер не зарегистрирован, в Swagger UI отсутствует; получать токен не нужно — клиентская идентичность передаётся `X-API-Key` + `X-User-Id`.
 
 **Admin-эндпоинты (`adminToken`):**
 1. Нажать **Authorize** → выбрать `adminToken` → вставить значение `ADMIN_API_SECRET` (его получает тестировщик из секрет-менеджера/env, не из API).
@@ -97,7 +97,7 @@ OpenAPI-тексты (`summary`, `description` эндпоинтов, `Field(desc
 | `POST /v1/tokens/purchase` description | «Подписанная consumable-транзакция верифицируется и идемпотентно начисляет кредиты по серверному маппингу productId → credits; отдельный путь от подписки (ADR-015).» | «Покупка пакета токенов через StoreKit. Начисляет кредиты по `productId`. Повторная отправка той же транзакции не начисляет повторно.» |
 | Тег / summary `BYOK` | «Свой ключ Anthropic (Bring Your Own Key)» | «Свой ключ Anthropic» |
 
-Правило применяется и к новым эндпоинтам (`/v1/auth/*`, `GET /v1/tools`): их summary/description — в этом же лаконичном стиле.
+Правило применяется и к прочим эндпоинтам (например `GET /v1/tools`): их summary/description — в этом же лаконичном стиле. (`/v1/auth/*` — retired, не смонтирован, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md); в OpenAPI-текстах не участвует.)
 
 ## R3. Бизнес-блокировки (status=blocked, HTTP 200)
 
@@ -136,30 +136,26 @@ OpenAPI-тексты (`summary`, `description` эндпоинтов, `Field(desc
 
 Сгруппировать endpoint по модулям через `tags` + объявить порядок и русские описания в `openapi_tags`. Порядок тегов = порядок пользовательского сценария.
 
-Колонка **Security** ниже отражает Hermes-интеграцию ([ADR-044](adr/ADR-044-client-api-key-auth.md)): клиентский контур — **`clientApiKey` + `userId`** (обе схемы, заголовки `X-API-Key` + `X-User-Id`); admin — `adminToken`; public — none. Запись `clientApiKey+userId` означает привязку обеих клиентских схем (R2.1). `bearerAuth` (JWT) — спящий, в таблице не фигурирует.
+Колонка **Security** ниже отражает Hermes-интеграцию ([ADR-044](adr/ADR-044-client-api-key-auth.md)): клиентский контур — **`clientApiKey` + `userId`** (обе схемы, заголовки `X-API-Key` + `X-User-Id`); admin — `adminToken`; adapty — `adaptyWebhook`; public — none. Запись `clientApiKey+userId` означает привязку обеих клиентских схем (R2.1). `bearerAuth` (JWT) — спящий, в таблице не фигурирует.
+
+**Hermes-only OpenAPI-поверхность ([ADR-059](adr/ADR-059-hermes-only-openapi-surface.md)).** В `/openapi.json` (и `/docs`, `/redoc`) документируются **только Hermes-контуры**: `Agent`, `Policy`, `Wallet`, `Tokens`, `BYOK`, `Billing (Adapty)`, `Admin`, `Health`. Legacy-роутеры (`chat`, `chats`, `workspaces`, `tools`, `models`, `presets`, `profile`, `preferences`, `preview`) регистрируются с `include_in_schema=False` — **скрыты из схемы, но маршруты активны и функциональны** (документационное изменение, не поведенческое). Тег `Auth` не документируется (issuer-роутер `/v1/auth/*` не зарегистрирован, спящий контур [ADR-044 §4](adr/ADR-044-client-api-key-auth.md)). Таблица ниже — **только видимые** теги.
 
 | Тег | Endpoint | Security | Описание тега (русский, кратко) |
 |---|---|---|---|
-| `Auth` | `POST /v1/auth/register`, `POST /v1/auth/token`, `POST /v1/auth/refresh`, `GET /v1/auth/jwks` | none | Получение и обновление токена доступа (спящий контур, [ADR-044](adr/ADR-044-client-api-key-auth.md)). Клиентом при Hermes-интеграции не используется; оставлен публичным для совместимости/тестов. |
 | `Agent` | `POST /v1/agent/run`, `GET /v1/agent/runs/{runId}/events`, `POST /v1/agent/runs/{runId}/approval`, `POST /v1/agent/runs/{runId}/stop` | `clientApiKey+userId` | Автономный ИИ-агент пользователя (Hermes). Запуск прогона, поток событий (SSE), подтверждение инструмента, остановка. Headline-контур ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)). |
-| `Chat` | `POST /v1/chat/run`, `POST /v1/chat/tool-result` | `clientApiKey+userId` | Простой диалог с ассистентом и tool-loop (вызовы инструментов на устройстве). Опциональный контур рядом с `Agent`. |
-| `Tools` | `GET /v1/tools` | `clientApiKey+userId` | Каталог инструментов, доступных в tool-loop. |
-| `Models` | `GET /v1/models` | `clientApiKey+userId` | Каталог доступных моделей активного провайдера для селектора модели ([ADR-034](adr/ADR-034-user-model-selection.md)). |
-| `Presets` | `GET /v1/presets` | `clientApiKey+userId` | Пресеты промтов для чипов на главном экране чата ([ADR-035](adr/ADR-035-prompt-presets-endpoint.md)). |
 | `Policy` | `GET /v1/policy/effective` | `clientApiKey+userId` | Эффективные права пользователя для UI (можно ли генерировать и почему нет). |
 | `Wallet` | `GET /v1/wallet`, `POST /v1/wallet/consume` | `clientApiKey+userId` | Баланс кредитов и списание. |
 | `Tokens` | `POST /v1/tokens/purchase`, `GET /v1/tokens/products` | `clientApiKey+userId` | Покупка пакетов токенов и каталог продуктов. |
 | `BYOK` | `POST /v1/byok/set`, `POST /v1/byok/toggle`, `POST /v1/byok/delete` | `clientApiKey+userId` | Свой ключ Anthropic: сохранение, включение, удаление. |
+| `Billing (Adapty)` | `POST /v1/billing/adapty/webhook` | `adaptyWebhook` | Вебхук Adapty: активация/продление/отмена подписки. Вызывает Adapty, не клиент; изолированный bearer-секрет ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)). |
 | `Admin` | `POST /v1/admin/credits/grant`, `POST /v1/admin/subscription/grant`, `GET /v1/admin/wallet/{userId}`, `POST /v1/admin/wallet/grant` (переходный алиас `credits/grant`) | `adminToken` | Операторские действия: начисление кредитов, ручная активация подписки, просмотр кошелька ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)). Авторизация — `X-Admin-Token`. |
-| `Preview` | `GET /v1/preview/{projectId}/{token}/{path}` | none | Публичная отдача сгенерированных сайтов по подписанной ссылке (авторизация в подписи, без JWT, [ADR-010](adr/ADR-010-backend-hosted-preview.md)). |
-| `Chats` | `GET/PATCH/DELETE /v1/chats[/{id}]` (+ `/{id}/steps`) | `clientApiKey+userId` | История чатов: список, переименование, удаление, шаги. |
-| `Profile` | `GET/PATCH /v1/profile` | `clientApiKey+userId` | Профиль пользователя. |
-| `Preferences` | `GET/PATCH /v1/preferences` | `clientApiKey+userId` | Пользовательские настройки. |
 | `Health` | `GET /health`, `GET /healthz`, `GET /ready`, `GET /metrics` | none | Служебные проверки и метрики (без auth). `/healthz` — алиас `/health` ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)). |
 
-Каждый endpoint имеет ровно один тег из таблицы и security согласно колонке (R2). Порядок в `openapi_tags` = фактический порядок в `_OPENAPI_TAGS` (`src/app/main.py`): `Auth`, `Agent`, `Chat`, `Tools`, `Models`, `Presets`, `Policy`, `Wallet`, `Tokens`, `BYOK`, `Admin`, `Preview`, `Chats`, `Workspaces`, `Profile`, `Preferences`, `Health`. Тег `Agent` ставится перед `Chat` — он headline-контур пользовательского сценария ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)). **Тег `Subscription` удалён** ([TD-021](100-known-tech-debt.md)/ревизия [ADR-029](adr/ADR-029-adapty-subscription-webhook.md)): после ретирования `POST /v1/subscription/sync` под ним нет роутов → пустую группу убираем из `_OPENAPI_TAGS` (синхронно code↔docs; подписки идут через Adapty-вебхук `POST /v1/billing/adapty/webhook`, который под своим контуром/тегом). needs_code_sync: `_OPENAPI_TAGS` в `src/app/main.py`.
+**Скрытые (legacy, `include_in_schema=False`, [ADR-059](adr/ADR-059-hermes-only-openapi-surface.md)) — в OpenAPI отсутствуют, но маршруты работают:** `Chat` (`/v1/chat/*`), `Tools` (`/v1/tools`), `Models` (`/v1/models`), `Presets` (`/v1/presets`), `Preview` (`/v1/preview/*`), `Chats` (`/v1/chats*`), `Workspaces` (`/v1/workspaces*`), `Profile` (`/v1/profile`), `Preferences` (`/v1/preferences`). Контракты этих контуров сохраняются в [modules/](modules/) и соответствующих ADR.
 
-> Прочие модули расширения (workspaces, snippets, attachments, notifications — см. [карту маршрутов](modules/api-gateway/02-api-contracts.md)) получают собственные теги по тому же принципу: клиентская auth (`clientApiKey`+`userId`, [ADR-044](adr/ADR-044-client-api-key-auth.md)), лаконичные тексты (R2ter), один тег на endpoint.
+Каждый видимый endpoint имеет ровно один тег из таблицы и security согласно колонке (R2). Порядок в `openapi_tags` = фактический порядок в `_OPENAPI_TAGS` (`src/app/main.py`): **`Agent`, `Policy`, `Wallet`, `Tokens`, `BYOK`, `Billing (Adapty)`, `Admin`, `Health`** ([ADR-059](adr/ADR-059-hermes-only-openapi-surface.md)). Тег `Agent` — headline-контур пользовательского сценария ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)). **Тег `Subscription` удалён** ([TD-021](100-known-tech-debt.md)/ревизия [ADR-029](adr/ADR-029-adapty-subscription-webhook.md)): под ним нет роутов; подписки идут через Adapty-вебхук `POST /v1/billing/adapty/webhook` (тег `Billing (Adapty)`). Теги `Auth` и legacy-контуры (`Chat`/`Tools`/`Models`/`Presets`/`Preview`/`Chats`/`Workspaces`/`Profile`/`Preferences`) в `_OPENAPI_TAGS` **отсутствуют** ([ADR-059](adr/ADR-059-hermes-only-openapi-surface.md)). needs_code_sync: `_OPENAPI_TAGS` + `include_in_schema=False` в `src/app/main.py`.
+
+> Скрытые ([ADR-059](adr/ADR-059-hermes-only-openapi-surface.md)) `include_in_schema=False` — это ровно **девять зарегистрированных роутеров**: `chat`, `chats`, `workspaces`, `tools`, `models`, `presets`, `profile`, `preferences`, `preview` (полный список — [карта маршрутов](modules/api-gateway/02-api-contracts.md)). Они остаются функциональными, но не видны в OpenAPI; их auth (`clientApiKey`+`userId`, [ADR-044](adr/ADR-044-client-api-key-auth.md)) и контракты не меняются. **`snippets`/`attachments`/`notifications` — НЕ отдельные роутеры** (в `create_app()` таких `include_router` нет): это суб-контуры/поля скрытых родителей — `attachments` подаются inline в `POST /v1/chat/run` (base64, [ADR-020](adr/ADR-020-inline-base64-attachments-mvp.md); двухшаговый `/v1/attachments` [ADR-014](adr/ADR-014-multimodal-attachments.md) не смонтирован), `snippets`/`notifications` — поля/действия в контурах `profile`/`preferences`. Скрывать их отдельно ADR-059 не требуется — их родители уже скрыты.
 
 ## R5. Примеры (request/response)
 
@@ -188,7 +184,7 @@ Tool-loop сценарий описать связно (в `description` тег�
 
 | Параметр | Значение |
 |---|---|
-| `title` | `claude-ios-backend` (без изменений). |
+| `title` | `claude-hermes` ([ADR-059](adr/ADR-059-hermes-only-openapi-surface.md); установлено в `create_app()`). |
 | `version` | текущая версия приложения (на момент фичи `0.1.0`; источник версии не меняется). |
 | `description` | русский multiline-текст: назначение сервиса (backend-оркестратор Claude для iOS-приложения), кратко бизнес-правила доступа (trial → подписка/кредиты → BYOK), правило blocked=HTTP 200 (R3) с отсылкой к перечню `blockReason`, требование JWT (R2). Без раскрытия секретов и внутренних деталей реализации. |
 | `contact` / `license` / `terms_of_service` | опционально, на усмотрение `backend`. Если заданы — без выдуманных URL/email; иначе не задавать. |
@@ -221,8 +217,8 @@ Tool-loop сценарий описать связно (в `description` тег�
 ## Scope / Out-of-scope
 
 **В scope:**
-- `src/app/api_gateway/openapi_security.py` (или `custom_openapi()` в `src/app/main.py`): **объявить клиентские схемы `clientApiKey` (`X-API-Key`) + `userId` (`X-User-Id`) и схему `adminToken` (`X-Admin-Token`)** ([ADR-044](adr/ADR-044-client-api-key-auth.md), R2.1/R2.2). Пометить пользовательские `/v1/*` (включая `/v1/agent/*`) обеими клиентскими схемами; `/v1/admin/*` — `adminToken`; `/v1/auth/*`, `/v1/preview/*`, `Health` — без security (R2.3). `bearerAuth` (JWT) может оставаться объявленным, но спящим — на клиентские операции не навешивается.
-- `src/app/api_gateway/routers/*.py` — **переписать `summary`/`description` во ВСЕХ роутерах** в лаконичный стиль (R2ter): убрать ADR/Q/TD-ссылки и избыточные скобки-пояснения. Прицельно: `token_purchase.py` (многословие token-purchase, убрать `(ADR-015)`), `byok.py` (убрать `(Bring Your Own Key)`). Проставить корректные `tags`/`security` (R4). Новые роутеры `agent` (`clientApiKey`+`userId`), `auth` (public), `GET /v1/tools` (`clientApiKey`+`userId`) — в том же стиле и security.
+- `src/app/api_gateway/openapi_security.py` (или `custom_openapi()` в `src/app/main.py`): **объявить клиентские схемы `clientApiKey` (`X-API-Key`) + `userId` (`X-User-Id`) и схему `adminToken` (`X-Admin-Token`)** ([ADR-044](adr/ADR-044-client-api-key-auth.md), R2.1/R2.2). Пометить пользовательские `/v1/*` (включая `/v1/agent/*`) обеими клиентскими схемами; `/v1/admin/*` — `adminToken`; `/v1/preview/*`, `Health` — без security (R2.3). `/v1/auth/*` — retired (не смонтирован, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)), в схеме отсутствует. `bearerAuth` (JWT) может оставаться объявленным, но спящим — на клиентские операции не навешивается.
+- `src/app/api_gateway/routers/*.py` — **переписать `summary`/`description` во ВСЕХ роутерах** в лаконичный стиль (R2ter): убрать ADR/Q/TD-ссылки и избыточные скобки-пояснения. Прицельно: `token_purchase.py` (многословие token-purchase, убрать `(ADR-015)`), `byok.py` (убрать `(Bring Your Own Key)`). Проставить корректные `tags`/`security` (R4). Новые роутеры `agent` (`clientApiKey`+`userId`), `GET /v1/tools` (`clientApiKey`+`userId`) — в том же стиле и security. (Роутер `auth` — retired, не смонтирован, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md); его тексты в OpenAPI не участвуют.)
 - `src/app/schemas/*.py` — `Field(description=...)`: лаконично, убрать ADR/Q/TD-ссылки и расшифровки-аббревиатуры в скобках.
 - `src/app/main.py` — метаданные API (R6), теги (R4), docs-флаг (R7); `src/app/config.py` — `DOCS_ENABLED` (R7).
 - `src/app/api_gateway/routers/health.py` — служебные без security.

@@ -43,7 +43,7 @@ def _key_only() -> dict[str, str]:
 )
 @pytest.mark.parametrize(
     "headers_kind",
-    ["no_headers", "key_only", "bad_key", "no_user_id", "bad_user_id"],
+    ["no_headers", "key_only", "bad_key", "no_user_id", "blank_user_id"],
 )
 async def test_agent_routes_require_auth(
     client: AsyncClient,
@@ -59,8 +59,10 @@ async def test_agent_routes_require_auth(
         headers = {"X-API-Key": "wrong-key", "X-User-Id": str(uuid.uuid4())}
     elif headers_kind == "no_user_id":
         headers = _key_only()
-    elif headers_kind == "bad_user_id":
-        headers = {**_key_only(), "X-User-Id": "not-a-uuid"}
+    elif headers_kind == "blank_user_id":
+        # ADR-058: a non-UUID X-User-Id is NO LONGER 401 (it maps to a stable derived subject). The
+        # only subject-resolution 401 left is an empty / whitespace-only header (no subject).
+        headers = {**_key_only(), "X-User-Id": "   "}
     r = await client.request(method, path, json=json_body, headers=headers)
     assert r.status_code == 401, f"{headers_kind} {method} {path} -> {r.status_code}: {r.text}"
 

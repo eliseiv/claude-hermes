@@ -37,24 +37,24 @@
 
 ### Независимые контуры авторизации
 
-> **⚠️ Hermes-интеграция ([ADR-044](adr/ADR-044-client-api-key-auth.md)) — активный клиентский контур.** Клиентская авторизация `/v1/*` переведена с JWT Bearer на **клиентский API-KEY**: заголовок `X-API-Key: <CLIENT_API_KEY>` + идентичность субъекта `X-User-Id: <uuid>` (UUID доверяется, т.к. ключ доверенный). Прежний JWT-контур ([ADR-018](adr/ADR-018-embedded-auth-issuer.md))/Apple ([ADR-043](adr/ADR-043-sign-in-with-apple.md)) **«дремлют»** — код и `/v1/auth/*` сохранены, но клиент их не использует. Таблица ниже отражает активный контур.
+> **⚠️ Hermes-интеграция ([ADR-044](adr/ADR-044-client-api-key-auth.md)) — активный клиентский контур.** Клиентская авторизация `/v1/*` переведена с JWT Bearer на **клиентский API-KEY**: заголовок `X-API-Key: <CLIENT_API_KEY>` + идентичность субъекта `X-User-Id: <стабильный-идентификатор>` (доверяется, т.к. ключ доверенный). `X-User-Id` — любая непустая строка ([ADR-058](adr/ADR-058-x-user-id-string-identity.md)): UUID-строка используется как есть, иная строка детерминированно маппится в `users.id` (`uuid5`), пустой/whitespace → `401`. Прежний JWT-контур ([ADR-018](adr/ADR-018-embedded-auth-issuer.md))/Apple ([ADR-043](adr/ADR-043-sign-in-with-apple.md)) **«дремлют» (спящий код), а HTTP-поверхность `/v1/auth/*` — retired**: issuer/Apple-код и таблицы `auth_*` сохранены, но роутер `/v1/auth/*` **НЕ смонтирован** ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)) → любой вызов `/v1/auth/*` даёт `404`. Клиент их не использует. Таблица ниже отражает активный контур.
 
 | Контур | Кто использует | Механизм | Заголовок | Swagger security scheme |
 |---|---|---|---|---|
-| **Пользовательский (активный, [ADR-044](adr/ADR-044-client-api-key-auth.md))** | iOS-приложение, эндпоинты `/v1/*` (кроме admin, preview, adapty-webhook) | клиентский API-KEY + идентичность | `X-API-Key: <CLIENT_API_KEY>` + `X-User-Id: <uuid>` | `clientApiKey` + `userId` (оба apiKey, header) |
-| **Пользовательский (спящий, [ADR-018](adr/ADR-018-embedded-auth-issuer.md))** | не используется клиентом при Hermes-интеграции | JWT Bearer (RS256) | `Authorization: Bearer <JWT>` | `bearerAuth` (http bearer, format JWT) — не навешан на `/v1/*` |
+| **Пользовательский (активный, [ADR-044](adr/ADR-044-client-api-key-auth.md)/[ADR-058](adr/ADR-058-x-user-id-string-identity.md))** | iOS-приложение, эндпоинты `/v1/*` (кроме admin, preview, adapty-webhook) | клиентский API-KEY + идентичность | `X-API-Key: <CLIENT_API_KEY>` + `X-User-Id: <стабильная-строка>` (UUID как есть / иная строка → `uuid5`) | `clientApiKey` + `userId` (оба apiKey, header) |
+| **Пользовательский (спящий, [ADR-018](adr/ADR-018-embedded-auth-issuer.md))** | не используется клиентом; issuer-роутер `/v1/auth/*` retired (не смонтирован → `404`, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)) | JWT Bearer (RS256), только спящий код | `Authorization: Bearer <JWT>` | `bearerAuth` (http bearer) — не навешан на `/v1/*` |
 | **Admin** | Операторские/саппорт-инструменты, `/v1/admin/*` | статический секрет | `X-Admin-Token: <ADMIN_API_SECRET>` | `adminToken` (apiKey, header `X-Admin-Token`) |
 | **Preview** | Браузер (открывает превью сайта) | подпись внутри URL (HMAC+TTL) | нет — авторизация в самой ссылке | — (публичный по signed URL) |
 | **Adapty webhook** | Сервис Adapty (M2M), `/v1/billing/adapty/webhook` | статический bearer-секрет (без HMAC-подписи payload) | `Authorization: Bearer <ADAPTY_WEBHOOK_SECRET>` | отдельная http-bearer схема ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)) |
 
-> Эндпоинты выпуска токена `/v1/auth/register|token|refresh|apple` и `GET /v1/auth/jwks` — **public** (без `Authorization`): это точка получения JWT. Защита — per-IP rate-limit. См. [§21](#21-auth-выпуск-токена).
+> Эндпоинты выпуска токена `/v1/auth/register|token|refresh|apple` и `GET /v1/auth/jwks` — **retired (не смонтированы → `404`, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md))**: получать JWT не нужно, клиентская идентичность передаётся `X-API-Key` + `X-User-Id`. §21 сохранён как описание спящего issuer-**кода** (путь будущего апгрейда), не как live-поверхность.
 
 Контуры **взаимно изолированы**: пользовательский JWT не даёт доступа к admin-эндпоинтам, admin-токен — к пользовательским ресурсам. Эскалация невозможна by design.
 
 ### Пользовательский JWT (RS256)
 
 - Алгоритм подписи — **RS256** (асимметричный: приватный ключ — секрет подписи, публичный — для verify).
-- **Issuer встроен в backend** ([ADR-018](adr/ADR-018-embedded-auth-issuer.md)): токен выпускается через `/v1/auth/*` (см. [§21](#21-auth-выпуск-токена)) и верифицируется тем же сервисом (self-consistent, `iss=https://broadnova.shop`, `aud=claude-ios`).
+- **Issuer встроен в backend** ([ADR-018](adr/ADR-018-embedded-auth-issuer.md)): по исходному проекту токен выпускался через `/v1/auth/*` (см. [§21](#21-auth-выпуск-токена)) и верифицировался тем же сервисом (self-consistent, `iss=https://broadnova.shop`, `aud=claude-ios`). **HTTP-поверхность `/v1/auth/*` retired** ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)) — роутер не смонтирован; описание ниже относится к спящему коду.
 - Обязательные claims: `sub` = `userId` (UUID), `exp` (срок), `iat`, `device_id`, `iss`, `aud`. Заголовок `kid`.
 - Просроченный/невалидный токен → `401`.
 - `userId` в теле запроса **обязан** совпадать с `sub` токена, иначе `403`.
@@ -119,7 +119,7 @@
 ### POST /v1/agent/run
 Запуск автономного прогона агента.
 
-**Заголовки:** `X-API-Key: <CLIENT_API_KEY>` (обязателен), `X-User-Id: <uuid>` (обязателен), `Content-Type: application/json`.
+**Заголовки:** `X-API-Key: <CLIENT_API_KEY>` (обязателен), `X-User-Id: <стабильный-идентификатор>` (обязателен; UUID-строка или любая непустая строка → детерминированный `users.id`, [ADR-058](adr/ADR-058-x-user-id-string-identity.md)), `Content-Type: application/json`.
 
 **Request:** `{ "message": "string", "sessionId": "string|null", "model": "string|null" }`.
 
@@ -824,9 +824,11 @@ Backend возвращает `status="tool_call"`, iOS исполняет на �
 
 ---
 
-## 21. Auth (выпуск токена)
+## 21. Auth (выпуск токена) — RETIRED HTTP-поверхность (спящий код)
 
-Встроенный issuer ([ADR-018](adr/ADR-018-embedded-auth-issuer.md), [modules/auth](modules/auth/README.md)): backend САМ выпускает и верифицирует RS256 JWT. Эндпоинты `/v1/auth/*` — **без** пользовательского JWT (точка его получения); защита — per-IP rate-limit. Первичная аутентификация — **device-based** (анонимная) + **Sign in with Apple** для кросс-девайс аккаунта ([ADR-043](adr/ADR-043-sign-in-with-apple.md), закрывает [Q-018-2](99-open-questions.md)). Email/пароль — опциональное расширение, не MVP.
+> **⚠️ RETIRED ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)).** Issuer-роутер `/v1/auth/*` **НЕ смонтирован** в `create_app()` — все эндпоинты этого раздела возвращают `404`, а не `200`/`503`. Раздел сохранён как описание **спящего issuer-КОДА** (`src/app/auth/*`, таблицы `auth_*`, cleanup-reaper [TD-013]) — путь будущего апгрейда идентичности. На текущей поставке клиентская идентичность — `X-API-Key` + `X-User-Id` (§2), получать токен не нужно.
+
+Встроенный issuer ([ADR-018](adr/ADR-018-embedded-auth-issuer.md), [modules/auth](modules/auth/README.md)): по исходному проекту backend САМ выпускает и верифицирует RS256 JWT. Эндпоинты `/v1/auth/*` — **без** пользовательского JWT (точка его получения); защита — per-IP rate-limit. Первичная аутентификация — **device-based** (анонимная) + **Sign in with Apple** для кросс-девайс аккаунта ([ADR-043](adr/ADR-043-sign-in-with-apple.md), закрывает [Q-018-2](99-open-questions.md)). Email/пароль — опциональное расширение, не MVP.
 
 ### POST /v1/auth/register
 Создать/найти идентичность устройства и выдать токены.
@@ -962,12 +964,9 @@ JWKS с публичным ключом (для самопроверки/отл�
 
 Интерактивная документация — `/docs` (Swagger UI) при `DOCS_ENABLED=true` (dev/staging; на `broadnova.shop` сейчас включена). Порядок ручной проверки:
 
-1. **Получить токен.** Открой `POST /v1/auth/register` → «Try it out» → тело `{}` (или `{ "deviceId": "my-test-device" }`) → «Execute». В ответе скопируй `accessToken`.
-   - Повторно для того же `deviceId` — `POST /v1/auth/token`. Обновить пару — `POST /v1/auth/refresh` с `refreshToken`.
-   - Если ответ `503` — на сервере не сконфигурирован приватный ключ подписи (issuer выключен); см. [§21](#21-auth-выпуск-токена) и prod-checklist деплоя.
-2. **Авторизоваться (`bearerAuth`).** Кнопка «Authorize» (вверху справа) → схема `bearerAuth` → вставь `accessToken` (без слова `Bearer`, Swagger добавит сам) → «Authorize». Теперь все `/v1/*` шлются с `Authorization: Bearer <JWT>`.
-3. **Дёргать защищённые эндпоинты.** Любой `/v1/*` (например `GET /v1/tools`, `GET /v1/policy/effective`, `POST /v1/chat/run`). В теле, где есть `userId`, подставляй `userId` = `sub` из токена (иначе `403`).
-4. **Admin-эндпоинты (`adminToken`).** Для `/v1/admin/*` — отдельная схема в «Authorize»: `adminToken` → вставь значение `ADMIN_API_SECRET` (уйдёт как заголовок `X-Admin-Token`). Пользовательский `bearerAuth` к admin-эндпоинтам не подходит — контуры изолированы.
+1. **Авторизоваться клиентским контуром ([ADR-044](adr/ADR-044-client-api-key-auth.md)/[ADR-058](adr/ADR-058-x-user-id-string-identity.md)).** Кнопка «Authorize» (вверху справа) → заполнить **обе** схемы: `clientApiKey` (вставить `CLIENT_API_KEY` в заголовок `X-API-Key`) и `userId` (вставить стабильный идентификатор в `X-User-Id` — любая непустая строка; UUID используется как есть, иная строка маппится в `users.id` через `uuid5`). Токен получать НЕ нужно — issuer `/v1/auth/*` retired (не смонтирован → `404`, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)).
+2. **Дёргать защищённые эндпоинты.** Любой `/v1/*` (например `GET /v1/tools`, `GET /v1/policy/effective`, `POST /v1/chat/run`, `POST /v1/agent/run`) — оба заголовка (`X-API-Key` + `X-User-Id`) подставляются автоматически. В теле, где есть `userId`, подставляй тот же субъект, что в `X-User-Id` (иначе `403`).
+4. **Admin-эндпоинты (`adminToken`).** Для `/v1/admin/*` — отдельная схема в «Authorize»: `adminToken` → вставь значение `ADMIN_API_SECRET` (уйдёт как заголовок `X-Admin-Token`). Пользовательский клиентский контур (`clientApiKey`+`userId`) к admin-эндпоинтам не подходит — контуры изолированы.
 5. **Preview** через Swagger не тестируется обычным способом — `GET /v1/preview/*` открывается прямой signed-URL ссылкой в браузере (авторизация в URL, не в заголовке).
 
 > Если `/docs` отдаёт `404` — на этом окружении `DOCS_ENABLED=false` (рекомендация для prod). Тогда тестируй через `curl`/Postman по контрактам выше.
