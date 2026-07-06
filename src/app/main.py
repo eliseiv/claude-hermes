@@ -23,7 +23,6 @@ from app.api_gateway.rate_limit import close_redis
 from app.api_gateway.routers import (
     admin,
     agent,
-    auth,
     billing_adapty,
     byok,
     chat,
@@ -296,8 +295,10 @@ def create_app() -> FastAPI:
         logger.exception("unhandled_error")
         return _error_response(500, "internal_error", "internal error")
 
+    # ADR-044: the client contour uses X-API-Key + X-User-Id; the legacy JWT/Apple issuer
+    # (/v1/auth/*) is not wired (it requires RS256 keys and returns 500 without them). Router
+    # intentionally NOT registered. The auth_refresh_tokens cleanup reaper (TD-013) still runs.
     for module in (
-        auth,
         chat,
         agent,
         tools,
