@@ -11,12 +11,15 @@ TWO apiKey-in-header schemes that are required TOGETHER (AND) — `clientApiKey`
 3. Real auth verification unchanged (auto_error=False did NOT short-circuit get_current_user):
    no headers / wrong key / missing X-User-Id on /v1/* still 401; valid pair passes (regression).
 4. No auth header leaks as an operation `parameter` (X-API-Key/X-User-Id/Authorization/X-Admin).
-5. Named request/response examples (visible byok/wallet contour); the 8-value blockReason
-   completeness guard lives on the VISIBLE EffectivePolicyResponse.reasons[]; tags/grouping.
+5. Named request/response examples (chat + byok/wallet contour); the 8-value blockReason
+   completeness guard lives on both the VISIBLE ChatResponse.blockReason and
+   EffectivePolicyResponse.reasons[]; tags/grouping.
 6. Swagger /docs builds without error.
-7. ADR-059 Hermes-only surface: legacy routers (chat/tools/models/presets/workspaces/chats/
-   profile/preferences/preview) and the dormant /v1/auth/* issuer are ABSENT from the schema, yet
-   the legacy routes stay live (hide-only, include_in_schema=False); title == "claude-hermes".
+7. ADR-059 §7 (Reversed): the hide-only measure is CANCELLED — the OpenAPI surface is FULL again.
+   Every active router is documented and present in the schema, including the nine claude-ios legacy
+   routers (chat/tools/models/presets/workspaces/chats/profile/preferences/preview). The ONLY route
+   family that stays out of the schema is the retired /v1/auth/* issuer (ADR-044 §4a: not mounted →
+   404). title == "claude-hermes".
 
 The documentation layer is reflection-only: these tests use the OpenAPI schema produced by
 create_app() and (for the regression guard) the live ASGI client from conftest. DOCS_ENABLED
@@ -58,24 +61,32 @@ _BLOCK_REASONS = (
     "policy_denied",
 )
 
-# Expected tag order per ADR-059 (Hermes-only public surface): only visible-router tags remain,
-# ordered by the Hermes user scenario. Legacy/dormant tags (Auth, Chat, Tools, Models, Presets,
-# Preview, Chats, Workspaces, Profile, Preferences) are REMOVED — their routers are hidden
-# (include_in_schema=False) and carry no visible operations. app.main `_OPENAPI_TAGS` must match.
+# Expected tag order per ADR-059 §7 (Reversed): the FULL public surface is restored. Every active
+# router's tag is declared in the Hermes-then-legacy scenario order. Only `Auth` (retired issuer,
+# ADR-044 §4a) and `Subscription` (retired sync route, TD-021/ADR-029) are absent. app.main
+# `_OPENAPI_TAGS` must match this list exactly (lock-step, docs↔code).
 _TAG_ORDER = [
     "Agent",
+    "Chat",
+    "Tools",
+    "Models",
+    "Presets",
     "Policy",
     "Wallet",
     "Tokens",
     "BYOK",
     "Billing (Adapty)",
     "Admin",
+    "Preview",
+    "Chats",
+    "Workspaces",
+    "Profile",
+    "Preferences",
     "Health",
 ]
 
-# Endpoint -> expected single tag (ADR-059 visible surface only). Hidden legacy routes
-# (chat, tools, models, presets, workspaces, chats, profile, preferences, preview) and the dormant
-# /v1/auth/* issuer are ABSENT from the schema and therefore not listed here.
+# Endpoint -> expected single tag (R4 table, ADR-059 §7 full surface). The retired /v1/auth/* issuer
+# and the retired POST /v1/subscription/sync are ABSENT from the schema and therefore not listed.
 _ENDPOINT_TAG = {
     # Agent (ADR-045/047): 4 client-contour /v1/agent/* endpoints, all tag=Agent. The route path
     # params are declared as {run_id} (FastAPI emits the function param name verbatim), so the
@@ -86,6 +97,12 @@ _ENDPOINT_TAG = {
     ("/v1/agent/runs/{run_id}/events", "get"): "Agent",
     ("/v1/agent/runs/{run_id}/approval", "post"): "Agent",
     ("/v1/agent/runs/{run_id}/stop", "post"): "Agent",
+    # Chat (ADR-059 §7 restored): the tool-loop contour is documented again.
+    ("/v1/chat/run", "post"): "Chat",
+    ("/v1/chat/tool-result", "post"): "Chat",
+    ("/v1/tools", "get"): "Tools",
+    ("/v1/models", "get"): "Models",
+    ("/v1/presets", "get"): "Presets",
     ("/v1/policy/effective", "get"): "Policy",
     ("/v1/wallet", "get"): "Wallet",
     ("/v1/wallet/consume", "post"): "Wallet",
@@ -103,6 +120,29 @@ _ENDPOINT_TAG = {
     ("/v1/admin/wallet/grant", "post"): "Admin",
     ("/v1/admin/subscription/grant", "post"): "Admin",
     ("/v1/admin/wallet/{userId}", "get"): "Admin",
+    # Preview (ADR-059 §7 restored): PUBLIC (security=none) signed-link delivery — excluded from
+    # the client-contour AND checks via _PUBLIC_PREVIEW below.
+    ("/v1/preview/{projectId}/{token}/{path}", "get"): "Preview",
+    # Chats (ADR-059 §7 restored): owner-scoped history, client contour.
+    ("/v1/chats", "get"): "Chats",
+    ("/v1/chats/{chat_id}", "get"): "Chats",
+    ("/v1/chats/{chat_id}", "patch"): "Chats",
+    ("/v1/chats/{chat_id}", "delete"): "Chats",
+    ("/v1/chats/{chat_id}/steps", "get"): "Chats",
+    # Workspaces (ADR-036): 8 owner-scoped CRUD + knowledge-file endpoints, all tag=Workspaces.
+    ("/v1/workspaces", "post"): "Workspaces",
+    ("/v1/workspaces", "get"): "Workspaces",
+    ("/v1/workspaces/{workspace_id}", "get"): "Workspaces",
+    ("/v1/workspaces/{workspace_id}", "patch"): "Workspaces",
+    ("/v1/workspaces/{workspace_id}", "delete"): "Workspaces",
+    ("/v1/workspaces/{workspace_id}/files", "post"): "Workspaces",
+    ("/v1/workspaces/{workspace_id}/files", "get"): "Workspaces",
+    ("/v1/workspaces/{workspace_id}/files/{file_id}", "delete"): "Workspaces",
+    # Profile / Preferences (ADR-059 §7 restored): client contour.
+    ("/v1/profile", "get"): "Profile",
+    ("/v1/profile", "patch"): "Profile",
+    ("/v1/preferences", "get"): "Preferences",
+    ("/v1/preferences", "patch"): "Preferences",
     ("/health", "get"): "Health",
     ("/ready", "get"): "Health",
     ("/metrics", "get"): "Health",
@@ -114,6 +154,11 @@ _PUBLIC_PATHS = {"/health", "/ready", "/metrics"}
 # The Adapty webhook is visible but authorized by adaptyWebhook (not the client contour); it is
 # excluded from the client-contour AND assertions and checked by test_adapty_webhook_* instead.
 _ADAPTY_WEBHOOK = ("/v1/billing/adapty/webhook", "post")
+
+# The public preview endpoint (ADR-059 §7) is a /v1/* path but carries NO security (authorization is
+# in the signed URL). It MUST be excluded from the client-contour AND assertions — including it would
+# make those AND-tests falsely fail — mirroring the _ADMIN_PATHS / _ADAPTY_WEBHOOK exclusions.
+_PUBLIC_PREVIEW = {("/v1/preview/{projectId}/{token}/{path}", "get")}
 
 # Admin endpoints (ADR-009): authorized by the isolated adminToken scheme, NOT the client contour.
 # ADR-048: credits/grant (canonical) + subscription/grant (new) join the wallet/grant alias.
@@ -169,13 +214,16 @@ def _operation(schema: dict[str, Any], path: str, method: str) -> dict[str, Any]
     return schema["paths"][path][method]
 
 
-# Client-contour /v1/* operations from the tag table. Excludes the admin contour (adminToken) and
-# the Adapty webhook (adaptyWebhook), which are authorized by their own isolated schemes, not by
-# clientApiKey+userId (ADR-009/ADR-029). Yields agent(4)+policy+wallet(2)+tokens(2)+byok(3) = 12.
+# Client-contour /v1/* operations from the tag table. Excludes the admin contour (adminToken), the
+# Adapty webhook (adaptyWebhook) and the PUBLIC preview (no security), which are authorized by their
+# own isolated schemes / signed URL, not by clientApiKey+userId (ADR-009/ADR-029/ADR-059 §7).
 _CLIENT_V1_OPERATIONS = [
     (p, m)
     for (p, m) in _ENDPOINT_TAG
-    if p.startswith("/v1/") and (p, m) not in _ADMIN_PATHS and (p, m) != _ADAPTY_WEBHOOK
+    if p.startswith("/v1/")
+    and (p, m) not in _ADMIN_PATHS
+    and (p, m) != _ADAPTY_WEBHOOK
+    and (p, m) not in _PUBLIC_PREVIEW
 ]
 
 
@@ -297,10 +345,10 @@ def test_client_v1_endpoints_not_or_form(
     assert len(sec) == 1, f"{method.upper()} {path} should have 1 requirement object: {sec}"
 
 
-# NOTE (ADR-059): test_tools_endpoint_requires_client_contour REMOVED — /v1/tools is now hidden
-# (include_in_schema=False) and absent from the schema. The client-contour AND requirement is still
-# asserted for every VISIBLE client operation via the parametrized _CLIENT_V1_OPERATIONS tests
-# above, and directly per-endpoint for the Agent headline contour below.
+def test_tools_endpoint_requires_client_contour(openapi_schema: dict[str, Any]) -> None:
+    # ADR-059 §7 restored: GET /v1/tools is visible again and carries the client-contour AND form.
+    op = _operation(openapi_schema, "/v1/tools", "get")
+    assert op.get("security") == _CLIENT_CONTOUR_SECURITY, op.get("security")
 
 
 # Enumerated-contour coverage for the Agent headline contour (08-api-documentation R2.1/R4,
@@ -348,10 +396,10 @@ def test_agent_endpoint_requires_client_contour_and_form(
         assert keysets.count(forbidden) == 0, f"{method.upper()} {path} uses OR form: {sec}"
 
 
-# NOTE (ADR-059): test_auth_endpoints_have_no_security REMOVED — the /v1/auth/* issuer router is
-# not registered in create_app() (dormant, ADR-044 §4), so those paths are absent from the schema
-# and there is no operation to assert on. The dormant JWT import contour is still guarded by
-# test_dormant_jwt_modules_importable in test_client_api_key_auth_adr044.py.
+# NOTE (ADR-044 §4a): the /v1/auth/* issuer router is NOT mounted in create_app() (retired HTTP
+# surface → 404), so those paths are absent from the schema and there is no operation to assert on.
+# test_no_auth_paths_in_openapi below asserts that absence positively; the dormant JWT import contour
+# is still guarded by test_dormant_jwt_modules_importable in test_client_api_key_auth_adr044.py.
 
 
 @pytest.mark.parametrize(("path", "method"), sorted(_ADMIN_PATHS))
@@ -369,6 +417,12 @@ def test_adapty_webhook_requires_adapty_scheme(openapi_schema: dict[str, Any]) -
     # ADR-029/ADR-044 R2.4: the Adapty webhook carries [{adaptyWebhook:[]}] only.
     op = _operation(openapi_schema, "/v1/billing/adapty/webhook", "post")
     assert op.get("security") == [{"adaptyWebhook": []}], op.get("security")
+
+
+def test_public_preview_has_no_security(openapi_schema: dict[str, Any]) -> None:
+    # ADR-059 §7: the public preview endpoint authorizes via the signed URL — no security scheme.
+    op = _operation(openapi_schema, "/v1/preview/{projectId}/{token}/{path}", "get")
+    assert not op.get("security"), f"public preview must not require auth, got {op.get('security')}"
 
 
 @pytest.mark.parametrize("path", sorted(_PUBLIC_PATHS))
@@ -415,26 +469,32 @@ def test_no_operation_declares_auth_header_as_parameter(openapi_schema: dict[str
 
 
 # ============================================================================
-# 2d. ADR-059 hide-only: legacy routes are ABSENT from the schema but STAY routed & functional.
-#     Removing them from /openapi.json (include_in_schema=False) must NOT unregister the route.
+# 2d. ADR-059 §7 (Reversed): the full public surface is restored — the legacy routers are PRESENT in
+#     the schema AND stay routed & functional. This is the positive counterpart to the retired
+#     /v1/auth/* absence (test_no_auth_paths_in_openapi).
 # ============================================================================
 @pytest.mark.parametrize(
     "path",
     ["/v1/chat/run", "/v1/chat/tool-result", "/v1/tools", "/v1/workspaces", "/v1/models"],
 )
-def test_hidden_legacy_paths_absent_from_openapi(openapi_schema: dict[str, Any], path: str) -> None:
-    # The legacy contour is documentation-hidden (ADR-059 §1/§3): no path item in the schema.
-    assert path not in openapi_schema.get("paths", {}), f"hidden legacy path {path} leaked into schema"
+def test_restored_legacy_paths_present_in_openapi(
+    openapi_schema: dict[str, Any], path: str
+) -> None:
+    # ADR-059 §7 (Reversed): hide-only is cancelled — each legacy contour path item is back in the
+    # documented schema (inverted from the former "absent" assertion).
+    assert path in openapi_schema.get("paths", {}), f"restored legacy path {path} missing from schema"
 
 
 @pytest.mark.asyncio
-async def test_hidden_chat_run_route_still_live_not_404(
-    client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
+async def test_chat_run_route_documented_and_live_not_404(
+    client: AsyncClient,
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+    openapi_schema: dict[str, Any],
 ) -> None:
-    # ADR-059 §1/§6: hide-only, not disable. Though '/v1/chat/run' is absent from /openapi.json, the
-    # route is still registered and answers (same code/auth). A valid client pair reaches the
-    # handler → NOT 404 (business-blocked 200 for a trial-spent user). This is the behavioural
-    # counterpart to the schema-absence assertion above (masking guard: "hidden" must not mean gone).
+    # ADR-059 §7: '/v1/chat/run' is BOTH documented (present in /openapi.json) AND live. A valid
+    # client pair reaches the handler → NOT 404 (business-blocked 200 for a trial-spent user). This
+    # pairs the schema-presence assertion above with real routing (masking guard: documented ⇒ live).
+    assert "/v1/chat/run" in openapi_schema.get("paths", {}), "chat/run missing from schema"
     async with db_sessionmaker() as s:
         uid = await seed_user(s, trial_used=True)
     r = await client.post(
@@ -442,8 +502,15 @@ async def test_hidden_chat_run_route_still_live_not_404(
         json={"userId": str(uid), "projectId": "p", "message": "hi", "mode": "credits"},
         headers=auth_headers(uid),
     )
-    assert r.status_code != 404, f"hidden route must stay live, got {r.status_code}: {r.text}"
+    assert r.status_code != 404, f"documented route must stay live, got {r.status_code}: {r.text}"
     assert r.status_code == 200
+
+
+def test_no_auth_paths_in_openapi(openapi_schema: dict[str, Any]) -> None:
+    # ADR-044 §4a: the /v1/auth/* issuer HTTP surface is retired (router not mounted). No path in the
+    # documented schema may begin with /v1/auth/ (positive absence guard, enumerated-contour style).
+    offenders = [p for p in openapi_schema.get("paths", {}) if p.startswith("/v1/auth/")]
+    assert not offenders, f"retired /v1/auth/* leaked into OpenAPI: {offenders}"
 
 
 # ============================================================================
@@ -523,10 +590,28 @@ def _response_example_names(op: dict[str, Any], status: str = "200") -> set[str]
     return set(content.get("examples", {}).keys())
 
 
-# NOTE (ADR-059): the chat request/response example tests (test_chat_run_*, test_chat_tool_result_*)
-# were REMOVED — /v1/chat/* is hidden from the schema (include_in_schema=False), so its named
-# examples are no longer part of the documented surface. The named-example convention is still
-# asserted on the VISIBLE contour below (byok/set request+response, wallet/consume request).
+def test_chat_run_response_examples(openapi_schema: dict[str, Any]) -> None:
+    # ADR-059 §7 restored: /v1/chat/* is documented again, so its named examples are back on surface.
+    op = _operation(openapi_schema, "/v1/chat/run", "post")
+    names = _response_example_names(op)
+    assert {"assistant_message", "tool_call", "blocked"} <= names, names
+
+
+def test_chat_run_request_example(openapi_schema: dict[str, Any]) -> None:
+    op = _operation(openapi_schema, "/v1/chat/run", "post")
+    assert _request_example_names(op), "chat/run must have a named request example"
+
+
+def test_chat_tool_result_response_examples(openapi_schema: dict[str, Any]) -> None:
+    op = _operation(openapi_schema, "/v1/chat/tool-result", "post")
+    names = _response_example_names(op)
+    assert "assistant_message" in names, names
+
+
+def test_chat_tool_result_request_examples(openapi_schema: dict[str, Any]) -> None:
+    op = _operation(openapi_schema, "/v1/chat/tool-result", "post")
+    names = _request_example_names(op)
+    assert {"batch", "single_deprecated", "error"} <= names, names
 
 
 def test_byok_set_examples_valid_and_invalid(openapi_schema: dict[str, Any]) -> None:
@@ -552,17 +637,33 @@ def test_wallet_consume_example_debit_one(openapi_schema: dict[str, Any]) -> Non
 
 # ============================================================================
 # 5. blockReason / reasons documentation (R3)
-#    ADR-059: the completeness guard for all 8 blockReason values moved from the hidden ChatResponse
-#    schema onto the VISIBLE EffectivePolicyResponse.reasons[] surface (test below). The
-#    chat-schema tests (test_chat_response_blockreason_documents_all_8,
-#    test_chat_response_status_invariant_documented) were REMOVED — ChatResponse is no longer part
-#    of the documented surface (its owning /v1/chat/* router is include_in_schema=False).
+#    ADR-059 §7: ChatResponse is documented again — the 8-value blockReason completeness guard is
+#    asserted on BOTH the visible ChatResponse.blockReason and EffectivePolicyResponse.reasons[].
 # ============================================================================
+def _chat_response_schema(openapi_schema: dict[str, Any]) -> dict[str, Any]:
+    return openapi_schema["components"]["schemas"]["ChatResponse"]
+
+
+def test_chat_response_blockreason_documents_all_8(openapi_schema: dict[str, Any]) -> None:
+    schema = _chat_response_schema(openapi_schema)
+    block_field = schema["properties"]["blockReason"]
+    desc = block_field.get("description", "")
+    assert len(_BLOCK_REASONS) == 8
+    for reason in _BLOCK_REASONS:
+        assert reason in desc, f"blockReason description missing '{reason}'"
+
+
+def test_chat_response_status_invariant_documented(openapi_schema: dict[str, Any]) -> None:
+    schema = _chat_response_schema(openapi_schema)
+    desc = schema.get("description", "")
+    for state in ("assistant_message", "tool_call", "blocked"):
+        assert state in desc, f"ChatResponse description missing state '{state}'"
+
+
 def test_policy_reasons_documents_all_8_block_reasons(openapi_schema: dict[str, Any]) -> None:
-    # Completeness guard (moved from ChatResponse.blockReason per ADR-059): the visible
-    # EffectivePolicyResponse.reasons[] field documents the FULL set of 8 canonical blockReason
-    # values. Losing any value fails here — the "all 8 documented" invariant is preserved on the
-    # Hermes-visible contour.
+    # Completeness guard on the visible EffectivePolicyResponse.reasons[]: the FULL set of 8 canonical
+    # blockReason values is documented. This mirrors the ChatResponse guard above (harmless dual-guard
+    # per ADR-059 §7) — losing any value fails on either surface.
     schema = openapi_schema["components"]["schemas"]["EffectivePolicyResponse"]
     reasons_field = schema["properties"]["reasons"]
     desc = reasons_field.get("description", "")
