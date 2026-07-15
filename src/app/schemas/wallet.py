@@ -23,6 +23,18 @@ class LedgerTxView(StrictModel):
 
 class WalletResponse(StrictModel):
     balance: int = Field(description="Текущий баланс кредитов.")
+    debt: int = Field(
+        description=(
+            "Непогашенная несписанная дельта агентного прогона в кредитах (ADR-051). 0 при "
+            "отсутствии долга или выключенном AGENT_DEBT_RECONCILE_ENABLED."
+        )
+    )
+    netBalance: int = Field(
+        description=(
+            "Эффективный баланс с учётом долга: balance − debt. Может быть < 0 при наличии "
+            "долга (клиент показывает как отрицательный баланс)."
+        )
+    )
     lastTransactions: list[LedgerTxView] = Field(
         description="Последние транзакции реестра (новые первыми)."
     )

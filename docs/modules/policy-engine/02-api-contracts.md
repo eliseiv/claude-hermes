@@ -12,6 +12,8 @@
   "isSubscribed": true,
   "trialRemaining": 0,
   "creditsBalance": 0,
+  "debt": 0,
+  "netBalance": 0,
   "byokEnabled": false,
   "canGenerateCreditsMode": true,
   "canGenerateByokMode": false,
@@ -22,7 +24,9 @@
 |---|---|---|
 | `isSubscribed` | bool | `subscription.status == active` |
 | `trialRemaining` | int | 1 если нет подписки и `trial_used=false`, иначе 0 |
-| `creditsBalance` | int | текущий баланс |
+| `creditsBalance` | int | текущий баланс, **всегда ≥0**, не меняется (обратная совместимость) |
+| `debt` | int | долг в кредитах (аддитивно, [ADR-063](../../adr/ADR-063-client-facing-debt-and-net-balance.md); колонка `wallets.debt`, [ADR-051](../../adr/ADR-051-agent-debt-reconciliation.md)): несписанная дельта агентного прогона, `≥0`. `0` при отсутствии долга или `AGENT_DEBT_RECONCILE_ENABLED=false`. Семантика едина с wallet/admin `debt`. Читается той же колонки `wallets.debt` в `effective()` — **`PolicyState` не меняется** (engine долгом не оперирует) |
+| `netBalance` | int | эффективный баланс (аддитивно, [ADR-063](../../adr/ADR-063-client-facing-debt-and-net-balance.md)): `creditsBalance − debt`, **может быть < 0** при наличии долга. Инвариант: флаг off → `debt=0` → `netBalance == creditsBalance`. Идентичен `netBalance` из `GET /v1/wallet` для того же пользователя |
 | `byokEnabled` | bool | `byok.enabled && key_status==valid` |
 | `canGenerateCreditsMode` | bool | результат `evaluate(state, mode=credits).allow` |
 | `canGenerateByokMode` | bool | результат `evaluate(state, mode=byok).allow` |

@@ -58,10 +58,12 @@ async def get_wallet(
     wallet: Annotated[WalletService, Depends(get_wallet_service)],
 ) -> WalletResponse:
     last_n = get_settings().wallet_last_transactions
-    # debt (ADR-051) is not part of the user-facing /v1/wallet contract — only the admin view.
-    balance, _debt, txs = await wallet.get_wallet_view(current.user_id, last_n)
+    # debt (ADR-051) surfaced to the client as additive debt/netBalance fields (ADR-063).
+    balance, debt, txs = await wallet.get_wallet_view(current.user_id, last_n)
     return WalletResponse(
         balance=balance,
+        debt=debt,
+        netBalance=balance - debt,
         lastTransactions=[
             LedgerTxView(
                 id=tx.id,

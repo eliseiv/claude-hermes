@@ -588,6 +588,14 @@ class HermesInstance(Base):
     last_active_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=_now
     )
+    # ADR-062 §1a: start of the CURRENT provisioning attempt (cold-start create_provisioning OR
+    # wake mark_provisioning) — the anchor for _is_stale_provisioning. Distinct from the immutable
+    # created_at (row-insert time, never advanced): for a woken instance created_at is hours/days
+    # old, so anchoring stale on it would falsely flag a live wake-wait. nullable (migration 0017
+    # backfills in-flight `provisioning` rows = created_at; a fresh attempt always sets it = now()).
+    provisioning_started_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=_now
     )

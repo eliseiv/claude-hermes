@@ -61,6 +61,10 @@ class _Row:
     container_id: str | None = None
     endpoint: str | None = None
     port: int | None = None
+    # ADR-062 §1a: anchor for _is_stale_provisioning (start of the CURRENT attempt). None → the
+    # manager falls back to created_at, preserving the original TD-031 stale semantics for crash
+    # residue; a fresh wake attempt stamps it = now() so a live wake-wait is NOT flagged stale.
+    provisioning_started_at: datetime.datetime | None = None
     created_at: datetime.datetime = field(
         default_factory=lambda: datetime.datetime.now(datetime.UTC)
     )
@@ -320,6 +324,70 @@ async def test_threshold_boundary_just_under_not_replayed() -> None:
     await mgr.ensure_running(uid)
     assert len(backend.provision_calls) == 0  # not replayed
     assert reg.touch_calls == 0  # fresh provisioning is no longer touch-only (ADR-056 §2)
+
+
+# ============================================================================
+# ADR-062 §1a (CRITICAL stale-anchor regression): a woken instance has an OLD created_at (original
+# provision, hours/days ago) but a FRESH provisioning_started_at (start of THIS wake attempt). The
+# stale check MUST anchor on provisioning_started_at, so the live wake-wait is NOT flagged stale.
+# If it anchored on created_at (the pre-ADR-062 behaviour), a concurrent ensure_running would take
+# the _replay_stale_provisioning branch and REMOVE the container the in-flight wake is polling.
+# ============================================================================
+@pytest.mark.asyncio
+async def test_stale_anchor_fresh_provisioning_started_at_over_old_created_at_not_stale() -> None:
+    reg, backend = FakeRegistry(), FakeRuntimeBackend()
+    mgr = _manager(reg, backend, _settings(stale_seconds=120))
+    uid = uuid.uuid4()
+    enc, dek, nonce = mgr._encrypt_key("seed-key-abcdef0123")
+    now = datetime.datetime.now(datetime.UTC)
+    reg.rows[uid] = _Row(
+        user_id=uid,
+        api_key_enc=enc,
+        encrypted_dek=dek,
+        nonce=nonce,
+        status="provisioning",
+        container_id="cid-woken",
+        endpoint=f"http://hermes-user-{uid}:{HERMES_API_PORT}",
+        # created_at is DAYS old (original provision); the CURRENT wake attempt just started.
+        created_at=now - datetime.timedelta(days=2),
+        provisioning_started_at=now,  # fresh anchor → live wake-wait, NOT stale
+    )
+
+    # A concurrent ensure_running observes the fresh provisioning row and must WAIT
+    # (_await_concurrent_ready), NOT replay. Simulate the wake owner reaching running on first read.
+    original_get = reg.get
+
+    async def _get_then_running(u: uuid.UUID) -> _Row | None:
+        row = await original_get(u)
+        if row is not None and row.status == "provisioning":
+            row.status = "running"
+        return row
+
+    reg.get = _get_then_running  # type: ignore[method-assign]
+
+    await mgr.ensure_running(uid)
+
+    # NOT stale (anchored on the fresh provisioning_started_at, not the 2-day-old created_at):
+    assert not mgr._is_stale_provisioning(reg.rows[uid]) or reg.rows[uid].status == "running"
+    assert len(backend.remove_calls) == 0  # the in-flight wake container is NOT torn down
+    assert len(backend.provision_calls) == 0  # NOT re-provisioned from scratch
+    assert reg.delete_calls == 0  # the row is NOT deleted (no replay)
+    assert reg.rows[uid].status == "running"  # the concurrent wake owner finished
+
+
+@pytest.mark.asyncio
+async def test_stale_anchor_old_created_at_null_anchor_still_stale_fallback() -> None:
+    # Defensive fallback: a `provisioning` row with a NULL anchor (pre-0017 residue) still uses
+    # created_at, so a genuinely old crash-residue row IS replayed (TD-031 preserved).
+    reg, backend = FakeRegistry(), FakeRuntimeBackend()
+    mgr = _manager(reg, backend, _settings(stale_seconds=120))
+    uid = _seed_provisioning(reg, mgr, age_seconds=300, container_id="cid-halfbaked")
+    assert reg.rows[uid].provisioning_started_at is None  # NULL anchor → fallback to created_at
+
+    await mgr.ensure_running(uid)
+
+    assert len(backend.remove_calls) == 1  # stale (via created_at fallback) → replayed
+    assert len(backend.provision_calls) == 1
 
 
 @pytest.mark.asyncio

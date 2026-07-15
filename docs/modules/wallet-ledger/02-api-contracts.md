@@ -5,11 +5,17 @@
 ```json
 {
   "balance": 0,
+  "debt": 0,
+  "netBalance": 0,
   "lastTransactions": [
     { "id": "uuid", "type": "credit|debit", "amount": 0, "createdAt": "ISO8601", "meta": {} }
   ]
 }
 ```
+- `balance` — текущий баланс, **всегда ≥0** (`CHECK (balance >= 0)`), не меняется (обратная совместимость).
+- `debt` (аддитивно, [ADR-063](../../adr/ADR-063-client-facing-debt-and-net-balance.md)) — долг в кредитах ([ADR-051](../../adr/ADR-051-agent-debt-reconciliation.md), колонка `wallets.debt`): несписанная дельта агентного прогона, `≥0`. `0` при отсутствии долга или `AGENT_DEBT_RECONCILE_ENABLED=false`. Семантика **едина** с `AdminWalletResponse.debt`. Источник — `WalletService.get_wallet_view` (уже возвращает `debt`).
+- `netBalance` (аддитивно, [ADR-063](../../adr/ADR-063-client-facing-debt-and-net-balance.md)) — эффективный баланс: `balance − debt`, **может быть < 0** при наличии долга (клиент показывает как отрицательный баланс). Инвариант: при `AGENT_DEBT_RECONCILE_ENABLED=false` → `debt=0` → `netBalance == balance`.
+- `debt`/`netBalance` идентичны одноимённым полям `GET /v1/policy/effective` для того же пользователя (единый источник — колонка `wallets.debt`).
 - `lastTransactions` — последние N (дефолт 20), по `created_at DESC`.
 - `meta` — без секретов (usage/model).
 

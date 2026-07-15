@@ -394,6 +394,17 @@ class Settings(BaseSettings):
     credits_per_1k_input: float = Field(default=1.0, alias="CREDITS_PER_1K_INPUT")
     credits_per_1k_output: float = Field(default=5.0, alias="CREDITS_PER_1K_OUTPUT")
 
+    # --- Hermes run-launch connect-only retry (ADR-062 §2, agent-proxy) ---
+    # Defense-in-depth for POST /v1/runs: on a CONNECT-phase transport error (the request is
+    # guaranteed not to have reached the server) _launch_run retries up to this many TOTAL attempts
+    # with a fixed backoff between them. attempts=1 disables retry (single attempt). Only the
+    # connect phase is retried — POST /v1/runs is NOT idempotent (no client key), so a post-send
+    # error must never be retried (double-run risk, ADR-062 §2). Per-instance, not secrets.
+    hermes_launch_retry_attempts: int = Field(default=3, alias="HERMES_LAUNCH_RETRY_ATTEMPTS")
+    hermes_launch_retry_backoff_seconds: float = Field(
+        default=2.0, alias="HERMES_LAUNCH_RETRY_BACKOFF_SECONDS"
+    )
+
     # --- Agent debt reconciliation (ADR-051) ---
     # Gate for the agent-run debt reconciliation: partial-debit + wallets.debt on a shortfall
     # (WalletService.consume), clawback on grant, and the policy-gate debt_outstanding block.

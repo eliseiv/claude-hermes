@@ -69,6 +69,10 @@ class _Row:
     container_id: str | None = None
     endpoint: str | None = None
     port: int | None = None
+    # ADR-062 §1a: anchor for _is_stale_provisioning — the START of the CURRENT provisioning attempt
+    # (set by create_provisioning on cold-start / mark_provisioning on wake). None by default so the
+    # manager falls back to created_at (pre-0017 / non-provisioning residue), preserving TD-031.
+    provisioning_started_at: datetime.datetime | None = None
     # TD-031: ensure_running reads created_at to detect a stale `provisioning` row. Fresh by default
     # (now()) so existing branch tests treat a provisioning row as a live concurrent provisioning.
     created_at: datetime.datetime = field(
@@ -86,6 +90,8 @@ class FakeRegistry:
         self.touch_calls = 0
         self.mark_running_calls = 0
         self.mark_stopped_calls = 0
+        self.mark_provisioning_calls = 0
+        self.mark_stopped_if_provisioning_calls = 0
 
     async def get(self, user_id: uuid.UUID) -> _Row | None:
         return self.rows.get(user_id)
@@ -105,9 +111,38 @@ class FakeRegistry:
             encrypted_dek=encrypted_dek,
             nonce=nonce,
             status="provisioning",
+            # ADR-062 §1a: cold-start create stamps the anchor = now() (mirrors registry func.now).
+            provisioning_started_at=datetime.datetime.now(datetime.UTC),
         )
         self.rows[user_id] = row
         return row
+
+    async def mark_provisioning(
+        self, user_id: uuid.UUID, *, provisioning_started_at: datetime.datetime
+    ) -> None:
+        # ADR-062 §1 step 3 (wake): stopped → provisioning, keeping container_id/endpoint/port and
+        # stamping the attempt anchor T. Records the call so wake tests can assert the arbiter step.
+        self.mark_provisioning_calls += 1
+        row = self.rows[user_id]
+        row.status = "provisioning"
+        row.provisioning_started_at = provisioning_started_at
+        row.last_active_at = datetime.datetime.now(datetime.UTC)
+
+    async def mark_stopped_if_provisioning(
+        self, user_id: uuid.UUID, *, provisioning_started_at: datetime.datetime
+    ) -> int:
+        # ADR-062 §1 step 7 / §1b: conditional re-hibernate guarded by attempt identity. Returns the
+        # affected rowcount (1 → still our attempt; 0 → a concurrent actor took the row).
+        self.mark_stopped_if_provisioning_calls += 1
+        row = self.rows.get(user_id)
+        if (
+            row is not None
+            and row.status == "provisioning"
+            and row.provisioning_started_at == provisioning_started_at
+        ):
+            row.status = "stopped"
+            return 1
+        return 0
 
     async def mark_running(
         self, user_id: uuid.UUID, *, container_id: str, endpoint: str, port: int | None = None

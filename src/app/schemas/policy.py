@@ -11,6 +11,18 @@ class EffectivePolicyResponse(StrictModel):
     isSubscribed: bool = Field(description="Есть ли активная подписка.")
     trialRemaining: int = Field(description="Остаток бесплатных пробных генераций (trial).")
     creditsBalance: int = Field(description="Текущий баланс кредитов (1 кредит = 1 сообщение).")
+    debt: int = Field(
+        description=(
+            "Непогашенная несписанная дельта агентного прогона в кредитах (ADR-051). 0 при "
+            "отсутствии долга или выключенном AGENT_DEBT_RECONCILE_ENABLED."
+        )
+    )
+    netBalance: int = Field(
+        description=(
+            "Эффективный баланс с учётом долга: creditsBalance − debt. Может быть < 0 при "
+            "наличии долга (клиент показывает как отрицательный баланс)."
+        )
+    )
     byokEnabled: bool = Field(
         description="Включён ли пользователем собственный ключ Anthropic (BYOK)."
     )

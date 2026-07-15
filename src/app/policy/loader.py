@@ -26,6 +26,7 @@ class EffectivePolicy:
     is_subscribed: bool
     trial_remaining: int
     credits_balance: int
+    debt: int
     byok_enabled: bool
     can_generate_credits_mode: bool
     can_generate_byok_mode: bool
@@ -83,6 +84,10 @@ async def load_policy_state(session: AsyncSession, user_id: uuid.UUID) -> Policy
 async def effective(session: AsyncSession, user_id: uuid.UUID) -> EffectivePolicy:
     """Compute /policy/effective using the same evaluate() as /chat/run (AC-6)."""
     state = await load_policy_state(session, user_id)
+    # ADR-063: surface debt/netBalance to the client. Same wallets.debt column as
+    # WalletService.current_debt → wallet↔policy consistency by construction. Read next to the
+    # engine, NOT inside PolicyState (engine.evaluate() does not operate on debt, ADR-051 §4).
+    debt = int(await session.scalar(select(Wallet.debt).where(Wallet.user_id == user_id)) or 0)
     credits_decision: Decision = evaluate(state, Mode.credits)
     byok_decision: Decision = evaluate(state, Mode.byok)
 
@@ -106,6 +111,7 @@ async def effective(session: AsyncSession, user_id: uuid.UUID) -> EffectivePolic
         is_subscribed=is_subscribed,
         trial_remaining=trial_remaining,
         credits_balance=state.credits_balance,
+        debt=debt,
         byok_enabled=byok_enabled_effective,
         can_generate_credits_mode=credits_decision.allow,
         can_generate_byok_mode=byok_decision.allow,

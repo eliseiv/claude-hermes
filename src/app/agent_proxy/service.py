@@ -12,6 +12,7 @@ forwards every event byte-for-event to the client and, on the terminal ``run.com
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -166,18 +167,48 @@ class AgentProxyService:
     async def _launch_run(
         self, endpoint: InstanceEndpoint, body: dict[str, Any]
     ) -> tuple[str, str]:
-        """POST {base}/v1/runs with the instance bearer; return (run_id, status). 502 on failure."""
+        """POST {base}/v1/runs with the instance bearer; return (run_id, status). 502 on failure.
+
+        ADR-062 §2 connect-only retry (defense-in-depth for the wake-gap / a transient connect
+        blip): on a CONNECT-phase transport error — the request is guaranteed NOT to have reached
+        the server — retry up to ``hermes_launch_retry_attempts`` TOTAL attempts with a fixed
+        backoff. POST /v1/runs is NOT idempotent (no client key), so ONLY the connect phase is safe
+        to retry; any post-send error (write/read/protocol) may have created a run and is re-raised
+        immediately as 502 (double-run risk). A fresh ``httpx.AsyncClient`` is used per attempt.
+        """
         url = f"{endpoint.base_url}/v1/runs"
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._settings.hermes_proxy_timeout_seconds
-            ) as client:
-                response = await client.post(
-                    url, json=body, headers=self._bearer_headers(endpoint.api_key)
-                )
-        except httpx.HTTPError as exc:
-            logger.warning("hermes run launch transport error")
-            raise UpstreamError("hermes instance unreachable") from exc
+        # ADR-062 §2: EXPLICIT tuple, NOT a base class. In httpx 0.28.1 ConnectTimeout is NOT a
+        # subclass of ConnectError (both connect-phase, but split under
+        # TimeoutException/NetworkError respectively); catching
+        # TimeoutException/NetworkError/TransportError would also swallow ReadTimeout/WriteError
+        # (post-send) → double-run risk. Match strictly the connect set.
+        connect_errors = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+        attempts = max(self._settings.hermes_launch_retry_attempts, 1)
+        response: httpx.Response | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.hermes_proxy_timeout_seconds
+                ) as client:
+                    response = await client.post(
+                        url, json=body, headers=self._bearer_headers(endpoint.api_key)
+                    )
+                break
+            except httpx.HTTPError as exc:
+                # Retry ONLY on a connect-phase error with attempts remaining; otherwise 502.
+                if isinstance(exc, connect_errors) and attempt < attempts:
+                    logger.warning(
+                        "hermes run launch connect error, retrying attempt=%d/%d",
+                        attempt,
+                        attempts,
+                    )
+                    await asyncio.sleep(self._settings.hermes_launch_retry_backoff_seconds)
+                    continue
+                logger.warning("hermes run launch transport error")
+                raise UpstreamError("hermes instance unreachable") from exc
+        if response is None:  # pragma: no cover - loop always breaks on success or raises
+            # Defensive: the loop breaks on success or raises on the final failed attempt.
+            raise UpstreamError("hermes instance unreachable")
 
         if not 200 <= response.status_code < 300:
             logger.warning("hermes run launch non-2xx status=%s", response.status_code)

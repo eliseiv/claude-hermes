@@ -28,6 +28,8 @@ async def policy_effective(current: CurrentUser, session: DbSession) -> Effectiv
         isSubscribed=result.is_subscribed,
         trialRemaining=result.trial_remaining,
         creditsBalance=result.credits_balance,
+        debt=result.debt,
+        netBalance=result.credits_balance - result.debt,
         byokEnabled=result.byok_enabled,
         canGenerateCreditsMode=result.can_generate_credits_mode,
         canGenerateByokMode=result.can_generate_byok_mode,

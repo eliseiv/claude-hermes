@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import datetime
 import uuid
+from typing import Any, cast
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,12 +65,67 @@ class HermesInstanceRegistry:
                 encrypted_dek=encrypted_dek,
                 nonce=nonce,
                 status="provisioning",
+                # ADR-062 §1a: anchor the stale check on the START of THIS provisioning attempt
+                # (not the immutable created_at). Cold-start create → now().
+                provisioning_started_at=func.now(),
             )
             .on_conflict_do_nothing(index_elements=[HermesInstance.user_id])
             .returning(HermesInstance)
         )
         result: HermesInstance | None = await self._session.scalar(stmt)
         return result
+
+    async def mark_provisioning(
+        self,
+        user_id: uuid.UUID,
+        *,
+        provisioning_started_at: datetime.datetime,
+    ) -> None:
+        """Move a ``stopped`` row to ``provisioning`` for a wake attempt (ADR-062 §1 step 3).
+
+        Sets ``provisioning_started_at`` to the caller-supplied attempt timestamp ``T`` (the
+        stale-anchor for THIS wake attempt, §1a) and re-stamps ``last_active_at``. Preserves
+        ``container_id``/``endpoint``/``port`` (the hibernated container is reused, NOT recreated),
+        unlike a cold-start insert. The committed ``provisioning`` row is then the race arbiter for
+        a concurrent ``ensure_running`` (ADR-062 §1 step 4).
+        """
+        await self._session.execute(
+            update(HermesInstance)
+            .where(HermesInstance.user_id == user_id)
+            .values(
+                status="provisioning",
+                provisioning_started_at=provisioning_started_at,
+                last_active_at=_utcnow(),
+            )
+        )
+
+    async def mark_stopped_if_provisioning(
+        self,
+        user_id: uuid.UUID,
+        *,
+        provisioning_started_at: datetime.datetime,
+    ) -> int:
+        """Conditionally re-hibernate a timed-out wake attempt (ADR-062 §1 step 7, §1b).
+
+        Guarded ``UPDATE … SET status='stopped' WHERE user_id AND status='provisioning' AND
+        provisioning_started_at=:T``: writes ONLY when the row is still THIS wake attempt (identity
+        guard by ``provisioning_started_at=T``). Returns the affected rowcount so the caller can
+        decide (1 → we still own the attempt: stop the container; 0 → a concurrent replay/provision
+        already took ownership and may have promoted a NEW ``running`` container: do NOT touch it,
+        else a healthy instance is clobbered — §1b MAJOR). ``container_id``/``endpoint`` are kept
+        (the container is valid; only the status reverts to ``stopped``).
+        """
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                update(HermesInstance)
+                .where(HermesInstance.user_id == user_id)
+                .where(HermesInstance.status == "provisioning")
+                .where(HermesInstance.provisioning_started_at == provisioning_started_at)
+                .values(status="stopped")
+            ),
+        )
+        return result.rowcount or 0
 
     async def mark_running(
         self,

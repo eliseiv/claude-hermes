@@ -125,19 +125,11 @@ class HermesInstanceManager:
             return await self._await_concurrent_ready(user_id)
 
         if row.status == "stopped":
-            container_ref = self._container_ref_from_row(row)
-            await self._backend.start(container_ref)
-            await self._registry.mark_running(
-                user_id,
-                container_id=container_ref.container_id,
-                endpoint=row.endpoint or container_ref.endpoint,
-                port=row.port,
-            )
-            logger.info("hermes instance woken user_id=%s", user_id)
-        else:
-            # running: just refresh the activity stamp.
-            await self._registry.touch_active(user_id)
+            # ADR-062 §1: wake behind a readiness-gate (short-transaction, own commit/poll cycle).
+            return await self._wake_locked(row)
 
+        # running: just refresh the activity stamp.
+        await self._registry.touch_active(user_id)
         await self._session.flush()
         return self._endpoint_from_row(await self._reload(user_id))
 
@@ -227,6 +219,78 @@ class HermesInstanceManager:
         )
         return InstanceEndpoint(base_url=container_ref.endpoint, api_key=api_key)
 
+    async def _wake_locked(self, row: HermesInstance) -> InstanceEndpoint:
+        """Wake a ``stopped`` instance behind the readiness-gate (ADR-062 §1). Short-transaction.
+
+        Flow (mirrors ``_provision_locked``'s gate on the wake path, ADR-062 §1):
+        0. ``T := now(UTC)`` — start of THIS wake attempt (the stale-anchor + the cleanup guard).
+        1-2. Under the held row-lock: ``RuntimeBackend.start`` the hibernated container (returns on
+             process start, NOT on api_server readiness).
+        3-4. ``mark_provisioning(user_id, provisioning_started_at=T)`` (``stopped → provisioning``,
+             keeping ``container_id``/``endpoint``/``port``) then ``commit`` — this RELEASES the
+             row-lock and makes the ``provisioning`` row the race arbiter (a concurrent
+             ``ensure_running`` waits via ``_await_concurrent_ready``). The lock is NEVER held
+             across the poll (ADR-054/ADR-056 §transactional-invariant).
+        5-6. ``_wait_for_ready`` polls ``health`` with NO DB held; on 200 → ``mark_running`` +
+             ``commit`` → return the endpoint.
+        7.   Timeout → CONDITIONAL re-hibernate guarded by attempt identity (§1b):
+             ``mark_stopped_if_provisioning(user_id, T)``. rowcount=1 (still our attempt) → stop the
+             (valid) container best-effort + ``commit``; rowcount=0 (a concurrent replay/provision
+             took the row, maybe a NEW ``running`` container) → leave row+container untouched +
+             ``rollback``. Either way raise ``UpstreamError`` → 502. The container is NOT removed
+             (a valid hibernated instance; volume/memory preserved) — the next request re-wakes.
+        """
+        user_id = row.user_id
+        container_ref = self._container_ref_from_row(row)
+        endpoint = row.endpoint or container_ref.endpoint
+        # Decrypt the bearer BEFORE the commit (returned to the caller on success; used only for
+        # the health probe otherwise). In-memory only — never persisted/logged (ADR-003 redaction).
+        api_key = self._decrypt_key(row)
+        attempt_started_at = datetime.datetime.now(datetime.UTC)
+
+        await self._backend.start(container_ref)
+        await self._registry.mark_provisioning(user_id, provisioning_started_at=attempt_started_at)
+        # ADR-062 §1 step 4: commit the provisioning arbiter, releasing the row-lock BEFORE polling.
+        await self._session.commit()
+
+        if await self._wait_for_ready(endpoint, api_key):
+            await self._registry.mark_running(
+                user_id,
+                container_id=container_ref.container_id,
+                endpoint=endpoint,
+                port=row.port,
+            )
+            await self._session.commit()
+            logger.info("hermes instance woken user_id=%s", user_id)
+            return InstanceEndpoint(base_url=endpoint, api_key=api_key)
+
+        # ADR-062 §1 step 7 / §1b: readiness timeout → conditional re-hibernate (identity guard T).
+        rows = await self._registry.mark_stopped_if_provisioning(
+            user_id, provisioning_started_at=attempt_started_at
+        )
+        if rows == 1:
+            # We still own this attempt → honest re-hibernate. Stop the (valid) container
+            # best-effort (a stop failure must not mask the timeout). No remove; volume/memory kept.
+            try:
+                await self._backend.stop(container_ref)
+            except UpstreamError:
+                logger.warning(
+                    "hermes wake cleanup: container stop failed after readiness timeout "
+                    "user_id=%s",
+                    user_id,
+                )
+            await self._session.commit()
+            logger.warning("hermes instance wake timed out, re-hibernated user_id=%s", user_id)
+        else:
+            # rowcount=0: a concurrent replay/provision already owns the row (possibly a NEW running
+            # container). Touching row or container would clobber a healthy instance (§1b MAJOR).
+            await self._session.rollback()
+            logger.warning(
+                "hermes instance wake timed out, row taken by concurrent actor user_id=%s",
+                user_id,
+            )
+        raise UpstreamError("hermes instance failed to become ready")
+
     async def stop_idle(self, threshold_seconds: int) -> int:
         """Stop running instances idle longer than the threshold (reaper). Returns the count.
 
@@ -275,16 +339,21 @@ class HermesInstanceManager:
     # --- internals ---------------------------------------------------------------------------
 
     def _is_stale_provisioning(self, row: HermesInstance) -> bool:
-        """True when a `provisioning` row is older than the stale threshold (TD-031).
+        """True when a `provisioning` row is older than the stale threshold (TD-031, ADR-062 §1a).
 
-        Anchored on ``created_at`` (the row-insert time, never advanced for a crashed provisioning
-        row — unlike ``last_active_at`` which mark_running/touch_active would move). A non-positive
-        threshold disables the replay (any provisioning row is treated as fresh).
+        Anchored on ``provisioning_started_at`` — the start of the CURRENT provisioning attempt
+        (set by ``create_provisioning`` on cold-start AND by ``mark_provisioning`` on wake), NOT on
+        the immutable ``created_at``. For a woken instance ``created_at`` is the ORIGINAL provision
+        time (hours/days ago); anchoring on it would falsely flag a live wake-wait as stale and let
+        a concurrent ``ensure_running`` replay-remove its in-flight container (ADR-062 §1a). Falls
+        back to ``created_at`` defensively when the anchor is NULL (pre-0017 rows / non-provisioning
+        residue). A non-positive threshold disables the replay (any provisioning row is fresh).
         """
         threshold = self._settings.hermes_provisioning_stale_seconds
         if threshold <= 0:
             return False
-        age = datetime.datetime.now(datetime.UTC) - row.created_at
+        anchor = row.provisioning_started_at or row.created_at
+        age = datetime.datetime.now(datetime.UTC) - anchor
         return age > datetime.timedelta(seconds=threshold)
 
     async def _replay_stale_provisioning(self, row: HermesInstance) -> None:

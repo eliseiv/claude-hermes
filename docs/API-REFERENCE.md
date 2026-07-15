@@ -248,13 +248,16 @@
 |---|---|---|
 | `isSubscribed` | bool | активная подписка |
 | `trialRemaining` | int | 1, если нет подписки и trial не использован; иначе 0 |
-| `creditsBalance` | int | текущий баланс кредитов |
+| `creditsBalance` | int | текущий баланс кредитов (**всегда ≥0**, не меняется — обратная совместимость) |
+| `debt` | int | долг в кредитах ([ADR-051](adr/ADR-051-agent-debt-reconciliation.md)): несписанная дельта агентного прогона. `0` при отсутствии долга или `AGENT_DEBT_RECONCILE_ENABLED=false`. Семантика едина с admin `debt` и wallet `debt` |
+| `netBalance` | int | эффективный баланс с учётом долга: `creditsBalance − debt`. **Может быть < 0** при наличии долга — клиент показывает как отрицательный баланс ([ADR-063](adr/ADR-063-client-facing-debt-and-net-balance.md)) |
 | `byokEnabled` | bool | BYOK включён и ключ валиден |
 | `canGenerateCreditsMode` | bool | можно ли генерировать в режиме credits |
 | `canGenerateByokMode` | bool | можно ли генерировать в режиме byok |
 | `reasons` | array | причины блокировки для недоступных режимов (подмножество blockReason **без** `rate_limited`) |
 
 > `rate_limited` в `reasons[]` не входит — это транспортный концерн (HTTP `429`), а не бизнес-policy.
+> **Долг ([ADR-063](adr/ADR-063-client-facing-debt-and-net-balance.md)):** `debt`/`netBalance` — аддитивные поля. При `AGENT_DEBT_RECONCILE_ENABLED=false` (или отсутствии долга) `debt=0` и `netBalance == creditsBalance`. `debt`/`netBalance` идентичны одноимённым полям `GET /v1/wallet` для того же пользователя (единый источник — `wallets.debt`).
 
 **Коды:** `200`; `401`; `429`; `5xx`.
 
@@ -270,8 +273,12 @@
 **Response (200):**
 | Поле | Тип | Прим. |
 |---|---|---|
-| `balance` | int | текущий баланс |
+| `balance` | int | текущий баланс (**всегда ≥0**, не меняется — обратная совместимость) |
+| `debt` | int | долг в кредитах ([ADR-051](adr/ADR-051-agent-debt-reconciliation.md)): несписанная дельта агентного прогона. `0` при отсутствии долга или `AGENT_DEBT_RECONCILE_ENABLED=false`. Семантика едина с admin `debt` (`GET /v1/admin/wallet/{userId}`) |
+| `netBalance` | int | эффективный баланс с учётом долга: `balance − debt`. **Может быть < 0** при наличии долга — клиент показывает как отрицательный баланс ([ADR-063](adr/ADR-063-client-facing-debt-and-net-balance.md)) |
 | `lastTransactions` | array `{ id, type, amount, createdAt, meta }` | последние N (дефолт 20), `type` ∈ `credit`\|`debit`; `meta` без секретов |
+
+> **Долг ([ADR-063](adr/ADR-063-client-facing-debt-and-net-balance.md)):** `debt`/`netBalance` — аддитивные поля. При `AGENT_DEBT_RECONCILE_ENABLED=false` (или отсутствии долга) `debt=0` и `netBalance == balance`. `debt`/`netBalance` идентичны одноимённым полям `GET /v1/policy/effective` для того же пользователя.
 
 **Коды:** `200`; `401`; `429`; `5xx`.
 
