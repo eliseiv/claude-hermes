@@ -274,6 +274,14 @@ class Settings(BaseSettings):
         default=32 * 1024 * 1024, alias="WORKSPACE_FILES_TOTAL_BYTES"
     )
     workspace_context_max_chars: int = Field(default=200_000, alias="WORKSPACE_CONTEXT_MAX_CHARS")
+    # Raised transport body limit applied ONLY to the workspace files collection path
+    # (/v1/workspaces/{id}/files). Inline base64 of a knowledge file (≤ WORKSPACE_FILE_MAX_BYTES
+    # = 8 MB) exceeds the general ≤512KB size_limit_body once base64-inflated (~4/3) + JSON
+    # envelope. 12 MB covers base64(8MB)≈10.67MB with headroom. Other routes keep size_limit_body.
+    # (ADR-060). Independent from attachment_request_body_limit (chat/run) by design.
+    workspace_request_body_limit: int = Field(
+        default=12 * 1024 * 1024, alias="WORKSPACE_REQUEST_BODY_LIMIT"
+    )
 
     # --- DB connection pool (02-tech-stack.md, sized for ~10k users / 2-3 replicas) ---
     # Per-process pool. Effective max conns ≈ (pool_size + max_overflow) * workers * replicas;

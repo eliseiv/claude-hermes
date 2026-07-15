@@ -36,7 +36,9 @@ Gateway не добавляет собственных бизнес-endpoint, к
 | POST DELETE | /v1/notifications/device-token | notifications | [link](../notifications/02-api-contracts.md) |
 
 > Расширение Figma-gap (2026-06-02): новые роуты модулей 10–17 (см. [figma-gap-analysis.md](../../figma-gap-analysis.md)). Все — под пользовательским JWT, изоляция по `sub`.
-> **Вложения (2026-06-03, [ADR-020](../../adr/ADR-020-inline-base64-attachments-mvp.md)):** на MVP мультимодальный ввод — **inline base64 в `POST /v1/chat/run`** (`application/json`), отдельного `/v1/attachments`-роута **нет**. У `/v1/chat/run` повышенный transport size-лимит (`ATTACHMENT_REQUEST_BODY_LIMIT`, дефолт 12 MB) — **только** у этого роута; остальные сохраняют JSON `≤512KB` ([05-security.md](../../05-security.md)). Двухшаговый `POST /v1/attachments` (`multipart/form-data`) отложен ([ADR-014](../../adr/ADR-014-multimodal-attachments.md) → [TD-015](../../100-known-tech-debt.md)).
+> **Вложения (2026-06-03, [ADR-020](../../adr/ADR-020-inline-base64-attachments-mvp.md)):** на MVP мультимодальный ввод — **inline base64 в `POST /v1/chat/run`** (`application/json`), отдельного `/v1/attachments`-роута **нет**. Двухшаговый `POST /v1/attachments` (`multipart/form-data`) отложен ([ADR-014](../../adr/ADR-014-multimodal-attachments.md) → [TD-015](../../100-known-tech-debt.md)).
+>
+> **Повышенный transport-лимит `SizeLimitMiddleware._limit_for` (набор правил, [ADR-060](../../adr/ADR-060-workspace-upload-transport-limit-alignment.md)):** inline base64-роуты получают повышенный per-route лимит, остальные сохраняют JSON `≤512KB` ([05-security.md](../../05-security.md)): (1) `/v1/chat/run` → `ATTACHMENT_REQUEST_BODY_LIMIT` (12 MB, ADR-020); (2) collection-путь `/v1/workspaces/{id}/files` (`startswith("/v1/workspaces/") ∧ endswith("/files")`) → `WORKSPACE_REQUEST_BODY_LIMIT` (12 MB, [ADR-060](../../adr/ADR-060-workspace-upload-transport-limit-alignment.md); НЕ матчит `/{id}/files/{file_id}`). Повышение НЕ глобальное — поверхность ограничена ровно этими роутами.
 
 ## Служебные endpoint
 | Метод | Путь | Auth | Ответ |

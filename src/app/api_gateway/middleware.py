@@ -30,10 +30,14 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
 class SizeLimitMiddleware:
     """Rejects bodies exceeding the limit with 413 (TD-017: streaming-safe, pure ASGI).
 
-    The general limit applies to all routes. /v1/chat/run gets a RAISED transport limit for
-    inline base64 attachments (ADR-020, 05-security.md): heavy multimodal payloads exceed the
-    general ≤512KB cap, so the raise is scoped to exactly that one route — the attack surface for
-    accepting a large payload is not widened globally.
+    The general limit applies to all routes. Two routes get a RAISED transport limit, each scoped
+    to exactly its path so the attack surface for a large payload is not widened globally:
+    - /v1/chat/run — inline base64 attachments (ADR-020, 05-security.md): heavy multimodal payloads
+      exceed the general ≤512KB cap.
+    - /v1/workspaces/{id}/files (collection path) — inline base64 of a knowledge file
+      (≤ WORKSPACE_FILE_MAX_BYTES = 8 MB) exceeds the general ≤512KB cap once base64-inflated plus
+      the JSON envelope (ADR-060). Matches POST upload + GET list; the per-file item path
+      /v1/workspaces/{id}/files/{file_id} keeps the general limit.
 
     Two guards (TD-017):
     1. Content-Length fast-path — an early reject BEFORE reading any body (unchanged HTTP-413
@@ -52,16 +56,23 @@ class SizeLimitMiddleware:
     """
 
     _CHAT_RUN_PATH = "/v1/chat/run"
+    _WORKSPACE_FILES_PREFIX = "/v1/workspaces/"
+    _WORKSPACE_FILES_SUFFIX = "/files"
 
     def __init__(self, app: ASGIApp) -> None:
         self._app = app
         settings = get_settings()
         self._limit = settings.size_limit_body
         self._chat_run_limit = settings.attachment_request_body_limit
+        self._workspace_upload_limit = settings.workspace_request_body_limit
 
     def _limit_for(self, path: str) -> int:
         if path == self._CHAT_RUN_PATH:
             return self._chat_run_limit
+        if path.startswith(self._WORKSPACE_FILES_PREFIX) and path.endswith(
+            self._WORKSPACE_FILES_SUFFIX
+        ):
+            return self._workspace_upload_limit
         return self._limit
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

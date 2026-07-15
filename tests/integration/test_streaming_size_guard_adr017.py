@@ -107,3 +107,91 @@ async def test_chat_run_chunked_over_raised_limit_returns_413(client: AsyncClien
     over = 12 * 1024 * 1024 + 256 * 1024
     r = await client.post("/v1/chat/run", content=_chunked(over), headers=_hdrs(uid))
     assert r.status_code == 413, r.text
+
+
+@pytest.mark.asyncio
+async def test_chat_run_chunked_just_under_raised_limit_not_413(client: AsyncClient) -> None:
+    # A body just under the 12MB chat/run cap must still pass transport (non-regression of ADR-060,
+    # which only touched the workspace path; the chat/run limit is unchanged).
+    uid = uuid.uuid4()
+    body = 12 * 1024 * 1024 - 256 * 1024  # ~11.75MB < 12MB
+    r = await client.post("/v1/chat/run", content=_chunked(body), headers=_hdrs(uid))
+    assert r.status_code != 413, r.text
+
+
+# ============================================================================
+# ADR-060 — workspace files COLLECTION path /v1/workspaces/{id}/files gets the raised 12MB transport
+# limit (inline base64 of a ≤8MB knowledge file exceeds the general ≤512KB cap once base64-inflated).
+# These transport-layer tests use chunked bodies (no Content-Length) and a random workspace id: they
+# assert only the middleware verdict (413 vs NOT-413) BEFORE the handler, so no DB/workspace is
+# needed. End-to-end 201 repro of the fixed prod bug lives in test_workspace_upload_body_limit_adr060.
+# ============================================================================
+def _ws_files_path(wid: uuid.UUID | None = None) -> str:
+    return f"/v1/workspaces/{wid or uuid.uuid4()}/files"
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_chunked_above_general_not_413(client: AsyncClient) -> None:
+    # ~645KB > general 512KB but << workspace 12MB → the raised per-route limit applies, so the
+    # transport guard must NOT fire (the request reaches auth/handler and is rejected there, ≠413).
+    # This is the direct transport-level repro of the fixed prod bug (413 on a ~484KB file).
+    uid = uuid.uuid4()
+    body = 645 * 1024
+    r = await client.post(_ws_files_path(), content=_chunked(body), headers=_hdrs(uid))
+    assert r.status_code != 413, r.text
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_chunked_near_8mb_cap_not_413(client: AsyncClient) -> None:
+    # base64(8MB) ≈ 10.67MB body: above general AND above chat-run-only concerns, still < 12MB
+    # workspace limit → passes transport (reaches ADR-036 validation, ≠413 at the middleware).
+    uid = uuid.uuid4()
+    body = 10_670 * 1024  # ~10.42MB, comfortably < 12MB
+    r = await client.post(_ws_files_path(), content=_chunked(body), headers=_hdrs(uid))
+    assert r.status_code != 413, r.text
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_chunked_over_12mb_returns_413(client: AsyncClient) -> None:
+    # Above the 12MB workspace limit → 413 payload_too_large at the transport middleware.
+    uid = uuid.uuid4()
+    over = 12 * 1024 * 1024 + 256 * 1024
+    r = await client.post(_ws_files_path(), content=_chunked(over), headers=_hdrs(uid))
+    assert r.status_code == 413, r.text
+    assert r.json()["error"]["code"] == "payload_too_large"
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_over_12mb_rejected_before_auth(client: AsyncClient) -> None:
+    # The transport guard runs OUTERMOST (before auth). An over-12MB body with NO auth headers must
+    # be 413 (middleware), never 401 — proving the reject is at transport, not the endpoint.
+    over = 12 * 1024 * 1024 + 256 * 1024
+    r = await client.post(_ws_files_path(), content=_chunked(over), headers={"content-type": _JSON_CT})
+    assert r.status_code == 413, r.text
+    assert r.json()["error"]["code"] == "payload_too_large"
+
+
+# ============================================================================
+# ADR-060 — the raise is scoped to the COLLECTION path only. The per-file ITEM path
+# /v1/workspaces/{id}/files/{file_id} and the workspace collection/detail paths keep the general
+# ≤512KB cap (first-match rule in _limit_for). A ~600KB body on those paths → 413.
+# ============================================================================
+@pytest.mark.asyncio
+async def test_workspace_file_item_path_keeps_general_limit_413(client: AsyncClient) -> None:
+    uid = uuid.uuid4()
+    over_general = _GENERAL_LIMIT + 100 * 1024  # ~612KB > 512KB, << 12MB
+    path = f"/v1/workspaces/{uuid.uuid4()}/files/{uuid.uuid4()}"
+    r = await client.post(path, content=_chunked(over_general), headers=_hdrs(uid))
+    assert r.status_code == 413, r.text
+    assert r.json()["error"]["code"] == "payload_too_large"
+
+
+@pytest.mark.asyncio
+async def test_non_workspace_post_600kb_still_413(client: AsyncClient) -> None:
+    # Non-regression: the general size_limit_body is UNCHANGED by ADR-060. A ~600KB body on an
+    # unrelated POST route still trips the general ≤512KB cap → 413.
+    uid = uuid.uuid4()
+    body = 600 * 1024  # > 512KB, < 12MB
+    r = await client.post("/v1/wallet/me", content=_chunked(body), headers=_hdrs(uid))
+    assert r.status_code == 413, r.text
+    assert r.json()["error"]["code"] == "payload_too_large"
