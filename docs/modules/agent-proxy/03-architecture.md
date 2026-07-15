@@ -28,10 +28,14 @@ sequenceDiagram
         AP->>HM: ensure_running(userId)
         HM-->>AP: InstanceEndpoint(base_url, api_key)
         AP->>I: POST /v1/runs (Bearer api_key) {input, session_id?, model?}
+        Note over AP,I: connect-error (ConnectError/ConnectTimeout/PoolTimeout, явный кортеж isinstance)<br/>→ retry до HERMES_LAUNCH_RETRY_ATTEMPTS с backoff (ADR-062)
+        Note over AP,I: post-send (ReadTimeout/ReadError/WriteError/WriteTimeout/RemoteProtocolError)<br/>→ БЕЗ retry → 502 (POST /v1/runs НЕ идемпотентен → анти-дубль-run)
         I-->>AP: 202 {run_id}
         AP-->>C: 202 {runId}
     end
 ```
+
+- **Connect-only retry `_launch_run` ([ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md)):** `POST /v1/runs` не идемпотентен (образ Hermes создаёт run на каждый вызов, без ключа) → retry допустим ТОЛЬКО на фазе установки соединения, где тело гарантированно не отправлено. **Retry (safe):** `isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))` — **явный кортеж, НЕ по базовому классу** (в httpx `ConnectTimeout` НЕ подкласс `ConnectError`; базы `TimeoutException`/`NetworkError`/`TransportError` захватили бы post-send `ReadTimeout`/`WriteError` → риск дубль-run). До `HERMES_LAUNCH_RETRY_ATTEMPTS` (дефолт `3`) попыток, backoff `HERMES_LAUNCH_RETRY_BACKOFF_SECONDS` (дефолт `2.0`с). **НЕ retry (post-send, риск дубль-run):** `httpx.WriteError`/`WriteTimeout`, `httpx.ReadError`/`ReadTimeout`, `httpx.RemoteProtocolError`, прочие `httpx.HTTPError`, а также non-2xx ответ → сразу `UpstreamError`/`502`. Это страховка поверх wake-readiness-gate ([ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md) §1): покрывает остаточную connect-гонку без дублей.
 
 ## SSE-ретрансляция + биллинг
 ```mermaid
@@ -55,7 +59,7 @@ sequenceDiagram
 ```
 
 ## Обработка ошибок ([ADR-045 §6](../../adr/ADR-045-hermes-as-agent-proxy.md))
-- Инстанс недоступен / `ensure_running` не поднял / health fail → `502`.
+- Инстанс недоступен / `ensure_running` не поднял / health fail → `502`. Транзиентная connect-ошибка `POST /v1/runs` (напр. остаточное окно wake) → connect-only retry перед `502` ([ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md), см. выше).
 - Hermes 4xx/5xx → проксируется как соответствующий технический код (не `200 blocked`).
 - Бизнес-blocked (policy) → только до прогона, `200 {status:blocked}`.
 - Разрыв SSL до `run.completed` → debit на этом соединении не выполнен; повторная подписка довыполнит (idempotency по `runId`); реконсиляция — [Q-047-2](../../99-open-questions.md).

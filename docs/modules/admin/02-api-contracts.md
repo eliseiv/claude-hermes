@@ -49,6 +49,56 @@ per source IP, конфигурируемо), `extra='forbid'`, тело ≤ 8 K
 - **Несуществующий userId → `404 {error.code:"user_not_found"}`** (admin-grant **не создаёт** пользователей — см. 03-architecture; обоснование ниже).
 - `reason` отсутствует/пустой → `422`.
 
+## POST /v1/admin/wallet/debit
+Списание кредитов с баланса пользователя (ручная коррекция баланса вниз). Новый эндпоинт ([ADR-061](../../adr/ADR-061-admin-wallet-debit.md)). Симметричен `credits/grant`: `credits/grant` начисляет, `wallet/debit` списывает.
+
+> **Семантика — списание на дельту**, НЕ установка абсолютного значения ([ADR-061 §Выбор семантики](../../adr/ADR-061-admin-wallet-debit.md)). Кейс «сделать чтобы осталось N»: оператор читает баланс через `GET /v1/admin/wallet/{userId}`, затем применяет `wallet/debit` на `current − N` (если N меньше) или `credits/grant` на `N − current` (если N больше). Триада `GET wallet` + `credits/grant` + `wallet/debit` даёт полный контроль коррекции.
+
+### Headers
+- `X-Admin-Token: <ADMIN_API_SECRET>` (обязателен).
+
+### Request
+```json
+{
+  "userId": "uuid",
+  "amount": 100,
+  "idempotencyKey": "string",
+  "reason": "string"
+}
+```
+- `userId` — UUID существующего пользователя (см. Правила §Несуществующий userId).
+- `amount` — целое **> 0** (BIGINT, целые кредиты). Сколько кредитов **списать**. `amount <= 0` → `422`.
+- `idempotencyKey` — непустая строка, `max_length` 128. Ключ идемпотентности списания (передаётся в `WalletService.consume(idempotency_key=...)`).
+- `reason` — **обязателен**, непустая строка, `max_length` 512. Пишется в audit `admin_debit` и `ledger_transactions.meta`.
+
+### Response (200)
+```json
+{
+  "newBalance": 900,
+  "ledgerTxId": "uuid",
+  "idempotentReplay": false
+}
+```
+Форма ответа идентична `credits/grant` (`AdminGrantResponse`; backend переиспользует её или объявляет alias `AdminDebitResponse` идентичной формы).
+- `newBalance` — баланс **после** списания.
+- `ledgerTxId` — id `ledger_transactions` (`type=debit`).
+- `idempotentReplay` — `true`, если ключ уже был использован с тем же payload (повторного списания не было).
+
+### Правила
+- Переиспользует `WalletService.consume(user_id, amount, idempotency_key, meta, session_id=None)` (`src/app/wallet/service.py`, метод `consume`) — атомарно (savepoint, [ADR-047 §6](../../adr/ADR-047-usage-based-billing-for-agent.md)), идемпотентно по `(user_id, idempotency_key)`, пишет `ledger_transactions(type=debit)` + audit `billing_debit`. `session_id=None` → списание вне чат-сессии (`consume` пропускает валидацию сессии). **Новый метод `WalletService` не требуется.**
+- `meta = {"source": "admin_debit", "reason": reason}`. `meta.source="admin_debit"` (≠ `"agent_run"`) → `_agent_reconcile_applies=False` → **обычный** savepoint-путь, `wallets.debt` **не** затрагивается (см. §Взаимодействие с debt).
+- **Дополнительно** пишется audit-событие `admin_debit` (actor=admin, `userId`, `amount`, `reason`, `idempotencyKey`, `ledgerTxId`, `idempotentReplay`) — сверх `billing_debit`, фиксирует admin-инициацию. **Секрет `X-Admin-Token` в audit не пишется.**
+- **Недостаточный баланс:** `amount > balance` → `409 {error.code:"insufficient_credits"}` (условный `UPDATE ... WHERE balance >= amount` матчит 0 строк → `InsufficientCreditsError`, savepoint-откат just-inserted debit-строки; баланс не тронут, orphan-строки нет). **НЕ clamp** — тихое занижение отвергнуто ([ADR-061 §3](../../adr/ADR-061-admin-wallet-debit.md)); оператор видит баланс через `GET wallet` и задаёт корректный `amount` (для обнуления — `amount = current balance`). `CHECK (balance >= 0)` соблюдён.
+- Идемпотентность: тот же `idempotencyKey` + тот же payload (`type=debit`, тот же `amount`) → тот же `ledgerTxId`, `idempotentReplay=true`, без повторного списания.
+- Тот же `idempotencyKey`, **другой** `amount` (или существующая строка с `type=credit`) → `409 conflict` («idempotency key reused with different payload», из `consume`), без списания.
+- **Несуществующий userId → `404 {error.code:"user_not_found"}`** (admin-debit **не создаёт** пользователей — тот же принцип, что `credits/grant`; см. §Обоснование ниже).
+- `reason` отсутствует/пустой → `422`. Лишнее поле (`extra='forbid'`) → `422`. Тело > 8 KB → `413`. Admin rate limit → `429`.
+
+### Взаимодействие с debt/clawback ([ADR-051](../../adr/ADR-051-agent-debt-reconciliation.md))
+- Admin-debit **ортогонален долгу**: `meta.source="admin_debit"` не проходит `_agent_reconcile_applies` → нет частичного списания, нет accrual `wallets.debt`, нет clawback. Списание **не читает и не изменяет** `wallets.debt`.
+- Долг растёт только из недобора агентного прогона ([ADR-051 §2.1](../../adr/ADR-051-agent-debt-reconciliation.md)) и гасится только clawback'ом на `grant` ([ADR-051 §3](../../adr/ADR-051-agent-debt-reconciliation.md)). Инвариант `debt >= 0` и семантика долга сохранены.
+- Коррекция **самого долга** оператором — вне scope ([Q-061-1](../99-open-questions.md)).
+
 ## POST /v1/admin/subscription/grant
 Ручная выдача/активация подписки пользователю без покупки через App Store/Adapty (саппорт/компенсация/тестовый доступ). Новый эндпоинт ([ADR-048 §2](../../adr/ADR-048-admin-credits-and-subscription-grant.md)).
 

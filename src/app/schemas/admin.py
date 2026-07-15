@@ -41,6 +41,27 @@ class AdminGrantResponse(StrictModel):
     )
 
 
+class AdminDebitRequest(StrictModel):
+    """Тело `POST /v1/admin/wallet/debit` (ADR-061): списание кредитов оператором на дельту.
+
+    Та же форма, что `AdminGrantRequest` (симметрия начисление/списание). Ответ —
+    переиспользует `AdminGrantResponse` (`{newBalance, ledgerTxId, idempotentReplay}`).
+    """
+
+    userId: uuid.UUID = Field(description="Идентификатор существующего пользователя.")
+    amount: int = Field(gt=0, description="Сколько кредитов списать (целое > 0).")
+    idempotencyKey: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Ключ идемпотентности списания.",
+    )
+    reason: str = Field(
+        min_length=1,
+        max_length=512,
+        description="Причина списания (обязательна).",
+    )
+
+
 class AdminSubscriptionGrantRequest(StrictModel):
     userId: uuid.UUID = Field(description="Идентификатор существующего пользователя.")
     plan: str = Field(

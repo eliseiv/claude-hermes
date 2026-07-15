@@ -17,10 +17,14 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.audit.service import EVENT_ADMIN_GRANT, AuditEvent, AuditService
-from app.errors import ConflictError, UserNotFoundError
+from app.audit.service import EVENT_ADMIN_DEBIT, EVENT_ADMIN_GRANT, AuditEvent, AuditService
+from app.errors import ConflictError, InsufficientCreditsError, UserNotFoundError
 from app.models import LedgerTransaction
-from app.observability.metrics import admin_grant_total, admin_subscription_grant_total
+from app.observability.metrics import (
+    admin_debit_total,
+    admin_grant_total,
+    admin_subscription_grant_total,
+)
 from app.subscription.service import AdminGrantResult as SubscriptionAdminGrantResult
 from app.subscription.service import SubscriptionService
 from app.wallet.service import WalletService
@@ -118,6 +122,71 @@ class AdminService:
             )
         )
         admin_grant_total.labels(result="success").inc()
+        return AdminGrantResult(
+            new_balance=result.new_balance,
+            ledger_tx_id=result.ledger_tx_id,
+            idempotent_replay=result.idempotent_replay,
+        )
+
+    async def debit(
+        self,
+        *,
+        user_id: uuid.UUID,
+        amount: int,
+        idempotency_key: str,
+        reason: str,
+    ) -> AdminGrantResult:
+        """Debit a user's wallet on behalf of an operator (ADR-061): manual downward correction.
+
+        Mirror of AdminService.grant. Reuses WalletService.consume verbatim (atomic savepoint,
+        idempotent by (user_id, idempotency_key), writes ledger debit + billing_debit audit).
+        meta.source="admin_debit" (NOT "agent_run") keeps consume on the plain savepoint path, so
+        wallets.debt is never touched (ADR-051 invariant preserved). session_id=None → consume
+        skips _validate_session (debit outside any chat session). amount > balance surfaces the
+        existing InsufficientCreditsError (savepoint-rolled-back, no orphan row) → 409
+        insufficient_credits (NOT clamped, NOT remapped to generic conflict). A reused key with a
+        different payload surfaces as 409 conflict. An extra admin_debit audit records the admin
+        initiation (actor=admin, reason); the X-Admin-Token secret is never part of any payload.
+        """
+        if not await self._user_exists(user_id):
+            admin_debit_total.labels(result="not_found").inc()
+            raise UserNotFoundError("user not found")
+        meta: dict[str, Any] = {"source": "admin_debit", "reason": reason}
+        try:
+            result = await self._wallet.consume(
+                user_id=user_id,
+                amount=amount,
+                idempotency_key=idempotency_key,
+                meta=meta,
+                session_id=None,
+            )
+        except InsufficientCreditsError:
+            # Must precede the base ConflictError handler: InsufficientCreditsError subclasses
+            # ConflictError (app/errors.py). Caught first so amount > balance emits result=
+            # "insufficient" and propagates unchanged as 409 insufficient_credits (ADR-061 §3).
+            admin_debit_total.labels(result="insufficient").inc()
+            raise
+        except ConflictError:
+            # Idempotency key reused with a different payload → 409 conflict (from consume).
+            admin_debit_total.labels(result="conflict").inc()
+            raise
+
+        await self._audit.record(
+            AuditEvent(
+                user_id=user_id,
+                event_type=EVENT_ADMIN_DEBIT,
+                payload={
+                    "actor": "admin",
+                    "userId": str(user_id),
+                    "amount": amount,
+                    "reason": reason,
+                    "idempotencyKey": idempotency_key,
+                    "ledgerTxId": str(result.ledger_tx_id),
+                    "idempotentReplay": result.idempotent_replay,
+                },
+            )
+        )
+        admin_debit_total.labels(result="success").inc()
         return AdminGrantResult(
             new_balance=result.new_balance,
             ledger_tx_id=result.ledger_tx_id,

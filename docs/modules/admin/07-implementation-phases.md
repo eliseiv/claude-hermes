@@ -13,8 +13,11 @@
 | ADM-9 | `POST /v1/admin/subscription/grant`: Pydantic-схема (`extra='forbid'`, `plan` непустой, `expiresAt` в будущем, `reason` непустой, `grantCredits` опц.); проверка существования `users(userId)` → `404`; вызов `SubscriptionService.admin_grant`; ответ `{status, plan, expiresAt, creditsGranted?, ledgerTxId?, idempotentReplay}`. | ADM-8 |
 | ADM-10 | Audit: новый `eventType=admin_subscription_grant` в каталоге Audit (без секрета). | ADM-9, Audit |
 | ADM-11 | Метрика `admin_subscription_grant_total{result=success|conflict|not_found}` (observability). | ADM-9 |
+| ADM-12 | `AdminService.debit(user_id, amount, idempotency_key, reason)` ([ADR-061](../../adr/ADR-061-admin-wallet-debit.md)): `_require_user_exists` → `404`; вызов `WalletService.consume(meta={"source":"admin_debit","reason":reason}, session_id=None)` (реюз, **без нового метода Wallet**); `except ConflictError` (вкл. `InsufficientCreditsError`) → метрика + re-raise (409 propagates). | ADM-3, Wallet |
+| ADM-13 | `POST /v1/admin/wallet/debit`: Pydantic-схема `AdminDebitRequest` (`extra='forbid'`, `amount>0`, `reason` непустой, `idempotencyKey` 1..128); вызов `AdminService.debit`; ответ формы `AdminGrantResponse` `{newBalance, ledgerTxId, idempotentReplay}` (реюз или alias `AdminDebitResponse`); `_enforce_admin_body_size` + `_enforce_admin_rate_limit`. `amount>balance` → `409 insufficient_credits`. | ADM-12 |
+| ADM-14 | Audit `eventType=admin_debit` в каталоге Audit (без секрета) + метрика `admin_debit_total{result=success|conflict|insufficient|not_found}` (observability). | ADM-12, Audit |
 
-> Фазы ADM-1..7 — реализованы (credits/grant + get-wallet). ADM-8..11 — спроектированы под [ADR-048](../../adr/ADR-048-admin-credits-and-subscription-grant.md), ожидают backend.
+> Фазы ADM-1..7 — реализованы (credits/grant + get-wallet). ADM-8..11 — спроектированы под [ADR-048](../../adr/ADR-048-admin-credits-and-subscription-grant.md); ADM-12..14 — под [ADR-061](../../adr/ADR-061-admin-wallet-debit.md); ожидают backend.
 >
-> Admin-модуль не дублирует биллинг/подписку — тонкая обёртка над существующими `WalletService.grant`/`get_wallet_view` и новым `SubscriptionService.admin_grant`
-> ([ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md), [ADR-009](../../adr/ADR-009-admin-token-auth.md), [ADR-048](../../adr/ADR-048-admin-credits-and-subscription-grant.md)).
+> Admin-модуль не дублирует биллинг/подписку — тонкая обёртка над существующими `WalletService.grant`/`consume`/`get_wallet_view` и новым `SubscriptionService.admin_grant`
+> ([ADR-006](../../adr/ADR-006-credit-billing-and-subscription-grant.md), [ADR-009](../../adr/ADR-009-admin-token-auth.md), [ADR-048](../../adr/ADR-048-admin-credits-and-subscription-grant.md), [ADR-061](../../adr/ADR-061-admin-wallet-debit.md)).

@@ -12,12 +12,15 @@
 - `POST /v1/admin/subscription/grant` — ручно активировать подписку (`plan`, `expiresAt`) пользователю `userId`,
   идемпотентно по `admin-sub-grant:{idempotencyKey}`, опц. начислить кредиты периода (`grantCredits`). Через
   `SubscriptionService.admin_grant()` ([ADR-048 §2](../../adr/ADR-048-admin-credits-and-subscription-grant.md)).
+- `POST /v1/admin/wallet/debit` — **списать** `amount>0` кредитов с баланса `userId` (коррекция вниз), идемпотентно по
+  `idempotencyKey`, с обязательным `reason`. Переиспользует `WalletService.consume(session_id=None, meta.source="admin_debit")`
+  ([ADR-061](../../adr/ADR-061-admin-wallet-debit.md)). Семантика — списание на дельту (не set-абсолют); `amount > balance` → `409 insufficient_credits`.
 - `GET /v1/admin/wallet/{userId}` — баланс + последние ledger-транзакции (read-only, для саппорта).
 - Изолированная admin-авторизация: `X-Admin-Token` ([ADR-009](../../adr/ADR-009-admin-token-auth.md)), зависимость `require_admin`.
-- Аудит `admin_grant` / `admin_subscription_grant`, отдельный rate limit, strict validation, size-лимиты.
+- Аудит `admin_grant` / `admin_subscription_grant` / `admin_debit`, отдельный rate limit, strict validation, size-лимиты.
 
 ## Out of scope
-- Мутации сверх начисления кредитов и выдачи подписки (нет admin-списания, нет правки BYOK/trial, нет удаления/создания пользователей).
+- Мутации сверх начисления/списания кредитов и выдачи подписки (нет set-абсолюта баланса, нет коррекции `wallets.debt` — [Q-061-1](../../99-open-questions.md); нет правки BYOK/trial, нет удаления/создания пользователей).
 - Admin-UI (только HTTP API).
 - Персональная идентичность/атрибуция конкретного оператора (actor — обезличенный `admin`, [Q-009-1](../../99-open-questions.md)).
 - Scope/least-privilege на уровне токена (один секрет = все admin-операции; разделение прав — [Q-009-1](../../99-open-questions.md)).
@@ -30,3 +33,4 @@
 - BR-ADM-3: `reason` обязателен и пишется в audit (`admin_grant` / `admin_subscription_grant`) (и в `ledger_transactions.meta`, без секретов).
 - BR-ADM-4: целевой `userId` **должен существовать** — ни одно admin-действие не создаёт пользователей (см. 03-architecture §Несуществующий userId).
 - BR-ADM-5: `subscription/grant` идемпотентен по `admin-sub-grant:{idempotencyKey}` (отдельное пространство ключей от `credits/grant` и StoreKit/Adapty), upsert `subscriptions(status=active)` атомарно с опц. начислением кредитов; повтор с тем же payload → `idempotentReplay=true`, без двойной мутации/начисления ([ADR-048 §2](../../adr/ADR-048-admin-credits-and-subscription-grant.md)).
+- BR-ADM-6: `wallet/debit` ([ADR-061](../../adr/ADR-061-admin-wallet-debit.md)) списывает через `WalletService.consume` (реюз, не прямой SQL), идемпотентно по `idempotencyKey`; `meta.source="admin_debit"` (≠ `agent_run`) → реконсиляция долга ([ADR-051](../../adr/ADR-051-agent-debt-reconciliation.md)) **не применяется**, `wallets.debt` не читается/не меняется. `amount > balance` → `409 insufficient_credits` (savepoint-откат, `CHECK balance>=0` соблюдён, НЕ clamp). Инвариант `balance == Σ(credit)−Σ(debit)` сохранён.

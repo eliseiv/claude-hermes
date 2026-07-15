@@ -15,12 +15,14 @@
 
 ## Изоляция инвариантов
 - `require_admin` не запускает provisioning ([ADR-007](../../adr/ADR-007-lazy-user-provisioning.md)) и не трогает `trial`.
-- Мутирующие admin-операции — начисление кредитов (`credits/grant`) и ручная выдача подписки (`subscription/grant`,
-  [ADR-048](../../adr/ADR-048-admin-credits-and-subscription-grant.md)). Admin-списания, правки BYOK/trial,
-  удаления/создания пользователей — отсутствуют (out of scope, [00-overview.md](00-overview.md)).
+- Мутирующие admin-операции — начисление кредитов (`credits/grant`), **списание/коррекция баланса** (`wallet/debit`,
+  [ADR-061](../../adr/ADR-061-admin-wallet-debit.md)) и ручная выдача подписки (`subscription/grant`,
+  [ADR-048](../../adr/ADR-048-admin-credits-and-subscription-grant.md)). Set-абсолют баланса, коррекция `wallets.debt`
+  ([Q-061-1](../../99-open-questions.md)), правки BYOK/trial, удаления/создания пользователей — отсутствуют (out of scope, [00-overview.md](00-overview.md)).
 
 ## Аудит
 - Каждый `credits/grant` → audit-событие `admin_grant` (actor=admin, `userId`, `amount`, `reason`, `idempotencyKey`, `ledgerTxId`).
+- Каждый `wallet/debit` → audit-событие `admin_debit` (actor=admin, `userId`, `amount`, `reason`, `idempotencyKey`, `ledgerTxId`, `idempotentReplay`) — сверх `billing_debit` (Wallet).
 - Каждый `subscription/grant` → audit-событие `admin_subscription_grant` (actor=admin, `userId`, `plan`, `expiresAt`, `reason`, `idempotencyKey`, `grantCredits`, `ledgerTxId?`).
 - Секрет `X-Admin-Token` в audit/логи не попадает.
 - `idempotencyKey` в audit **не редактируется** ([ADR-050](../../adr/ADR-050-redaction-idempotencykey-allowlist.md)) — это клиентский дедуп-ключ для трассируемости, НЕ секрет; carve-out из redaction-денилиста `*key*` (реальные key-секреты редактируются как прежде).

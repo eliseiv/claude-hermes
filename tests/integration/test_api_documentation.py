@@ -114,10 +114,11 @@ _ENDPOINT_TAG = {
     # Adapty webhook (ADR-029): visible under its own contour (adaptyWebhook), NOT the client
     # contour — excluded from _CLIENT_V1_OPERATIONS below and asserted by its own security test.
     ("/v1/billing/adapty/webhook", "post"): "Billing (Adapty)",
-    # Admin (ADR-009/048): 4 endpoints, all tag=Admin, authorized by adminToken only (see
+    # Admin (ADR-009/048/061): 5 endpoints, all tag=Admin, authorized by adminToken only (see
     # _ADMIN_PATHS) — excluded from the client-contour AND checks.
     ("/v1/admin/credits/grant", "post"): "Admin",
     ("/v1/admin/wallet/grant", "post"): "Admin",
+    ("/v1/admin/wallet/debit", "post"): "Admin",
     ("/v1/admin/subscription/grant", "post"): "Admin",
     ("/v1/admin/wallet/{userId}", "get"): "Admin",
     # Preview (ADR-059 §7 restored): PUBLIC (security=none) signed-link delivery — excluded from
@@ -163,11 +164,13 @@ _PUBLIC_PREVIEW = {("/v1/preview/{projectId}/{token}/{path}", "get")}
 
 # Admin endpoints (ADR-009): authorized by the isolated adminToken scheme, NOT the client contour.
 # ADR-048: credits/grant (canonical) + subscription/grant (new) join the wallet/grant alias.
+# ADR-061: wallet/debit (new) is the downward-correction counterpart to credits/grant.
 # Each NEW route is enumerated DIRECTLY so its adminToken-only security is asserted per-endpoint
 # (enumerated-contour guard) — not merely inferred from sharing the same router dependency.
 _ADMIN_PATHS = {
     ("/v1/admin/wallet/grant", "post"),
     ("/v1/admin/credits/grant", "post"),
+    ("/v1/admin/wallet/debit", "post"),
     ("/v1/admin/subscription/grant", "post"),
     ("/v1/admin/wallet/{userId}", "get"),
 }

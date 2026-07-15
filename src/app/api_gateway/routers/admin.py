@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.deps import client_ip, get_admin_service
 from app.errors import PayloadTooLargeError, RateLimitedError
 from app.schemas.admin import (
+    AdminDebitRequest,
     AdminGrantRequest,
     AdminGrantResponse,
     AdminLedgerTxView,
@@ -109,6 +110,39 @@ async def admin_wallet_grant(
     body: Annotated[AdminGrantRequest, Body()],
 ) -> AdminGrantResponse:
     return await _admin_credits_grant(request, admin, body)
+
+
+@router.post(
+    "/wallet/debit",
+    response_model=AdminGrantResponse,
+    summary="Списать кредиты у пользователя",
+    description=(
+        "Списывает кредиты у пользователя на дельту `amount` (ручная коррекция баланса вниз, "
+        "саппорт). Авторизация — заголовок `X-Admin-Token`. Идемпотентно по `idempotencyKey`: "
+        "повтор с тем же payload не спишет дважды (`idempotentReplay=true`); тот же ключ с другим "
+        "`amount` — `409 conflict`. `amount > balance` — `409 insufficient_credits` (без "
+        "занижения). Несуществующий `userId` — `404 user_not_found` (admin не создаёт "
+        "пользователей). Долг (`wallets.debt`, ADR-051) не затрагивается."
+    ),
+)
+async def admin_wallet_debit(
+    request: Request,
+    admin: Annotated[AdminService, Depends(get_admin_service)],
+    body: Annotated[AdminDebitRequest, Body()],
+) -> AdminGrantResponse:
+    _enforce_admin_body_size(request)
+    await _enforce_admin_rate_limit(request)
+    result = await admin.debit(
+        user_id=body.userId,
+        amount=body.amount,
+        idempotency_key=body.idempotencyKey,
+        reason=body.reason,
+    )
+    return AdminGrantResponse(
+        newBalance=result.new_balance,
+        ledgerTxId=result.ledger_tx_id,
+        idempotentReplay=result.idempotent_replay,
+    )
 
 
 @router.post(

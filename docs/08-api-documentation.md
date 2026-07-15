@@ -38,7 +38,7 @@ Swagger UI должен позволять тестировщику автори
 ### R2.2. `adminToken` — admin-auth (X-Admin-Token)
 - apiKey scheme: `type: apiKey`, `in: header`, `name: X-Admin-Token`, `scheme_name = adminToken`. Изолированный admin-секрет ([контракт admin](modules/admin/02-api-contracts.md), [05-security.md](05-security.md)).
 - В `description` scheme кратко (по-русски): «Изолированный admin-токен. Вставьте секрет в заголовок `X-Admin-Token` через Authorize. Пользовательский JWT admin-действия не авторизует».
-- **Требуется** для **всех** `/v1/admin/*` (`POST /v1/admin/credits/grant`, `POST /v1/admin/subscription/grant` ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)), `GET /v1/admin/wallet/{userId}`; `POST /v1/admin/wallet/grant` — переходный алиас `credits/grant`). До этой фичи admin-эндпоинты не имели объявленной scheme в OpenAPI → тестировщик не мог авторизоваться в Swagger UI; теперь у них значок замка `adminToken`.
+- **Требуется** для **всех** `/v1/admin/*` (`POST /v1/admin/credits/grant`, `POST /v1/admin/subscription/grant` ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)), `POST /v1/admin/wallet/debit` ([ADR-061](adr/ADR-061-admin-wallet-debit.md)), `GET /v1/admin/wallet/{userId}`; `POST /v1/admin/wallet/grant` — переходный алиас `credits/grant`). До этой фичи admin-эндпоинты не имели объявленной scheme в OpenAPI → тестировщик не мог авторизоваться в Swagger UI; теперь у них значок замка `adminToken`.
 - Механизм объявления — добавить scheme в OpenAPI-кастомизацию (рядом с дремлющим `bearerAuth` в `src/app/api_gateway/openapi_security.py` или в `custom_openapi()`); реальная проверка остаётся в `require_admin` ([ADR-009](adr/ADR-009-admin-token-auth.md), неизменна).
 
 ### R2.3. Публичные endpoint (без security, без замка)

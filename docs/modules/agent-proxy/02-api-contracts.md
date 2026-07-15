@@ -25,7 +25,7 @@
 - **202** (allowed): `{"runId": "string", "status": "queued|running"}` (proxy Hermes `run_id`→`runId`, `status`).
 - **200** (blocked, [ADR-004](../../adr/ADR-004-blocked-http-200.md)): `{"status": "blocked", "blockReason": "credits_empty|subscription_expired|trial_used|debt_outstanding"}`.
 - **401** — нет/неверный `X-API-Key` или нет/невалидный `X-User-Id`.
-- **502** — инстанс недоступен / `ensure_running` не поднял контейнер / Hermes 5xx.
+- **502** — инстанс недоступен / `ensure_running` не поднял контейнер / Hermes 5xx. Транзиентная connect-ошибка запуска (`POST /v1/runs`) ретраится ([ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md), connect-only) перед `502`; wake после гибернации теперь ждёт готовности `api_server` (readiness-gate wake, [ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md)) → устранён `502` «каждый 3–4-й запрос».
 
 #### Достижимый набор `blockReason` (credits-ветка)
 Источник истины по полному перечню `blockReason` — Policy Engine ([ADR-002](../../adr/ADR-002-access-policy-state-machine.md)). Агентный путь вызывает `evaluate(state, mode=credits)` **только** в `credits`-ветке ([ADR-047 §3](../../adr/ADR-047-usage-based-billing-for-agent.md)), поэтому фактически достижим строго следующий набор:

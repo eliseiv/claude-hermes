@@ -44,6 +44,13 @@ admin_subscription_grant_total = Counter(
     "Count of admin subscription-grant attempts by result.",
     ["result"],
 )
+# Admin wallet debit (ADR-061, ADM-14): operator credit-debit outcomes by result
+# (success | conflict | insufficient | not_found).
+admin_debit_total = Counter(
+    "admin_debit_total",
+    "Count of admin wallet-debit attempts by result.",
+    ["result"],
+)
 # Token purchase (ADR-015): consumable purchase outcomes by result
 # (granted | replay | unknown_product | invalid_transaction | forbidden).
 token_purchase_total = Counter(

@@ -50,6 +50,7 @@
 - **Ротация:** два активных секрета на grace-период — `ADMIN_API_SECRET` (основной) + опц. `ADMIN_API_SECRET_PREV`.
 - Защита admin-API: отдельный rate limit (дефолт 10 req/min per source IP), `extra='forbid'`, тело ≤ 8 KB.
 - `X-Admin-Token` — в redaction allowlist (никогда не логируется).
+- **Мутирующие admin-действия** (`POST /v1/admin/credits/grant`, `POST /v1/admin/subscription/grant` ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)), `POST /v1/admin/wallet/debit` ([ADR-061](adr/ADR-061-admin-wallet-debit.md))) — под тем же контуром `adminToken`, обязательный `reason`, идемпотентность по ledger `idempotency_key`, отдельное audit-событие (`admin_grant`/`admin_subscription_grant`/`admin_debit`, actor=admin, **без** секрета `X-Admin-Token`). `admin_debit` списывает через `WalletService.consume` (не прямой SQL) — атомарность/инвариант `balance == Σ(credit)−Σ(debit)` и `CHECK balance>=0` соблюдаются; `wallets.debt` ([ADR-051](adr/ADR-051-agent-debt-reconciliation.md)) не затрагивается.
 
 ## Adapty webhook-авторизация (изолированная, без HMAC-подписи payload, ADR-029)
 См. [ADR-029](adr/ADR-029-adapty-subscription-webhook.md), [modules/billing-adapty](modules/billing-adapty/README.md).

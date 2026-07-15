@@ -402,6 +402,8 @@
 Операторские/саппорт-действия. **Авторизация — только `X-Admin-Token`** (пользовательский JWT не подходит). Отдельный rate limit (дефолт 10 req/min per source IP), тело ≤ 8 KB, строгая валидация. Admin-эндпоинты **не** создают пользователей.
 
 > **Hermes-интеграция ([ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md)):** добавлены/уточнены два admin-эндпоинта. `POST /v1/admin/credits/grant` (= `wallet/grant`, реюз/переименование — приведение пути; контракт тела/ответа ниже идентичен) и **новый** `POST /v1/admin/subscription/grant` (ручная выдача подписки). Защита — тот же `X-Admin-Token` ([ADR-009](adr/ADR-009-admin-token-auth.md), неизменна).
+>
+> **Коррекция баланса ([ADR-061](adr/ADR-061-admin-wallet-debit.md)):** добавлен `POST /v1/admin/wallet/debit` — **списание** кредитов (симметрично `credits/grant`). Триада `GET wallet` + `credits/grant` + `wallet/debit` покрывает полную коррекцию баланса без прямого SQL.
 
 ### POST /v1/admin/subscription/grant (Hermes-интеграция, [ADR-048](adr/ADR-048-admin-credits-and-subscription-grant.md))
 Ручная выдача/активация подписки пользователю (доступ без покупки через App Store/Adapty).
@@ -437,6 +439,25 @@
 Каждое начисление пишет audit-событие `admin_grant` (без секрета токена).
 
 **Коды:** `200`; `401` (нет/неверный `X-Admin-Token`); `404` (`user_not_found` — admin не создаёт пользователей); `409` (тот же `idempotencyKey`, другой `amount`); `422` (нет `reason` / `amount ≤ 0` / схема); `429` (admin rate limit); `5xx`.
+
+### POST /v1/admin/wallet/debit ([ADR-061](adr/ADR-061-admin-wallet-debit.md))
+Ручное **списание** кредитов с баланса пользователя (коррекция баланса вниз). Симметрично `credits/grant`. Семантика — списание на дельту, НЕ set-абсолют ([ADR-061](adr/ADR-061-admin-wallet-debit.md)). «Сделать чтобы осталось N»: прочитать баланс через `GET /v1/admin/wallet/{userId}` → `debit` на `current − N` (или `credits/grant` на `N − current`).
+
+**Заголовки:** `X-Admin-Token: <ADMIN_API_SECRET>` (обязателен), `Content-Type: application/json`.
+
+**Request:**
+| Поле | Тип | Прим. |
+|---|---|---|
+| `userId` | string (uuid) | существующий пользователь |
+| `amount` | int > 0 | целые кредиты для списания; `≤ 0` → `422` |
+| `idempotencyKey` | string (≤ 128) | ключ идемпотентности списания |
+| `reason` | string (≤ 512) | **обязателен**; пишется в audit `admin_debit` и meta |
+
+**Response (200):** `{ "newBalance": int, "ledgerTxId": "uuid", "idempotentReplay": bool }` (форма `AdminGrantResponse`). `newBalance` — баланс после списания; `ledgerTxId` — id debit-транзакции.
+
+**Правила:** реюз `WalletService.consume(session_id=None, meta.source="admin_debit")` — атомарно/идемпотентно, пишет `ledger_transactions(type=debit)` + audit `billing_debit` + `admin_debit`. `wallets.debt` **не** затрагивается ([ADR-051](adr/ADR-051-agent-debt-reconciliation.md); source ≠ `agent_run`).
+
+**Коды:** `200`; `401` (нет/неверный `X-Admin-Token`); `404` (`user_not_found`); `409` (`insufficient_credits` — `amount > balance`, НЕ clamp; либо тот же `idempotencyKey` с другим payload); `422` (нет `reason` / `amount ≤ 0` / схема); `413` (тело > 8 KB); `429` (admin rate limit); `5xx`.
 
 ### GET /v1/admin/wallet/{userId}
 Read-only просмотр кошелька для саппорта.

@@ -34,6 +34,10 @@ EVENT_TOOL_CALL_INITIATED = "tool_call_initiated"
 EVENT_TOOL_CALL_COMPLETED = "tool_call_completed"
 EVENT_ADMIN_GRANT = "admin_grant"
 EVENT_ADMIN_SUBSCRIPTION_GRANT = "admin_subscription_grant"
+# ADR-061 §2: admin wallet debit initiation (actor=admin). Written by AdminService.debit in
+# addition to the billing_debit that WalletService.consume already records. Never carries the
+# X-Admin-Token secret.
+EVENT_ADMIN_DEBIT = "admin_debit"
 
 
 @dataclass(frozen=True)

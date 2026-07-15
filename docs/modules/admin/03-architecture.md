@@ -53,8 +53,9 @@ Admin-grant **не создаёт** пользователей (обоснова
 - `grant`: вызывается **как есть** (`src/app/wallet/service.py:174`); сигнатура `grant(user_id, amount, idempotency_key, meta, reason)`,
   идемпотентна по `(user_id, idempotency_key)`, пишет ledger credit + audit `billing_credit`. `meta` admin-grant включает
   `{"source": "admin", "reason": reason}` (без секретов).
+- `consume`: для `POST /v1/admin/wallet/debit` ([ADR-061](../../adr/ADR-061-admin-wallet-debit.md)) вызывается **как есть** (метод `consume` в `src/app/wallet/service.py`); сигнатура `consume(user_id, amount, idempotency_key, meta, session_id=None)`, идемпотентна по `(user_id, idempotency_key)`, savepoint-атомарна, пишет ledger debit + audit `billing_debit`. `meta` admin-debit = `{"source": "admin_debit", "reason": reason}` → `_agent_reconcile_applies=False` → обычный путь, `wallets.debt` не затрагивается. `session_id=None` → без валидации сессии. `amount > balance` → `InsufficientCreditsError` → `409 insufficient_credits` (savepoint-откат). **Новый метод Wallet не требуется.**
 - `get_wallet_view`: для `GET /v1/admin/wallet/{userId}`.
-- Admin-модуль **не** дублирует биллинг-логику — только тонкая обёртка (auth + проверка userId + дополнительный audit `admin_grant`).
+- Admin-модуль **не** дублирует биллинг-логику — только тонкая обёртка (auth + проверка userId + дополнительный audit `admin_grant`/`admin_debit`).
 
 ## Защита
 - Отдельный rate limit на `/v1/admin/*` (per source IP, дефолт 10 req/min, env-конфиг). Изолирован от пользовательских лимитов.

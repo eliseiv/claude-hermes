@@ -5,6 +5,7 @@
   не таймингом). Совпадение с `ADMIN_API_SECRET_PREV` (ротация) → проходит. Пустые секреты в конфиге не матчатся.
 - Pydantic-схема credits/grant: `amount<=0` → `422`; пустой/отсутствующий `reason` → `422`; лишнее поле (`extra='forbid'`) → `422`.
 - Pydantic-схема subscription/grant: пустой `plan` → `422`; `expiresAt` в прошлом/`now()` → `422`; пустой/отсутствующий `reason` → `422`; лишнее поле → `422`; `grantCredits` опц. (дефолт `false`).
+- Pydantic-схема wallet/debit ([ADR-061](../../adr/ADR-061-admin-wallet-debit.md)): `amount<=0` → `422`; пустой/отсутствующий `reason` → `422`; лишнее поле (`extra='forbid'`) → `422`; `idempotencyKey` пустой/> 128 → `422`.
 
 ## Integration (реальный PostgreSQL)
 - `credits/grant` на существующем `userId` → `ledger_transactions(type=credit)`, баланс += amount, `idempotentReplay=false`.
@@ -24,6 +25,15 @@
 - **Атомарность `subscription/grant`:** при искусственном сбое после upsert и до grant — полный откат (ни активной подписки, ни кредитов).
 - После `subscription/grant` последующий `POST /v1/agent/run` проходит policy-gate (активная подписка) — e2e.
 - audit: успешный `subscription/grant` создаёт `admin_subscription_grant` (при grantCredits=true — дополнительно `billing_credit`). Секрет в payload отсутствует.
+- **`wallet/debit`** ([ADR-061](../../adr/ADR-061-admin-wallet-debit.md)) на существующем `userId` с балансом ≥ `amount` → `ledger_transactions(type=debit, meta.source="admin_debit")`, баланс −= `amount`, `idempotentReplay=false`, `newBalance` корректен.
+- **Кейс «сделать чтобы осталось N»:** начислить/иметь `balance=B`, затем `wallet/debit` на `B − N` → `newBalance == N` (композиция с `GET wallet`).
+- **Обнуление:** `wallet/debit` с `amount == balance` → `newBalance == 0`, `CHECK balance>=0` соблюдён.
+- **Идемпотентность:** повторный `wallet/debit` тот же `idempotencyKey` + payload → `idempotentReplay=true`, баланс не меняется, тот же `ledgerTxId` (списание не удваивается).
+- **Недостаточный баланс:** `wallet/debit` с `amount > balance` → `409 {error.code:"insufficient_credits"}`, баланс **не тронут**, orphan debit-строки в ledger **нет** (savepoint-откат), НЕ clamp.
+- Тот же `idempotencyKey`, другой `amount` (или ключ ранее использован для `credit`) → `409 conflict`, без списания.
+- Несуществующий `userId` → `404 user_not_found`, строка `users` не создана.
+- **audit:** успешный `wallet/debit` создаёт **и** `billing_debit` (Wallet), **и** `admin_debit` (Admin, actor=admin, reason, без секрета).
+- **Взаимодействие с debt ([ADR-051](../../adr/ADR-051-agent-debt-reconciliation.md)):** при `wallets.debt > 0` `wallet/debit` списывает **только** `balance` (обычный путь), `debt` **не** меняется (ни accrual, ни clawback), `admin_debit` не пишет debt-полей; проверить при `AGENT_DEBT_RECONCILE_ENABLED=true` и `=false` — поведение идентично (source ≠ `agent_run`).
 
 ## Security
 - Пользовательский JWT/клиентский `X-API-Key` на `/v1/admin/*` (без `X-Admin-Token`) → `401` (клиентская auth не авторизует admin).
