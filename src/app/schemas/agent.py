@@ -48,6 +48,14 @@ class AgentRunResponse(StrictModel):
         default=None,
         description="Идентификатор прогона Hermes (`run_id`). Есть только при не-blocked ответе.",
     )
+    continuedFrom: str | None = Field(
+        default=None,
+        description=(
+            "ADR-064: при ответе на `POST /v1/agent/runs/{runId}/resume` — `run_id` "
+            "приостановленного прогона, продолжением которого является новый `runId`. "
+            "Отсутствует (`null`) для обычного запуска `POST /v1/agent/run`."
+        ),
+    )
     blockReason: str | None = Field(
         default=None,
         description=(
@@ -56,6 +64,19 @@ class AgentRunResponse(StrictModel):
             "(ADR-051) — достижим только на агентном пути под AGENT_DEBT_RECONCILE_ENABLED "
             "(дефолт true); входит в enum безусловно (ADR-051 §4)."
         ),
+    )
+
+
+class AgentResumeRequest(StrictModel):
+    """Тело `POST /v1/agent/runs/{runId}/resume` — возобновление прогона (ADR-064).
+
+    `message` (опц.) — дополнительный ход пользователя, добавляемый при продолжении. Если не задан,
+    прогон продолжается с восстановленным контекстом сессии без нового пользовательского ввода.
+    """
+
+    message: str | None = Field(
+        default=None,
+        description="Опциональный дополнительный ход пользователя при возобновлении.",
     )
 
 

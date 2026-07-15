@@ -2,6 +2,7 @@
 
 - Статус: Accepted
 - Дата: 2026-06-23
+- **Расширен/частично-ревизован 2026-07-15 → [ADR-064](ADR-064-incremental-agent-run-billing-and-pause-resume.md):** биллинг агентного пути переведён на **incremental** (per-step на `usage.delta`, idempotency `runId:step`; `run.completed`→финализация остатка) под флагом `agent_incremental_billing_enabled`. Схема «cumulative-owed минус charged» телескопирует **точно** в сумму §2 `usage_to_credits(final)`. OFF → поведение этого ADR (постфактум) без изменений. §6 сохранён. Тело не переписано (immutability).
 - Связан с: [ADR-006](ADR-006-credit-billing-and-subscription-grant.md) (**расширяет / частично-суперсидит для `/v1/agent/*`**), [ADR-005](ADR-005-idempotency-ledger.md) (idempotency-ledger), [ADR-002](ADR-002-access-policy-state-machine.md) (policy state machine), [ADR-004](ADR-004-blocked-http-200.md) (blocked HTTP 200), [ADR-045](ADR-045-hermes-as-agent-proxy.md) (agent-proxy), [03-data-model.md](../03-data-model.md), [modules/wallet-ledger/](../modules/wallet-ledger/README.md), [modules/agent-proxy/](../modules/agent-proxy/README.md)
 
 ## Context

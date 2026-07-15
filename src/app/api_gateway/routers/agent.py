@@ -16,7 +16,12 @@ from fastapi.responses import StreamingResponse
 
 from app.agent_proxy.service import AgentProxyService
 from app.deps import CurrentUser, get_agent_proxy_service
-from app.schemas.agent import AgentApprovalRequest, AgentRunRequest, AgentRunResponse
+from app.schemas.agent import (
+    AgentApprovalRequest,
+    AgentResumeRequest,
+    AgentRunRequest,
+    AgentRunResponse,
+)
 
 router = APIRouter(prefix="/v1/agent", tags=["Agent"])
 
@@ -108,9 +113,14 @@ async def agent_run(
     description=(
         "Ретранслирует события Hermes-инстанса как Server-Sent Events: "
         "`run.queued`/`run.running`/`message.delta`/`tool.started`/`tool.completed`/"
-        "`approval.request`/`run.completed`/`run.failed`. На `run.completed{usage}` кредиты "
-        "списываются по реальному usage (идемпотентно по `runId`); на `run.failed` — без "
-        "списания. На `approval.request` ответьте через `POST /v1/agent/runs/{runId}/approval`."
+        "`approval.request`/`usage.delta`/`run.completed`/`run.failed`. На `run.completed{usage}` "
+        "кредиты списываются по реальному usage (идемпотентно по `runId`); на `run.failed` — без "
+        "списания. На `approval.request` ответьте через `POST /v1/agent/runs/{runId}/approval`.\n\n"
+        "ADR-064 (под флагом `AGENT_INCREMENTAL_BILLING_ENABLED`): на каждом `usage.delta` кредиты "
+        "списываются пошагово (кумулятивно, без долга); при исчерпании баланса прогон "
+        "останавливается и приходит синтетическое терминальное событие `run.paused` "
+        "(`reason=credits_exhausted`) — `run.completed` НЕ следует. После пополнения возобновите "
+        "через `POST /v1/agent/runs/{runId}/resume`."
     ),
     responses={
         200: {
@@ -131,6 +141,65 @@ async def agent_run_events(
         stream,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+_RESUME_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": "Блокировка по бизнес-правилам (HTTP 200, ADR-004): баланс пуст/долг.",
+        "model": AgentRunResponse,
+    },
+    202: {
+        "description": (
+            "Прогон возобновлён: НОВЫЙ `runId` + `continuedFrom` (исходный приостановленный "
+            "`runId`). Подпишитесь на `GET /v1/agent/runs/{runId}/events` нового прогона."
+        ),
+        "model": AgentRunResponse,
+    },
+    401: {"description": "Нет/неверный `X-API-Key` или нет/невалидный `X-User-Id`."},
+    404: {"description": "Прогон не найден или принадлежит другому пользователю (RBAC)."},
+    409: {
+        "description": (
+            "`run_not_resumable` (не в статусе paused/resumed) | `resume_in_progress` "
+            "(конкурентное возобновление в процессе — повторите) | `session_expired` "
+            "(контекст сессии Hermes недоступен)."
+        )
+    },
+    502: {"description": "Инстанс недоступен / запуск продолжения не удался (CAS откачен)."},
+}
+
+
+@router.post(
+    "/runs/{run_id}/resume",
+    response_model=AgentRunResponse,
+    summary="Возобновить приостановленный прогон",
+    description=(
+        "ADR-064: возобновляет прогон, остановленный из-за исчерпания баланса (`run.paused`). "
+        "После пополнения запускает НОВЫЙ прогон-продолжение в той же Hermes-сессии (память и "
+        "контекст сохраняются) и возвращает HTTP 202 с новым `runId` и `continuedFrom`. Если "
+        "баланс всё ещё пуст/в долге — HTTP 200 с `blockReason` (продолжение не запускается). "
+        "`session_id` клиенту хранить не нужно — он резолвится по приостановленному `runId`."
+    ),
+    responses=_RESUME_RESPONSES,
+)
+async def agent_run_resume(
+    run_id: str,
+    current: CurrentUser,
+    service: _AgentService,
+    response: Response,
+    body: AgentResumeRequest,
+) -> AgentRunResponse:
+    result = await service.resume(user_id=current.user_id, run_id=run_id, message=body.message)
+    if result.blocked:
+        # Business block is a 200 success (ADR-004), not an error.
+        response.status_code = status.HTTP_200_OK
+        return AgentRunResponse(status="blocked", runId=None, blockReason=result.block_reason)
+    response.status_code = status.HTTP_202_ACCEPTED
+    return AgentRunResponse(
+        status="running",
+        runId=result.run_id,
+        continuedFrom=result.continued_from,
+        blockReason=None,
     )
 
 

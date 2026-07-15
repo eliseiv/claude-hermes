@@ -414,6 +414,19 @@ class Settings(BaseSettings):
     # set of blockReason ALWAYS includes debt_outstanding (agent-proxy/02, ADR-051 §4).
     agent_debt_reconcile_enabled: bool = Field(default=True, alias="AGENT_DEBT_RECONCILE_ENABLED")
 
+    # --- Agent incremental billing + pause/resume (ADR-064) ---
+    # Master gate for the incremental (per-step) agent-run billing, pause-at-zero (run.paused) and
+    # resume (continuation) contour. Default false => the ADR-047 post-hoc behaviour holds
+    # (single debit on run.completed, no agent_runs rows, resume unavailable) — a safe rollout.
+    # When true: run() creates the root agent_runs row; stream_events() bills each usage.delta
+    # (cumulative-owed-minus-charged, ADR-064 §1), stops at zero balance with a synthetic
+    # run.paused (no debt, ADR-064 §3), and POST /v1/agent/runs/{runId}/resume continues the run
+    # in the same Hermes session. Requires the Hermes image patch (usage.delta + hydrate endpoint,
+    # ADR-064 §7); without it the flag-off post-hoc path is unaffected. Per-instance, not a secret.
+    agent_incremental_billing_enabled: bool = Field(
+        default=False, alias="AGENT_INCREMENTAL_BILLING_ENABLED"
+    )
+
     # --- Observability ---
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     otel_exporter_otlp_endpoint: str = Field(default="", alias="OTEL_EXPORTER_OTLP_ENDPOINT")

@@ -43,6 +43,12 @@ from app.observability.metrics import wallet_debit_total
 # InsufficientCreditsError → 409 semantics).
 _AGENT_RUN_SOURCE = "agent_run"
 
+# ADR-064 §4: sentinel ledger_tx_id for the incremental-clamp result when NO ledger row was written
+# (balance already 0 → nothing to charge). Never persisted/read — the incremental caller
+# (_bill_step) only reads ``charged_amount``/``idempotent_replay`` from that path. A nil UUID keeps
+# ``uuid.UUID`` (non-optional) so the standard debit/grant callers are unaffected.
+_NIL_TX_ID = uuid.UUID(int=0)
+
 
 class _RetryNormalPath(Exception):
     """Internal signal: the agent-reconcile savepoint hit a concurrent-debit race; roll it back and
@@ -54,6 +60,12 @@ class ConsumeResult:
     new_balance: int
     ledger_tx_id: uuid.UUID
     idempotent_replay: bool
+    # ADR-064 §4: credits ACTUALLY decremented by this call. Equals the requested amount on the
+    # standard debit path; on the incremental self-clamp path it is the real balance delta
+    # (< amount in a concurrent-chat-debit race, 0 on replay / drained balance). Read by the agent
+    # per-step biller so ``charged`` / the agent_runs mirror stay consistent with the ledger. Other
+    # callers ignore it (default 0).
+    charged_amount: int = 0
 
 
 @dataclass(frozen=True)
@@ -107,6 +119,28 @@ class WalletService:
         """Read the current wallet debt (0 if no row). ADR-051: accumulated uncharged agent-run
         delta in credits. Used by the policy-gate (debt_outstanding) and the admin wallet view."""
         return await self._current_debt(user_id)
+
+    async def charged_for_run(self, user_id: uuid.UUID, run_id: str) -> int:
+        """Sum the credits already debited for an agent run (ADR-064 §6, reconnect-safe seed).
+
+        Sums ``ledger.amount`` over this run's debit rows: the finalization key (bare ``run_id``)
+        OR any per-step key (``run_id:<step>``). The per-step keys are matched with a LIKE on the
+        run_id prefix; ``%``/``_``/``\\`` in the Hermes ``run_id`` (a string, not a UUID) are
+        ESCAPEd so a run_id containing a LIKE metacharacter cannot cause a false match (which would
+        inflate ``charged`` → under-bill). Used to re-seed ``charged`` at the start of the SSE relay
+        (and on a fresh resume run) so a re-subscription does not re-charge already-billed steps.
+        """
+        escaped = run_id.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        total = await self._session.scalar(
+            text(
+                "SELECT COALESCE(SUM(amount), 0) FROM ledger_transactions "
+                "WHERE user_id = :uid AND type = 'debit' AND ("
+                "idempotency_key = :run_id "
+                "OR idempotency_key LIKE :prefix ESCAPE '\\')"
+            ),
+            {"uid": str(user_id), "run_id": run_id, "prefix": f"{escaped}:%"},
+        )
+        return int(total or 0)
 
     async def _validate_session(self, user_id: uuid.UUID, session_id: uuid.UUID) -> None:
         """Validate sessionId before any FK-dependent op (wallet-ledger/02; robustness vs 500).
@@ -199,6 +233,19 @@ class WalletService:
         if session_id is not None:
             await self._validate_session(user_id, session_id)
         await self._ensure_wallet(user_id)
+
+        # ADR-064 §4: the per-step INCREMENTAL debit is a DEDICATED third branch, routed FIRST —
+        # BEFORE _agent_reconcile_applies / _debit_in_savepoint. This is critical: the savepoint
+        # path raises InsufficientCreditsError on a shortfall (conditional UPDATE ... WHERE balance
+        # >= amount matches 0 rows), which is the OPPOSITE of the required no-debt self-clamp and
+        # would break the SSE stream. _agent_reconcile_applies also ultimately leads into the
+        # raising savepoint path, so `incremental` must ROUTE to its own method, not merely toggle
+        # a flag. The caller passes amount = min(want, balance) from a fresh read, so the clamp only
+        # bites in a narrow race with a concurrent chat-debit.
+        if meta.get("incremental"):
+            return await self._consume_incremental_clamp(
+                user_id=user_id, amount=amount, idempotency_key=idempotency_key, meta=meta
+            )
 
         # ADR-051 §2.1: on the AGENT path with reconciliation enabled, a shortfall (amount >
         # balance) does NOT roll back fully — consume debits the available balance (partial ledger
@@ -388,6 +435,110 @@ class WalletService:
             )
         )
         return ConsumeResult(new_balance=0, ledger_tx_id=inserted_id, idempotent_replay=False)
+
+    async def _consume_incremental_clamp(
+        self,
+        *,
+        user_id: uuid.UUID,
+        amount: int,
+        idempotency_key: str,
+        meta: dict[str, Any],
+    ) -> ConsumeResult:
+        """No-debt, self-clamping per-step debit for incremental agent billing (ADR-064 §4).
+
+        MONEY INVARIANT: the ledger debit amount MUST equal the ACTUAL balance decrement so
+        ``balance == Σ(credit) − Σ(debit)`` holds. This is done atomically in ONE statement (a CTE):
+        the wallet row is ``SELECT ... FOR UPDATE`` locked; the debit is inserted for
+        ``LEAST(:amount, balance)``; the balance is decremented by exactly that inserted amount. So
+        even when a concurrent chat-debit drained the balance below ``:amount`` after the caller's
+        pre-read, the ledger row records only what was truly taken (never inflating Σdebit → no
+        silent under-charge, and ``charged_for_run`` stays consistent with balance → an exact resume
+        seed). NO raise, NO ``wallets.debt``; the CHECK ``balance >= 0`` holds by ``LEAST``.
+
+        - Balance already 0 (drained): no row is inserted (would violate the ``amount > 0`` CHECK
+          and inflate Σdebit); ``charged_amount == 0`` signals depletion to the caller.
+        - Idempotent replay of the same step (reconnect / concurrent same-key): no second decrement;
+          the existing tx is returned with ``charged_amount == 0``.
+        """
+        # Idempotent replay fast-path: the step is already billed → return it, NO second decrement.
+        existing = await self._existing_tx(user_id, idempotency_key)
+        if existing is not None:
+            balance = await self._current_balance(user_id)
+            return ConsumeResult(
+                new_balance=balance,
+                ledger_tx_id=existing.id,
+                idempotent_replay=True,
+                charged_amount=0,
+            )
+
+        # Atomic clamp: lock the wallet, insert the debit for LEAST(:amount, balance) and decrement
+        # the balance by exactly that amount — one statement so ledger.amount == balance delta.
+        row = (
+            await self._session.execute(
+                text(
+                    "WITH locked AS ("
+                    "  SELECT balance FROM wallets WHERE user_id = :uid FOR UPDATE"
+                    "), ins AS ("
+                    "  INSERT INTO ledger_transactions "
+                    "  (user_id, type, amount, meta, idempotency_key) "
+                    "  SELECT :uid, 'debit', LEAST(:amount, locked.balance), "
+                    "         CAST(:meta AS JSONB), :key "
+                    "  FROM locked WHERE locked.balance > 0 "
+                    "  ON CONFLICT (user_id, idempotency_key) DO NOTHING "
+                    "  RETURNING id, amount"
+                    "), upd AS ("
+                    "  UPDATE wallets SET balance = balance - (SELECT amount FROM ins), "
+                    "         updated_at = now() "
+                    "  WHERE user_id = :uid AND EXISTS (SELECT 1 FROM ins) "
+                    "  RETURNING balance"
+                    ") "
+                    "SELECT (SELECT id FROM ins) AS tx_id, "
+                    "       (SELECT amount FROM ins) AS charged, "
+                    "       COALESCE((SELECT balance FROM upd), "
+                    "                (SELECT balance FROM locked)) AS new_balance"
+                ),
+                {
+                    "uid": str(user_id),
+                    "amount": amount,
+                    "meta": _json(meta),
+                    "key": idempotency_key,
+                },
+            )
+        ).one()
+        new_balance = int(row.new_balance) if row.new_balance is not None else 0
+        if row.tx_id is None:
+            # No row inserted: balance was 0 (nothing to charge) OR a concurrent same-key insert won
+            # the race after the existence check (that request did the decrement). We charged 0 now
+            # → signal depletion without a ledger row.
+            replay = await self._existing_tx(user_id, idempotency_key)
+            return ConsumeResult(
+                new_balance=new_balance,
+                ledger_tx_id=replay.id if replay is not None else _NIL_TX_ID,
+                idempotent_replay=replay is not None,
+                charged_amount=0,
+            )
+        charged = int(row.charged)
+        wallet_debit_total.labels(result="success").inc()
+        await self._audit.record(
+            AuditEvent(
+                user_id=user_id,
+                event_type=EVENT_BILLING_DEBIT,
+                payload={
+                    "ledgerTxId": str(row.tx_id),
+                    "amount": charged,
+                    "newBalance": new_balance,
+                    "runId": meta.get("runId"),
+                    "stepIndex": meta.get("stepIndex"),
+                    "model": meta.get("model"),
+                },
+            )
+        )
+        return ConsumeResult(
+            new_balance=new_balance,
+            ledger_tx_id=row.tx_id,
+            idempotent_replay=False,
+            charged_amount=charged,
+        )
 
     async def grant(
         self,

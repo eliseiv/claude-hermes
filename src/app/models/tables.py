@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     Identity,
     Index,
+    Integer,
     LargeBinary,
     String,
     Text,
@@ -39,6 +40,16 @@ TOOL_CALL_STATUS = ("pending", "completed", "errored")
 ASSISTANT_MODE = ("chat", "code")
 # ADR-046: per-user Hermes runtime lifecycle: provisioning → running → stopped (hibernation).
 HERMES_INSTANCE_STATUS = ("provisioning", "running", "stopped")
+# ADR-064: agent-run lifecycle (incremental billing + pause/resume). running →
+# {paused, completed, failed, cancelled}; paused → resumed (CAS on resume).
+AGENT_RUN_STATUS = (
+    "running",
+    "paused",
+    "resumed",
+    "completed",
+    "failed",
+    "cancelled",
+)
 
 _subscription_status_enum = Enum(
     *SUBSCRIPTION_STATUS, name="subscription_status", create_type=False
@@ -52,6 +63,7 @@ _assistant_mode_enum = Enum(*ASSISTANT_MODE, name="assistant_mode", create_type=
 _hermes_instance_status_enum = Enum(
     *HERMES_INSTANCE_STATUS, name="hermes_instance_status", create_type=False
 )
+_agent_run_status_enum = Enum(*AGENT_RUN_STATUS, name="agent_run_status", create_type=False)
 
 _uuid_default = sa_text("gen_random_uuid()")
 _now = sa_text("now()")
@@ -603,4 +615,61 @@ class HermesInstance(Base):
     __table_args__ = (
         # Serves the background reaper (stop_idle: status='running' AND last_active_at < threshold).
         Index("ix_hermes_instances_status_active", "status", "last_active_at"),
+    )
+
+
+class AgentRun(Base):
+    """Agent-run lifecycle + resume-chain row (ADR-064 §6, migration 0018).
+
+    One row per Hermes run (``run_id`` TEXT PK — a Hermes string, NOT a UUID). Populated ONLY on
+    the incremental-billing path (``AGENT_INCREMENTAL_BILLING_ENABLED``); the post-hoc path
+    (ADR-047) never writes here. ``session_id`` is the STABLE continuation key (one Hermes session
+    per resume chain): resume resolves it from the paused ``run_id`` (client stores nothing).
+    ``continued_from_run_id`` is a self-FK (``ON DELETE SET NULL``) forming the continuation chain
+    (child → parent; root = NULL). ``cumulative_credits_spent``/``last_billed_step`` are a
+    denormalised mirror of the ledger (source of truth is ``ledger_transactions``; on divergence the
+    ledger wins via ``WalletService.charged_for_run``).
+    """
+
+    __tablename__ = "agent_runs"
+
+    run_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # Stable resume key (the Hermes session shared across the whole continuation chain).
+    session_id: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        _agent_run_status_enum, nullable=False, server_default=sa_text("'running'")
+    )
+    # Denormalised mirror of Σ ledger.amount over this run's debits (ledger is source of truth).
+    cumulative_credits_spent: Mapped[int] = mapped_column(
+        BIGINT, nullable=False, server_default=sa_text("0")
+    )
+    # Highest usage.delta.step_index billed so far (monotonic; updated via GREATEST).
+    last_billed_step: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sa_text("0")
+    )
+    paused_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Self-FK: continuation chain (child → parent). Root of a chain is NULL.
+    continued_from_run_id: Mapped[str | None] = mapped_column(
+        Text, ForeignKey("agent_runs.run_id", ondelete="SET NULL"), nullable=True
+    )
+    model: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+
+    __table_args__ = (
+        CheckConstraint("cumulative_credits_spent >= 0", name="ck_agent_runs_cumulative_nonneg"),
+        CheckConstraint("last_billed_step >= 0", name="ck_agent_runs_last_step_nonneg"),
+        # Owner-scoped lifecycle queries (RBAC lookup + admin/analytics by status).
+        Index("ix_agent_runs_user_status", "user_id", "status"),
+        # Resolve the continuation chain by the shared Hermes session.
+        Index("ix_agent_runs_session", "session_id"),
+        # active_child(): find the child whose continued_from_run_id == parent.
+        Index("ix_agent_runs_continued_from", "continued_from_run_id"),
     )

@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import AdminService
+from app.agent_proxy.runs_repo import AgentRunsRepository
 from app.agent_proxy.service import AgentProxyService
 from app.api_gateway.auth import AuthenticatedUser, get_jwt_verifier, verify_client_api_key
 from app.api_gateway.openapi_security import client_api_key_scheme, user_id_scheme
@@ -308,6 +309,8 @@ def get_agent_proxy_service(session: DbSession) -> AgentProxyService:
         wallet=WalletService(session, audit),
         audit=audit,
         settings=get_settings(),
+        # ADR-064: agent_runs lifecycle + resume-chain repository (per-session).
+        runs=AgentRunsRepository(session),
     )
 
 

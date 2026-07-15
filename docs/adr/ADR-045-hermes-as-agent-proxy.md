@@ -4,6 +4,7 @@
 - Дата: 2026-06-23
 - Связан с: [ADR-044](ADR-044-client-api-key-auth.md) (клиентская auth), [ADR-046](ADR-046-per-user-hermes-runtime.md) (per-user runtime), [ADR-047](ADR-047-usage-based-billing-for-agent.md) (биллинг по usage), [ADR-002](ADR-002-access-policy-state-machine.md) (policy), [ADR-004](ADR-004-blocked-http-200.md) (blocked HTTP 200), [ADR-033](ADR-033-llm-provider-abstraction.md) (LLM-провайдер — Hermes использует СВОЙ внутри инстанса), [01-architecture.md](../01-architecture.md), [modules/agent-proxy/](../modules/agent-proxy/README.md)
 - Закрывает: архитектурный выбор «как именно подключается Hermes»
+- **Расширен 2026-07-15 → [ADR-064](ADR-064-incremental-agent-run-billing-and-pause-resume.md):** SSE-контракт §3 дополнен событиями **`usage.delta`** (Hermes-патч образа, per-step usage с `cumulative_*_tokens`) и **`run.paused`** (control plane, терминальное при исчерпании баланса) + зависимость `GET {base}/api/sessions/{sessionId}/messages` (hydrate для resume). Аддитивно. Тело не переписано (immutability).
 
 ## Context
 

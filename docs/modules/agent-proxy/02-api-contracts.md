@@ -79,6 +79,39 @@ Passthrough approval-ответа.
 ## POST /v1/agent/runs/{runId}/stop
 Passthrough остановки прогона → `POST {base}/v1/runs/{runId}/stop`.
 
+## POST /v1/agent/runs/{runId}/resume  ([ADR-064](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md))
+Возобновление прогона, остановленного при исчерпании баланса (`run.paused`, [05-events.md](05-events.md)). Возобновление = **continuation**: запускается **новый** прогон в **той же** Hermes-сессии (память/контекст целы), с догрузкой истории. Доступно **только** для `status='paused'`.
+
+### Headers
+- `X-API-Key`, `X-User-Id` (обязательны).
+
+### Request
+```json
+{ "message": "string|null" }
+```
+- `message` — опц.; дополнительный ход пользователя при возобновлении (маппится в Hermes `input` нового прогона). При `null`/отсутствии агент продолжает с последнего состояния сессии.
+
+### Response
+- **202** (возобновлено): `{"status": "running", "runId": "<new_run_id>", "continuedFrom": "<paused_run_id>"}` (тело — `AgentRunResponse`). Клиент подписывается на `GET /v1/agent/runs/{new_run_id}/events`.
+- **200** (blocked, [ADR-004](../../adr/ADR-004-blocked-http-200.md)): баланс всё ещё `0`/долг → `{"status":"blocked","blockReason":"credits_empty|subscription_expired|trial_used|debt_outstanding"}` (тот же достижимый набор, что `POST /v1/agent/run`). Resume без пополнения прогон не запускает.
+- **404** — прогон не найден **или** принадлежит другому пользователю (RBAC, [06-rbac.md](06-rbac.md)); `agent_runs[runId].user_id != subject`.
+- **409** `run_not_resumable` — `status ∉ {paused, resumed}` (running/completed/failed/cancelled не возобновляемы). Это ранний информационный гвард; авторитетный арбитр — CAS.
+- **409** `resume_in_progress` — конкурентный resume выиграл CAS и ещё не зафиксировал child (узкое окно); клиент ретраит → получит `202` с child. **Второй child НЕ создаётся.**
+- **409** `session_expired` ([ADR-064 §7](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md), [Q-064-3](../../99-open-questions.md)) — hydrate `GET {base}/api/sessions/{sessionId}/messages` вернул `404` **или пустую историю**: Hermes-сессия истекла/недоступна, continuation невозможен → CAS откатывается `resumed→paused` (прогон остаётся paused), клиент начинает новый прогон через `POST /v1/agent/run`. **Отличие от 502:** `session_expired` (409) — сессии *нет* (детерминированный отказ); 502 — сессия/инстанс временно *недоступны* (транзиентно).
+- **401** — нет/неверный `X-API-Key`/`X-User-Id`.
+- **502** — инстанс недоступен / `ensure_running` не поднял контейнер / Hermes 5xx / hydrate transport-ошибка или non-2xx (кроме `404` → `session_expired`) / сбой `_launch_run`. После любого сбоя **до** создания child CAS откатывается `resumed→paused` — прогон остаётся возобновляемым.
+
+### Правила
+- Поток ([ADR-064 §5](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)): auth → RBAC-404 → пред-гвард `status∈{paused,resumed}` (иначе 409 `run_not_resumable`) → **policy-gate** (read-only, blocked 200 если баланс 0/долг, **до** флипа статуса) → **атомарный CAS `paused→resumed`** (арбитр гонки, отдельная короткая транзакция: `UPDATE agent_runs SET status='resumed' WHERE run_id=:id AND status='paused' RETURNING session_id, model`) → **ветвление:**
+  - **выиграл** (`rowcount=1`): `ensure_running` (wake) → **hydrate** `GET {base}/api/sessions/{session_id}/messages` → `conversation_history` (при `404`/пустой истории → `409 session_expired`, откат CAS) → `_launch_run` нового прогона **строго после выигрыша CAS** (та же `session_id`, `model` из CAS RETURNING) → `create_running(new, continued_from=runId, status='running')` → `202 {runId:new, continuedFrom:runId}`;
+  - **проиграл/ретрай** (`rowcount=0`): резолв active child (`continued_from_run_id==runId`) — есть → `202 {runId:child, continuedFrom:runId}`; ещё не зафиксирован → `409 resume_in_progress`.
+- **Защита от гонки (CRITICAL, [ADR-064 §5](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)):** конкурентные in-flight resume / сетевой ретрай `POST /resume` **не** создают два child в одной `session_id` — CAS `paused→resumed` пропускает к launch **ровно один** запрос; `POST /v1/runs` не идемпотентен ([ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md)), поэтому launch — **только** после выигрыша CAS (single-flight, исключает интерливинг памяти сессии + двойной биллинг + orphan). При сбое до создания Hermes-run — откат CAS `resumed→paused` (образец claim-rollback [ADR-054](../../adr/ADR-054-trial-claim-reconcile.md)).
+- **Свежий keyspace `f"{new_run_id}:{step}"`** ([ADR-064 §5](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) — списания нового прогона не пересекаются с paused (`old_run_id:%`) → без двойного счёта; seed `charged` нового прогона читает ledger по `new_run_id`.
+- `session_id` клиенту хранить/передавать **не нужно** — резолвится по paused `run_id` из `agent_runs`.
+
+## AgentRunResponse — аддитивное поле
+- `continuedFrom: string|null` ([ADR-064](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) — для прогона, созданного через resume, содержит `run_id` родительского (paused) прогона; `null` для корневого прогона (`POST /v1/agent/run`). Аддитивно, обратно совместимо.
+
 ## Маппинг iOS ↔ Hermes (сводка)
 | iOS (`/v1/agent/run`) | Hermes (`POST /v1/runs`) |
 |---|---|

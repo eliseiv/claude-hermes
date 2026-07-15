@@ -120,6 +120,48 @@ class FakePolicyState:
     """Minimal PolicyState double; only the attributes evaluate() reads matter."""
 
 
+class FakeRunsRepo:
+    """Stand-in for AgentRunsRepository (ADR-064). The default post-hoc unit tests keep the
+    incremental flag OFF, so the proxy never dereferences the repo; a resume/incremental unit test
+    can pass a scripted double instead. Records calls so a targeted test can assert on them."""
+
+    def __init__(self) -> None:
+        self.record_step_calls: list[tuple[str, int, int]] = []
+        self.mark_paused_calls: list[tuple[str, str]] = []
+        self.mark_status_calls: list[tuple[str, str]] = []
+        self.create_running_calls: list[dict[str, Any]] = []
+
+    async def create_running(
+        self,
+        run_id: str,
+        user_id: uuid.UUID,
+        session_id: str,
+        model: str | None,
+        *,
+        continued_from_run_id: str | None = None,
+        status: str = "running",
+    ) -> None:
+        self.create_running_calls.append(
+            {
+                "run_id": run_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "model": model,
+                "continued_from_run_id": continued_from_run_id,
+                "status": status,
+            }
+        )
+
+    async def record_step(self, run_id: str, step_index: int, credits: int) -> None:
+        self.record_step_calls.append((run_id, step_index, credits))
+
+    async def mark_paused(self, run_id: str, reason: str) -> None:
+        self.mark_paused_calls.append((run_id, reason))
+
+    async def mark_status(self, run_id: str, status: str) -> None:
+        self.mark_status_calls.append((run_id, status))
+
+
 class FakeSession:
     """Stand-in for AsyncSession used by _bill_completed (ADR-047 §6, ADR-051 §2.1).
 
@@ -150,6 +192,7 @@ def _make_service(
     wallet: FakeWallet | None = None,
     audit: FakeAudit | None = None,
     session: FakeSession | None = None,
+    runs: FakeRunsRepo | None = None,
 ) -> tuple[AgentProxyService, FakeManager, FakeWallet, FakeAudit]:
     mgr = manager or FakeManager()
     wal = wallet or FakeWallet()
@@ -160,6 +203,9 @@ def _make_service(
         wallet=wal,  # type: ignore[arg-type]
         audit=aud,  # type: ignore[arg-type]
         settings=settings,
+        # ADR-064: constructor requires the runs repo. The default post-hoc unit tests keep the
+        # incremental flag OFF so it is never dereferenced; a scripted double keeps wiring valid.
+        runs=runs or FakeRunsRepo(),  # type: ignore[arg-type]
     )
     return svc, mgr, wal, aud
 
@@ -342,7 +388,10 @@ async def test_run_allowed_proxies_with_bearer_and_body_mapping(
 async def test_run_allowed_omits_optional_fields(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # sessionId/model None → not sent (only `input`); status normalized to queued when missing.
+    # model None → not sent; status normalized to queued when missing. ADR-064 §5: session_id is
+    # ALWAYS sent now — when the client omits it, run() computes a STABLE fresh uuid4 (the resume
+    # continuation key) and passes it to Hermes. So the body carries `input` + a uuid `session_id`,
+    # but NOT `model`.
     _patch_policy(monkeypatch, _Decision(allow=True))
     svc, _mgr, _wal, _aud = _make_service(settings=settings)
     route = respx.post(f"{_BASE_URL}/v1/runs").mock(
@@ -354,7 +403,10 @@ async def test_run_allowed_omits_optional_fields(
     import json as _json
 
     sent = _json.loads(route.calls.last.request.content)
-    assert sent == {"input": "hello"}
+    assert sent.keys() == {"input", "session_id"}, "model omitted; session_id auto-generated"
+    assert sent["input"] == "hello"
+    # A fresh, valid uuid4 was generated as the stable continuation session key (ADR-064 §5).
+    assert uuid.UUID(sent["session_id"]).version == 4
 
 
 # ============================================================================

@@ -130,7 +130,9 @@
 - `502` — Hermes-инстанс недоступен.
 
 ### GET /v1/agent/runs/{runId}/events  (SSE)
-Поток событий прогона (ретрансляция из Hermes): `run.queued|run.running|message.delta|tool.started|tool.completed|approval.request|run.completed|run.failed`. На `run.completed{usage}` backend списывает кредиты по usage (идемпотентно по `runId`). `run.failed` → без списания. Заголовки: `X-API-Key` + `X-User-Id`.
+Поток событий прогона (ретрансляция из Hermes): `run.queued|run.running|message.delta|tool.started|tool.completed|approval.request|usage.delta|run.completed|run.failed|run.paused`. На `run.completed{usage}` backend списывает кредиты по usage (идемпотентно по `runId`). `run.failed` → без списания. Заголовки: `X-API-Key` + `X-User-Id`.
+- **`usage.delta`** ([ADR-064](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md), под флагом `AGENT_INCREMENTAL_BILLING_ENABLED`) — per-step usage (`{step_index, cumulative_input_tokens, cumulative_output_tokens, ...}`); драйвер пошагового списания. Клиент может игнорировать.
+- **`run.paused`** ([ADR-064 §3](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) — **терминальное** синтетическое событие при исчерпании баланса: `{event:"run.paused", run_id, reason:"credits_exhausted", status:"paused", output:"<промежуточный текст>", steps, billed:<кредиты>, balance:0, usage:{cumulative_input_tokens, cumulative_output_tokens}}`. Стрим закрывается **без** `run.completed`, долг не создаётся. Промежуточный текст ответа — в ключе **`output`** (не `message`). Клиент показывает `output`/`steps` и предлагает пополнение → `resume`. Тип события — в JSON-поле `"event"` (диспетчеризация по нему).
 
 ### POST /v1/agent/runs/{runId}/approval
 Подтверждение действия агента, ожидающего approval: `{ "choice": "string" }` (passthrough к Hermes).
@@ -138,7 +140,18 @@
 ### POST /v1/agent/runs/{runId}/stop
 Остановка прогона (passthrough к Hermes).
 
-> Маппинг и детали — [modules/agent-proxy/02-api-contracts.md](modules/agent-proxy/02-api-contracts.md). Монетизация агента — usage-based ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)), в отличие от «1 кредит = 1 сообщение» для `/v1/chat/*` ([ADR-006](adr/ADR-006-credit-billing-and-subscription-grant.md)).
+### POST /v1/agent/runs/{runId}/resume
+Возобновление прогона, остановленного по исчерпании баланса (`run.paused`, [ADR-064 §5](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)). Continuation: запускается **новый** прогон в той же Hermes-сессии (память/контекст целы). `session_id` клиенту хранить не нужно.
+
+**Request:** `{ "message": "string|null" }` (опц. дополнительный ход пользователя).
+
+**Response:**
+- `202 {"status":"running", "runId":"<новый>", "continuedFrom":"<paused runId>"}` — возобновлено; подписаться на `/events` нового `runId`.
+- `200 {"status":"blocked","blockReason":"credits_empty|subscription_expired|trial_used|debt_outstanding"}` — баланс всё ещё 0/долг ([ADR-004](adr/ADR-004-blocked-http-200.md)); прогон не запущен.
+- `409` — `run_not_resumable` (не paused/resumed) | `resume_in_progress` (конкурентный resume — повторить) | `session_expired` (Hermes-сессия истекла — начать новый прогон).
+- `404` — чужой/несуществующий прогон (RBAC). `401` — auth. `502` — инстанс/hydrate недоступны (CAS откачен, прогон остаётся возобновляемым).
+
+> Маппинг и детали — [modules/agent-proxy/02-api-contracts.md](modules/agent-proxy/02-api-contracts.md). Монетизация агента — usage-based ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)), с incremental pause/resume ([ADR-064](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)); в отличие от «1 кредит = 1 сообщение» для `/v1/chat/*` ([ADR-006](adr/ADR-006-credit-billing-and-subscription-grant.md)).
 
 ---
 

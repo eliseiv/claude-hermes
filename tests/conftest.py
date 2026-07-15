@@ -154,6 +154,10 @@ async def _engine(_migrated: str):
 
 _TABLES = (
     "audit_logs",
+    # ADR-064 (migration 0018): agent-run lifecycle + resume chain. run_id TEXT PK, FK→users
+    # CASCADE + a self-FK (continued_from_run_id). Listed explicitly (before users) so it is reset
+    # deterministically between incremental-billing / resume tests.
+    "agent_runs",
     # ADR-052 (migration 0015): durable subscription-grant idempotency anchor. FK→users CASCADE,
     # but listed explicitly so it is reset deterministically between admin-subscription-grant tests.
     "subscription_grant_events",

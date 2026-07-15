@@ -62,6 +62,8 @@ def _settings() -> Settings:
 
 def _proxy(session: AsyncSession) -> AgentProxyService:
     """Real AgentProxyService with REAL WalletService + AuditService over the test session."""
+    from app.agent_proxy.runs_repo import AgentRunsRepository
+
     audit = AuditService(session)
     wallet = WalletService(session, audit)
     return AgentProxyService(
@@ -70,6 +72,9 @@ def _proxy(session: AsyncSession) -> AgentProxyService:
         wallet=wallet,
         audit=audit,
         settings=_settings(),
+        # ADR-064: post-hoc path (flag OFF default) never writes agent_runs, but the constructor
+        # requires the repo; pass a real one so the wiring matches production.
+        runs=AgentRunsRepository(session),
     )
 
 

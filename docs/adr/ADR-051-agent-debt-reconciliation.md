@@ -5,6 +5,7 @@
 - Связан с: [ADR-047](ADR-047-usage-based-billing-for-agent.md) (**расширяет §4/§6**, закрывает [Q-047-2](../99-open-questions.md) в части реконсиляции), [ADR-005](ADR-005-idempotency-ledger.md) (idempotency-ledger), [ADR-002](ADR-002-access-policy-state-machine.md) (policy state machine), [ADR-004](ADR-004-blocked-http-200.md) (blocked HTTP 200), [ADR-006 §2](ADR-006-credit-billing-and-subscription-grant.md) (grant при подписке), [ADR-045](ADR-045-hermes-as-agent-proxy.md) (agent-proxy), [03-data-model.md](../03-data-model.md), [modules/wallet-ledger/](../modules/wallet-ledger/README.md), [modules/agent-proxy/](../modules/agent-proxy/README.md)
 - Контракт данных: новая колонка `wallets.debt` (миграция `0014`)
 - Закрывает: [TD-029](../100-known-tech-debt.md)
+- **Область сужена 2026-07-15 → [ADR-064](ADR-064-incremental-agent-run-billing-and-pause-resume.md):** на **incremental**-пути (флаг `agent_incremental_billing_enabled`) долг **не копится** (`charge=min(want,balance)≤balance` → debt-ветка недостижима; при 0 — `run.paused` без долга). `wallets.debt`/clawback/`debt_outstanding` остаются **fallback** для finalization на `run.completed` (гонка) и legacy (флаг OFF = постфактум). Тело не переписано (immutability).
 
 ## Context
 

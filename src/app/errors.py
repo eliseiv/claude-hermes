@@ -94,6 +94,37 @@ class InsufficientCreditsError(ConflictError):
     code = "insufficient_credits"
 
 
+class RunNotResumableError(ConflictError):
+    """POST /v1/agent/runs/{runId}/resume on a run not in {paused, resumed} (ADR-064 §5 step 3).
+
+    409 with code=run_not_resumable: an informational early guard (running/completed/failed/
+    cancelled cannot be resumed). The authoritative arbiter is the atomic CAS (ADR-064 §5 step 5).
+    """
+
+    code = "run_not_resumable"
+
+
+class ResumeInProgressError(ConflictError):
+    """Concurrent resume lost the CAS and the continuation child is not yet visible (ADR-064 §5).
+
+    409 with code=resume_in_progress: the narrow window between the CAS winner's flip and its
+    chain-insert. The client retries and then observes the child (202). A second child is never
+    created (single-flight CAS).
+    """
+
+    code = "resume_in_progress"
+
+
+class SessionExpiredError(ConflictError):
+    """Resume hydrate found no Hermes session transcript to continue from (ADR-064 §7, Q-064-3).
+
+    409 with code=session_expired: the Hermes session/messages endpoint returned 404 or an empty
+    history, so a continuation run cannot be seeded. The CAS is reverted (run stays paused).
+    """
+
+    code = "session_expired"
+
+
 class PayloadTooLargeError(AppError):
     status_code = 413
     code = "payload_too_large"

@@ -46,14 +46,16 @@ def _settings(**overrides: Any) -> Settings:
 
 
 def _service(settings: Settings) -> AgentProxyService:
-    # _launch_run only touches self._settings + self._bearer_headers, so the DB/manager/wallet/audit
-    # collaborators are irrelevant here and passed as None (never dereferenced on this path).
+    # _launch_run only touches self._settings + self._bearer_headers, so the DB/manager/wallet/
+    # audit/runs collaborators are irrelevant here and passed as None (never dereferenced here).
+    # ADR-064: the constructor now requires ``runs``; None is safe on this path.
     return AgentProxyService(
         session=None,  # type: ignore[arg-type]
         manager=None,  # type: ignore[arg-type]
         wallet=None,  # type: ignore[arg-type]
         audit=None,  # type: ignore[arg-type]
         settings=settings,
+        runs=None,  # type: ignore[arg-type]
     )
 
 

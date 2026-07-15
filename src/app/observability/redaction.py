@@ -27,6 +27,15 @@ _USAGE_COUNT_ALLOWLIST = (
     "inputtokens",
     "outputtokens",
     "totaltokens",
+    # Cumulative anchors from meta.usage (usage.delta / run.paused, ADR-064 §7). Integer
+    # billing analytics like the per-step counts above — NOT secrets — so they survive
+    # redaction if meta.usage is ever routed through redact() (future audit path, TD-035).
+    "cumulative_input_tokens",
+    "cumulative_output_tokens",
+    "cumulative_total_tokens",
+    "cumulativeinputtokens",
+    "cumulativeoutputtokens",
+    "cumulativetotaltokens",
 )
 
 # Closed-set allowlist of the idempotency dedup-key name (lowercased), ADR-050. The

@@ -90,10 +90,12 @@ def test_0017_single_head() -> None:
 
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     heads = script.get_heads()
+    # The invariant is NO FORK (a single head), NOT "0017 is the tip" — later migrations (0018+)
+    # legitimately move the tip forward. Assert 0017 is on the linear chain from the single head
+    # back to base instead, so this test does not need to know about future migrations.
     assert len(heads) == 1, f"expected a single migration head (no fork), got {heads}"
-    assert heads[0] == _THIS_REV  # 0017 is the current head
     ancestry = {rev.revision for rev in script.walk_revisions("base", heads[0])}
-    assert _THIS_REV in ancestry
+    assert _THIS_REV in ancestry  # 0017 is on the chain
     assert _PREV_REV in ancestry  # 0016 is its ancestor (chain intact)
 
 
