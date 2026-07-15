@@ -196,3 +196,14 @@ INSTANCES-loop broadnova `.154` ([ADR-017 §Мульти-инстанс](ADR-017
 **Остаточный пробел (заведён follow-up).** Readiness-gate `/ready` не верифицирует, что задеплоенный код соответствует нужному коммиту (ни один эндпоинт не отдаёт git-sha/версию). Риск stale-code теперь закрыт `--force-recreate api`, но пост-деплой верификация версии усилила бы гарантию — [TD-034](../100-known-tech-debt.md) (git-sha/версия в `/health` или новый `/version` + пост-деплой сравнение с `GITHUB_SHA`).
 
 Инварианты §1–§4/§6 без изменений. Тело ADR-057 не переписано (immutability); §5/§Rollback читаются с этой ревизией.
+
+## Ревизия 2026-07-15 (3) — источник образа Hermes: ghcr.io/eliseiv (наш патч), pull-модель на `.156` ([ADR-065](ADR-065-patched-hermes-image-ghcr.md))
+
+**Контекст.** §6 prod-checklist шаг 4 предписывал `docker pull nousresearch/hermes-agent:<pinned-tag>` (upstream Docker Hub). Для incremental-биллинга ([ADR-064 §7](ADR-064-incremental-agent-run-billing-and-pause-resume.md)) нужен патченый образ с `usage.delta` + hydrate, которого в upstream **нет** ([ADR-065](ADR-065-patched-hermes-image-ghcr.md)).
+
+**Что изменилось (отражено в [07-deployment.md](../07-deployment.md), [`.env.prod.example`](../../.env.prod.example)).**
+1. **Источник `HERMES_IMAGE` — наш `ghcr.io/eliseiv/hermes-agent@sha256:<digest>`** (digest-pin, НЕ `:latest`), а не upstream `nousresearch/hermes-agent`. §6 prod-checklist шаг 4 (`docker pull …`) читается как `docker pull ghcr.io/eliseiv/hermes-agent@sha256:<digest>`.
+2. **Модель доступа `.156` к ghcr.** Default — **публичный** ghcr-пакет (анонимный pull, **нет нового секрета на `.156`**; MIT-лицензия Hermes позволяет, [ADR-065 §4](ADR-065-patched-hermes-image-ghcr.md)). Альтернатива (приватный пакет) — `docker login ghcr.io -u eliseiv` под root на `.156` токеном `read:packages` (persist в `/root/.docker/config.json`, docker-py auto-pull подхватывает). Финал — [Q-046-4](../99-open-questions.md).
+3. **Инвариант «build на сервере» ([ADR-057 §Артефакт](../07-deployment.md#артефакт), унаследован из ADR-017) применяется ТОЛЬКО к образу `api`/`migrate`** (`claude-hermes`-код). Runtime-образ Hermes-инстансов **собирается off-server** (dev/CI) и pull'ится на `.156` — дерево Hermes на prod-сервер **не** попадает (самодостаточность `.156` сохранена, [ADR-065 §2](ADR-065-patched-hermes-image-ghcr.md)).
+
+Инварианты §1–§4/§6 (self-hosted Traefik, сети, `docker.sock :ro`, `HERMES_UID/GID`, readiness-gate) и топология стека — **без изменений** (меняется только registry-источник runtime-образа + предзагрузка). Тело ADR-057 не переписано (immutability); §6 шаг 4 читается с этой ревизией. Playbook — [07-deployment.md §Патченый образ Hermes](../07-deployment.md#патченый-образ-hermes--сборка-и-публикация-ghcrioeliseiv-adr-065).

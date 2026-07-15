@@ -85,8 +85,18 @@ jobs:
             if ! git pull --ff-only; then
               echo "::error title=git pull failed::ff-only pull failed in $DIR"; exit 1
             fi
-            echo "[avorelio] build api migrate (image built on the server)"
-            if ! $COMPOSE build api migrate; then
+            # Freshly pulled HEAD — used to BUST the Docker source layer so `build` can NEVER serve a
+            # stale-code image on a green deploy (SECOND deploy incident: a cache-HIT on `COPY src`
+            # baked OLD code; only `build --no-cache` helped). Dockerfile consumes `ARG GIT_SHA` in a
+            # RUN right before `COPY src`, so a new commit changes the cache key of the SOURCE layer
+            # only — the uv.lock-keyed deps layer stays cached (NO full --no-cache, no ~5-min rebuild).
+            GIT_SHA="$(git rev-parse HEAD)"
+            if [ -z "$GIT_SHA" ]; then
+              echo "::error title=git rev-parse failed::empty HEAD in $DIR"; exit 1
+            fi
+            echo "[avorelio] building GIT_SHA=$GIT_SHA"
+            echo "[avorelio] build api migrate (built on the server; source layer busted by GIT_SHA)"
+            if ! $COMPOSE build --build-arg GIT_SHA="$GIT_SHA" api migrate; then
               echo "::error title=build failed::docker compose build returned non-zero"; exit 1
             fi
             echo "[avorelio] migrate (alembic upgrade head)"

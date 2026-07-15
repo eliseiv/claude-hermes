@@ -30,6 +30,21 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
+# --- Source cache-busting (07-deployment.md §Deploy incident #2 — stale image on a GREEN build).
+# The deps layer above is keyed ONLY by pyproject.toml/uv.lock (uv sync --no-install-project), so it
+# stays CACHED across commits. From HERE down the layers MUST rebuild on every new commit, otherwise
+# a stale daemon-side source snapshot can serve a cache-HIT on `COPY src` and bake OLD code into the
+# image (readiness/health don't catch it — old code passes them). GIT_SHA is supplied by the deploy
+# step (`--build-arg GIT_SHA=$(git rev-parse HEAD)`, ci.yml `deploy-avorelio` + deploy.yml).
+#
+# A BARE `ARG` does NOT bust the cache: a changed ARG only forces a miss on its FIRST USAGE, not on
+# its declaration (Docker build-cache rule). So we USE it in a RUN *before* COPY src — this lands the
+# cache miss AHEAD of the source copy, guaranteeing `COPY src` + `uv sync` rebuild from the new
+# sources whenever the commit changes, while the (earlier) uv.lock-keyed deps layer is still reused
+# (NO full --no-cache; deps are not re-resolved).
+ARG GIT_SHA=unknown
+RUN echo "GIT_SHA=${GIT_SHA}" > /app/.git-sha
+
 # Now bring in the source and install the project itself (no dev deps in runtime image).
 COPY src ./src
 COPY migrations ./migrations
@@ -65,6 +80,14 @@ COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
 COPY --from=builder --chown=10001:10001 /app/src /app/src
 COPY --from=builder --chown=10001:10001 /app/migrations /app/migrations
 COPY --from=builder --chown=10001:10001 /app/alembic.ini /app/alembic.ini
+
+# Record the built commit for post-deploy verification (07-deployment.md §Проверка деплоя).
+# ARG scope is per-stage, so GIT_SHA is re-declared here; the LABEL bakes it into the image so you
+# can confirm the RUNNING container matches HEAD after a deploy (no app-code change required):
+#   docker image inspect <tag> --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+#   docker inspect claude-hermes-api-1 --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
 
 USER 10001:10001
 

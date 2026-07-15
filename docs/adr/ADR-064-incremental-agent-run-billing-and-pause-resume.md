@@ -6,6 +6,7 @@
 - Контракт данных: новая таблица `agent_runs` + enum `agent_run_status` (миграция `0018`, цепочка `0017`→`0018`, single head)
 - Контракт API: новый `POST /v1/agent/runs/{runId}/resume`; аддитивное поле `AgentRunResponse.continuedFrom`; новые SSE-события `usage.delta` (Hermes) и `run.paused` (control plane)
 - Внешний контракт Hermes: событие `usage.delta` (патч образа) + `GET /api/sessions/{sessionId}/messages` (hydrate) — см. §7
+- **Реализация зависимости образа (2026-07-15 → [ADR-065](ADR-065-patched-hermes-image-ghcr.md)):** «патч образа Hermes» (§7) поставляется как **наш патченый образ `ghcr.io/eliseiv/hermes-agent@sha256:<digest>`** (digest-pin), собираемый off-server и pull'имый на `.156` ([ADR-065](ADR-065-patched-hermes-image-ghcr.md)). Патч верифицирован по коду: `agent/conversation_loop.py:2061` (эмиссия `usage.delta`) + `gateway/platforms/api_server.py:4485` (проброс в SSE). Флаг `agent_incremental_billing_enabled` включается **только после** образа на `.156` + зелёного e2e ([ADR-065 §6](ADR-065-patched-hermes-image-ghcr.md)).
 
 ## Context
 
