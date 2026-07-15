@@ -96,7 +96,9 @@ async def test_non_uuid_user_id_is_stable_no_duplicates(
             text("SELECT COUNT(*) FROM users WHERE id = :id"), {"id": str(expected)}
         )
         assert row.scalar_one() == 1, "the derived subject must be a single, stable users row"
-    assert await _users_count(db_sessionmaker) == 1, "no other subject may leak from the same string"
+    assert (
+        await _users_count(db_sessionmaker) == 1
+    ), "no other subject may leak from the same string"
 
 
 @pytest.mark.asyncio

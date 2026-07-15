@@ -6,20 +6,21 @@ but each test does a MANUAL ``await outer.commit()`` AFTER ``stream_events``. Th
 SUBSTITUTED the internal commit that the production code was missing — so those tests were green
 BEFORE the fix and did NOT guard the regression. The live e2e then surfaced the real defect: a
 successful agent run logged "agent run billed" but wrote NO debit and left the balance unchanged,
-because ``_bill_completed`` runs INSIDE the StreamingResponse body generator — AFTER FastAPI has torn
-down the request session dependency (``session_scope`` yield→commit happens on Depends-resume, which
-for a StreamingResponse is BEFORE the body iterates). ``consume`` only released a SAVEPOINT
+because ``_bill_completed`` runs INSIDE the StreamingResponse body generator — AFTER FastAPI has
+torn down the request session dependency (``session_scope`` yield→commit happens on Depends-resume,
+which for a StreamingResponse is BEFORE the body iterates). ``consume`` only released a SAVEPOINT
 (begin_nested), never the outer transaction, so nothing persisted.
 
 The fix added ``await self._session.commit()`` inside ``_bill_completed`` on BOTH the success branch
 and after ``_record_insufficient`` (ADR-051 partial-debit + debt branch); the generic-except branch
 rolls back.
 
-These tests therefore DELIBERATELY DO NOT call ``outer.commit()`` after ``stream_events`` — they rely
-solely on the production internal commit and verify persistence through a FRESH, independent session
-from the SAME container-bound sessionmaker (real engine, real commits — see conftest ``_engine`` /
-``db_sessionmaker``). If the internal commit were removed, the fresh session would see no debit and
-the tests would fail (proven by the negative-guard test below, which patches the session's commit to
+These tests therefore DELIBERATELY DO NOT call ``outer.commit()`` after ``stream_events`` — they
+rely solely on the production internal commit and verify persistence through a FRESH, independent
+session from the SAME container-bound sessionmaker (real engine, real commits — see conftest
+``_engine`` / ``db_sessionmaker``). If the internal commit were removed, the fresh session would
+see no debit and the tests would fail (proven by the negative-guard test below, which patches the
+session's commit to
 a no-op and asserts the absence-of-persistence).
 """
 
@@ -290,7 +291,8 @@ async def test_agent_idempotent_replay_persists_single_debit_without_manual_comm
 #    ``commit`` to a no-op (simulating the pre-fix "internal commit missing" regression) WITHOUT
 #    touching production src. The fresh session must then see NO persisted debit — i.e. the success
 #    assertions in #A would FAIL. This confirms #A is not green by accident (e.g. via a stray
-#    auto-commit elsewhere) but specifically because of ``self._session.commit()`` in _bill_completed.
+#    auto-commit elsewhere) but specifically because of ``self._session.commit()`` in
+#    _bill_completed.
 # ============================================================================
 @respx.mock
 @pytest.mark.asyncio

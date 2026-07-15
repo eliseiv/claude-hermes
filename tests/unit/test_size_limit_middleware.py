@@ -57,7 +57,8 @@ def test_unrelated_route_keeps_general_limit(mw: SizeLimitMiddleware) -> None:
 
 
 def test_raised_limits_actually_exceed_general(mw: SizeLimitMiddleware) -> None:
-    # If a raised limit were <= the general cap the scoping would be a silent no-op. Guard against it.
+    # If a raised limit were <= the general cap the scoping would be a silent no-op. Guard
+    # against it.
     s = get_settings()
     assert s.workspace_request_body_limit > s.size_limit_body
     assert s.attachment_request_body_limit > s.size_limit_body

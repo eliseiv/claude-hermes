@@ -23,7 +23,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from tests.conftest import auth_headers, seed_user
 
-_GENERAL_LIMIT = 512 * 1024  # SIZE_LIMIT_BODY default — the cap that used to reject the ~645KB body.
+_GENERAL_LIMIT = (
+    512 * 1024
+)  # SIZE_LIMIT_BODY default — the cap that used to reject the ~645KB body.
 
 
 def _b64(data: bytes) -> str:
@@ -36,10 +38,17 @@ async def _create_workspace(client: AsyncClient, uid: uuid.UUID) -> str:
     return str(r.json()["id"])
 
 
-async def _upload_text(client: AsyncClient, uid: uuid.UUID, wid: str, decoded: bytes) -> AsyncClient:
+async def _upload_text(
+    client: AsyncClient, uid: uuid.UUID, wid: str, decoded: bytes
+) -> AsyncClient:
     return await client.post(
         f"/v1/workspaces/{wid}/files",
-        json={"type": "text", "mediaType": "text/plain", "filename": "notes.txt", "data": _b64(decoded)},
+        json={
+            "type": "text",
+            "mediaType": "text/plain",
+            "filename": "notes.txt",
+            "data": _b64(decoded),
+        },
         headers=auth_headers(uid),
     )
 

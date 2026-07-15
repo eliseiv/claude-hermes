@@ -208,7 +208,8 @@ class _capture_service_logs:
     pytest's logging plugin leaves the ``app.agent_proxy.service`` logger with ``disabled=True``,
     which would silently drop the captured records (order-dependent flake — caplog stays empty when
     this module runs after the openapi documentation module). We attach our own handler to the
-    NAMED logger AND force-enable it for the duration of the block, restoring the flag/level after. In
+    NAMED logger AND force-enable it for the duration of the block, restoring the flag/level
+    after. In
     production the logger is always enabled.
     """
 

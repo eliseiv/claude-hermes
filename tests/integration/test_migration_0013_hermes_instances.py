@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -168,7 +169,8 @@ def test_0013_status_enum_constrains_values(isolated_pg: str) -> None:
             {"uid": str(uid), "a": b"x", "d": b"y", "n": b"z"},
         )
 
-    with pytest.raises(Exception):  # invalid enum value rejected by the DB
+    # invalid enum value rejected by the DB (asyncpg InvalidTextRepresentation → DBAPIError)
+    with pytest.raises(DBAPIError):
         asyncio.run(_run_async(isolated_pg, _seed_bad))
 
 

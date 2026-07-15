@@ -156,7 +156,8 @@ _PUBLIC_PATHS = {"/health", "/ready", "/metrics"}
 _ADAPTY_WEBHOOK = ("/v1/billing/adapty/webhook", "post")
 
 # The public preview endpoint (ADR-059 §7) is a /v1/* path but carries NO security (authorization is
-# in the signed URL). It MUST be excluded from the client-contour AND assertions — including it would
+# in the signed URL). It MUST be excluded from the client-contour AND assertions — including it
+# would
 # make those AND-tests falsely fail — mirroring the _ADMIN_PATHS / _ADAPTY_WEBHOOK exclusions.
 _PUBLIC_PREVIEW = {("/v1/preview/{projectId}/{token}/{path}", "get")}
 
@@ -398,7 +399,8 @@ def test_agent_endpoint_requires_client_contour_and_form(
 
 # NOTE (ADR-044 §4a): the /v1/auth/* issuer router is NOT mounted in create_app() (retired HTTP
 # surface → 404), so those paths are absent from the schema and there is no operation to assert on.
-# test_no_auth_paths_in_openapi below asserts that absence positively; the dormant JWT import contour
+# test_no_auth_paths_in_openapi below asserts that absence positively; the dormant JWT import
+# contour
 # is still guarded by test_dormant_jwt_modules_importable in test_client_api_key_auth_adr044.py.
 
 
@@ -482,7 +484,9 @@ def test_restored_legacy_paths_present_in_openapi(
 ) -> None:
     # ADR-059 §7 (Reversed): hide-only is cancelled — each legacy contour path item is back in the
     # documented schema (inverted from the former "absent" assertion).
-    assert path in openapi_schema.get("paths", {}), f"restored legacy path {path} missing from schema"
+    assert path in openapi_schema.get(
+        "paths", {}
+    ), f"restored legacy path {path} missing from schema"
 
 
 @pytest.mark.asyncio
@@ -493,7 +497,8 @@ async def test_chat_run_route_documented_and_live_not_404(
 ) -> None:
     # ADR-059 §7: '/v1/chat/run' is BOTH documented (present in /openapi.json) AND live. A valid
     # client pair reaches the handler → NOT 404 (business-blocked 200 for a trial-spent user). This
-    # pairs the schema-presence assertion above with real routing (masking guard: documented ⇒ live).
+    # pairs the schema-presence assertion above with real routing (masking guard: documented ⇒
+    # live).
     assert "/v1/chat/run" in openapi_schema.get("paths", {}), "chat/run missing from schema"
     async with db_sessionmaker() as s:
         uid = await seed_user(s, trial_used=True)
@@ -507,7 +512,8 @@ async def test_chat_run_route_documented_and_live_not_404(
 
 
 def test_no_auth_paths_in_openapi(openapi_schema: dict[str, Any]) -> None:
-    # ADR-044 §4a: the /v1/auth/* issuer HTTP surface is retired (router not mounted). No path in the
+    # ADR-044 §4a: the /v1/auth/* issuer HTTP surface is retired (router not mounted). No path in
+    # the
     # documented schema may begin with /v1/auth/ (positive absence guard, enumerated-contour style).
     offenders = [p for p in openapi_schema.get("paths", {}) if p.startswith("/v1/auth/")]
     assert not offenders, f"retired /v1/auth/* leaked into OpenAPI: {offenders}"
@@ -591,7 +597,8 @@ def _response_example_names(op: dict[str, Any], status: str = "200") -> set[str]
 
 
 def test_chat_run_response_examples(openapi_schema: dict[str, Any]) -> None:
-    # ADR-059 §7 restored: /v1/chat/* is documented again, so its named examples are back on surface.
+    # ADR-059 §7 restored: /v1/chat/* is documented again, so its named examples are back on
+    # surface.
     op = _operation(openapi_schema, "/v1/chat/run", "post")
     names = _response_example_names(op)
     assert {"assistant_message", "tool_call", "blocked"} <= names, names
@@ -661,8 +668,9 @@ def test_chat_response_status_invariant_documented(openapi_schema: dict[str, Any
 
 
 def test_policy_reasons_documents_all_8_block_reasons(openapi_schema: dict[str, Any]) -> None:
-    # Completeness guard on the visible EffectivePolicyResponse.reasons[]: the FULL set of 8 canonical
-    # blockReason values is documented. This mirrors the ChatResponse guard above (harmless dual-guard
+    # Completeness guard on the visible EffectivePolicyResponse.reasons[]: the FULL set of 8
+    # canonical blockReason values is documented. This mirrors the ChatResponse guard above
+    # (harmless dual-guard
     # per ADR-059 §7) — losing any value fails on either surface.
     schema = openapi_schema["components"]["schemas"]["EffectivePolicyResponse"]
     reasons_field = schema["properties"]["reasons"]

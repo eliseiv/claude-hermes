@@ -121,10 +121,12 @@ async def test_chat_run_chunked_just_under_raised_limit_not_413(client: AsyncCli
 
 # ============================================================================
 # ADR-060 — workspace files COLLECTION path /v1/workspaces/{id}/files gets the raised 12MB transport
-# limit (inline base64 of a ≤8MB knowledge file exceeds the general ≤512KB cap once base64-inflated).
+# limit (inline base64 of a ≤8MB knowledge file exceeds the general ≤512KB cap once
+# base64-inflated).
 # These transport-layer tests use chunked bodies (no Content-Length) and a random workspace id: they
 # assert only the middleware verdict (413 vs NOT-413) BEFORE the handler, so no DB/workspace is
-# needed. End-to-end 201 repro of the fixed prod bug lives in test_workspace_upload_body_limit_adr060.
+# needed. End-to-end 201 repro of the fixed prod bug lives in
+# test_workspace_upload_body_limit_adr060.
 # ============================================================================
 def _ws_files_path(wid: uuid.UUID | None = None) -> str:
     return f"/v1/workspaces/{wid or uuid.uuid4()}/files"
@@ -166,7 +168,9 @@ async def test_workspace_files_over_12mb_rejected_before_auth(client: AsyncClien
     # The transport guard runs OUTERMOST (before auth). An over-12MB body with NO auth headers must
     # be 413 (middleware), never 401 — proving the reject is at transport, not the endpoint.
     over = 12 * 1024 * 1024 + 256 * 1024
-    r = await client.post(_ws_files_path(), content=_chunked(over), headers={"content-type": _JSON_CT})
+    r = await client.post(
+        _ws_files_path(), content=_chunked(over), headers={"content-type": _JSON_CT}
+    )
     assert r.status_code == 413, r.text
     assert r.json()["error"]["code"] == "payload_too_large"
 

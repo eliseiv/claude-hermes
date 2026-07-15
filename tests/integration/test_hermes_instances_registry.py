@@ -143,7 +143,7 @@ async def test_stop_idle_selects_only_running_idle_rows(
         assert (await reg.get(fresh_uid)).status == "running"
 
 
-# ============================ race: concurrent ensure_running (follow_up #2) ============================
+# ==================== race: concurrent ensure_running (follow_up #2) ====================
 async def test_concurrent_ensure_running_provisions_single_container(
     db_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
