@@ -1,6 +1,6 @@
 # ADR-017 — Deploy-топология: общий сервер за внешним Traefik + GitHub Actions SSH
 
-- **Статус:** Accepted (2026-06-02; расширен 2026-06-10 разделом «Мульти-инстанс / клонирование сервиса»)
+- **Статус:** Accepted (2026-06-02; расширен 2026-06-10 разделом «Мульти-инстанс / клонирование сервиса»; **ревизия 2026-07-15: для `claude-hermes` применяется ТОЛЬКО выделенный `.156` / [ADR-057](ADR-057-dedicated-server-self-hosted-traefik-deploy.md), broadnova `.154` INSTANCES-loop удалён из CI** — см. [§Ревизия 2026-07-15](#ревизия-2026-07-15--для-claude-hermes-применяется-только-выделенный-156-adr-057))
 - **Контекст ревизует:** [TD-005](../100-known-tech-debt.md) (зафиксирован VPS + Caddy-standalone). Не отменяет [ADR-001](ADR-001-stack-choice.md) (стек) и [ADR-010](ADR-010-backend-hosted-preview.md) (контракт reverse-proxy на `/v1/preview/*`).
 - **Расширение (2026-06-10):** добавлен паттерн мульти-инстанс / клонирования за общим Traefik (`COMPOSE_PROJECT_NAME`-параметризация, изоляция доменов/данных/секретов, per-instance JWT keypair). Playbook — [07-deployment.md §Мульти-инстанс](../07-deployment.md#мульти-инстанс--клонирование-сервиса). Связано с [Q-017-3](../99-open-questions.md).
 
@@ -95,3 +95,16 @@
 - **Выделенный VPS + собственный Caddy (прежний TD-005).** Отклонено: владелец предоставляет общий сервер с уже работающим Traefik; дублировать edge-прокси нельзя (конфликт 80/443).
 - **Сборка образа в CI + push в registry, на сервере только pull.** Лучше для скорости/immutability, но требует registry-инфраструктуры и креденшелов; владелец зафиксировал `git pull && compose up --build` на сервере. Оставлено как возможное улучшение (новый ADR при вводе registry).
 - **Свой Traefik/nginx внутри нашего стека за общим Traefik (двойной прокси).** Отклонено: избыточно, второй прокси не нужен — Traefik роутит напрямую на `api:8000` по labels.
+
+## Ревизия 2026-07-15 — для claude-hermes применяется ТОЛЬКО выделенный .156 (ADR-057), broadnova-контур из CI удалён
+
+**Контекст ревизии.** `claude-hermes` — самостоятельный сервис на **выделенном** сервере `87.239.135.156` (`avorelio.shop`, self-hosted Traefik, [ADR-057](ADR-057-dedicated-server-self-hosted-traefik-deploy.md)). Раздел «Мульти-инстанс / клонирование сервиса» этого ADR (п.10–15, `INSTANCES`-loop, `COMPOSE_PROJECT_NAME`-параметризация, клонирование за общим edge-Traefik на `.154`) — **fork-артефакт claude-ios** и к деплою `claude-hermes` **не применяется**.
+
+**Что изменилось (сделано devops).** Из CI/CD `claude-hermes` (`.github/workflows/ci.yml` + `deploy.yml`) **удалён** deploy-job с `INSTANCES`-loop (`INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio claude-hermes:claude-hermes"`), который циклом деплоил **ЧУЖИЕ** сервисы (`claude-ios`/`avelyra`/`orvianix`/`veltrio` + дубль co-located `claude-hermes` на `.154`). Теперь **ЕДИНСТВЕННЫЙ** deploy-job — `deploy-avorelio` (SSH на `.156`, `SSH_HOST_AVORELIO`), overlay `docker-compose.avorelio.yml`.
+
+**Область действия ревизии.**
+- Для **`claude-hermes`** канон deploy-топологии — **[ADR-057](ADR-057-dedicated-server-self-hosted-traefik-deploy.md)** (`.156`, наш Traefik). Разделы этого ADR-017, привязанные к серверу `.154` (внешний `/opt/edge` Traefik, external-`web`, `docker network create web`, INSTANCES-loop, мульти-инстанс-клонирование, prod-статус broadnova/avelyra), для `claude-hermes` **неактуальны**.
+- **Сервер-агностичные инварианты** этого ADR **сохраняются** и переиспользуются на `.156`: label-контракт `api` (`Host(${SERVICE_DOMAIN})`/`entrypoints=websecure`/`tls.certresolver=${TRAEFIK_CERTRESOLVER}`/`loadbalancer.server.port=8000`), «build на сервере» (нет registry/immutable-tag), `/v1/preview/*` pass-through ([ADR-010](ADR-010-backend-hosted-preview.md)), `set -uo pipefail` без `-e` + `script_stop:false`, readiness-gate.
+- **`claude-ios`/`avelyra`/`orvianix`/`veltrio`** (`broadnova.shop`/`avelyraweb.shop`/`orvianix.shop`/`veltriohub.shop`) — **отдельные сервисы** (свои репозитории/хосты/пайплайны), из репозитория `claude-hermes` **не деплоятся**.
+
+Тело ADR-017 (п.1–15) не переписано (immutability); эта ревизия ограничивает область его применимости для `claude-hermes`. Playbook `.156` — [07-deployment.md §Топология](../07-deployment.md#топология--выделенный-сервер-156-avorelio-self-hosted-traefik-adr-057) и [§Процедура деплоя](../07-deployment.md#процедура-деплоя-github-actions--ssh-156).

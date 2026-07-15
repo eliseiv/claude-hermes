@@ -1,5 +1,7 @@
 # Auth — Security
 
+> **⚠️ HTTP-поверхность `/v1/auth/*` — RETIRED, КОД спящий ([ADR-044 §4a](../../adr/ADR-044-client-api-key-auth.md)).** Issuer-роутер не смонтирован → текущее HTTP-поведение `/v1/auth/*` = `404` (не `503`/`200`). Статусы `503`/`200` в этом документе описывают **спящий код** issuer'а (путь будущей аддитивной реактивации), а не текущую поверхность. `JWT_PRIVATE_KEY` — **опциональный/dormant** секрет, для публичного запуска НЕ требуется.
+
 ## Ключевая пара RSA (RS256)
 - **Приватный ключ — СЕКРЕТ.** Только через env / secret manager / mounted-файл. Никогда в репозитории, образе, логах. В redaction allowlist (`JWT_PRIVATE_KEY`, плюс покрытие `*key*`/`*secret*`).
 - **Публичный ключ** — не секрет; используется `JwtVerifier` (verify) и `GET /v1/auth/jwks` (отдача).
@@ -19,8 +21,8 @@
 - `.env` в `.gitignore`; в prod — секрет-менеджер ([Q-002-1](../../99-open-questions.md) дефолт).
 
 ## Issuer / audience (self-consistent)
-- `JWT_ISSUER = https://broadnova.shop` (= `SERVICE_DOMAIN`, [Q-017-1](../../99-open-questions.md)).
-- `JWT_AUDIENCE = claude-ios`.
+- `JWT_ISSUER = https://avorelio.shop` (= `SERVICE_DOMAIN`).
+- `JWT_AUDIENCE = claude-hermes`.
 - Verifier проверяет `iss`/`aud` против тех же значений (тот же config) — токен, выпущенный backend'ом, проходит собственную верификацию.
 
 ## Refresh-token

@@ -101,6 +101,8 @@
 
 ## Q-017-3 — выкат второго инстанса avelyraweb.shop (мульти-инстанс) — Closed
 
+> **Историческая запись (fork-ancestry, неактуальна для `claude-hermes`).** Относится к мульти-инстанс-развёртыванию **claude-ios** на общем сервере `.154`. `claude-hermes` — самостоятельный сервис на выделенном `.156` (`avorelio.shop`, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)); `INSTANCES`-loop **удалён** из его CI ([ADR-017 §Ревизия 2026-07-15](adr/ADR-017-shared-server-traefik-deploy.md#ревизия-2026-07-15--для-claude-hermes-применяется-только-выделенный-156-adr-057)). `avelyra`/`avelyraweb.shop` — отдельный сервис, из этого репозитория не деплоится.
+
 **Статус:** **Closed / Resolved — 2026-06-10.** Второй инстанс `avelyra` (`avelyraweb.shop`) развёрнут на сервере и включён в `INSTANCES` обоих deploy-workflow. Живой broadnova.shop не затронут.
 
 **Итог выката (2026-06-10).** Все next-step операции devops выполнены и проверены ревью:

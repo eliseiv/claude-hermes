@@ -1,64 +1,15 @@
 # 07 — Deployment
 
+## Единственный deploy-target claude-hermes (ВАЖНО)
+`claude-hermes` — **самостоятельный сервис на ВЫДЕЛЕННОМ сервере `87.239.135.156`** (домен `avorelio.shop`, self-hosted Traefik, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)). Это **ЕДИНСТВЕННЫЙ** deploy-target репозитория: CI-workflow содержит ровно один deploy-job — `deploy-avorelio` (`.156`). Другого контура выкатки нет.
+
+> **Fork-ancestry (справочно, НЕ применяется к деплою claude-hermes).** Репозиторий отпочкован от `claude-ios`. Прежняя shared-топология [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) (общий сервер `87.239.135.154` за **внешним** edge-Traefik `/opt/edge`) и её `INSTANCES`-loop (мульти-инстанс-цикл, деплоивший **другие** сервисы) **удалены из CI этого репозитория** (см. [ADR-017 §Ревизия 2026-07-15](adr/ADR-017-shared-server-traefik-deploy.md#ревизия-2026-07-15--для-claude-hermes-применяется-только-выделенный-156-adr-057)). `claude-ios`, `avelyra`, `orvianix`, `veltrio` — **ОТДЕЛЬНЫЕ сервисы** (свои репозитории/хосты/домены `broadnova.shop`/`avelyraweb.shop`/`orvianix.shop`/`veltriohub.shop`), к деплою `claude-hermes` **не относятся** и из этого репозитория **не деплоятся**. Ссылки на ADR-017 в этом документе сохранены там, где переиспользуется **инвариант, не привязанный к серверу** (label-контракт `api`, `/v1/preview/*` pass-through, «build на сервере», роли БД) — но deploy-target всегда только `.156`.
+
 ## Артефакт
-Один Docker-образ (multi-stage, base `python:3.12-slim`), запускается через Gunicorn + UvicornWorker. Stateless — состояние в PostgreSQL/Redis. Образ **собирается на сервере** из исходников в `/opt/<service>` (явный `docker compose build api migrate`, затем `up -d --no-build` — см. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh)), не пушится из registry ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)).
+Один Docker-образ (multi-stage, base `python:3.12-slim`), запускается через Gunicorn + UvicornWorker. Stateless — состояние в PostgreSQL/Redis. Образ **собирается на сервере** из исходников в `/opt/claude-hermes` (на `.156`; явный `docker compose build api migrate`, затем `up -d --no-build` — см. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh-156)), не пушится из registry ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), схема «build на сервере» унаследована из [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)).
 
-## Топология MVP — общий сервер за внешним Traefik
-Deploy-target зафиксирован ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md), решение владельца инфраструктуры 2026-06-02, ревизует [TD-005](100-known-tech-debt.md)): сервис размещается на **общем Linux-сервере** (Ubuntu 22.04, `87.239.135.154`, root), где уже работают другие сервисы (`music-backend`) и **общий edge-прокси Traefik** в `/opt/edge`. Наш сервис — каталог `/opt/<service>` (например `/opt/claude-ios`), встраивается в Traefik через docker-labels и внешнюю сеть `web`.
-
-```mermaid
-graph TD
-    Internet[Интернет / TLS 443] --> Traefik[Traefik /opt/edge<br/>внешний edge-прокси<br/>порты 80/443, TLS+ACME, роутинг по Host]
-    Traefik -->|HTTP через сеть web| API[api: Gunicorn + UvicornWorker<br/>expose 8000, без ports 80/443]
-    API --> PG[(PostgreSQL 16<br/>контейнер, volume, сеть default)]
-    API --> Redis[(Redis 7<br/>контейнер, сеть default)]
-    Migrate[migrate job<br/>alembic upgrade head] -.pre-deploy.-> PG
-    subgraph stack["наш стек /opt/&lt;service&gt;"]
-        API
-        PG
-        Redis
-        Migrate
-    end
-```
-
-Состав нашего `docker compose`-стека в `/opt/<service>` (Traefik — **вне** нашего стека):
-- **Traefik** — НЕ наш контейнер. Общий edge-прокси владельца сервера (`/opt/edge`): держит порты 80/443, терминирует TLS, авто-выпускает Let's Encrypt-сертификаты, роутит по доменам. Наш стек **не содержит** reverse-proxy и **не управляет** TLS/ACME.
-- **api** — Docker-образ приложения (Gunicorn + UvicornWorker). `expose: 8000` (uvicorn/gunicorn), **без** `ports:` для 80/443 (конфликт с Traefik запрещён). Подключён к двум сетям: `web` (`external: true`, общая с Traefik) и `default` (внутренняя для PG/Redis). Снаружи доступен **только** через Traefik по сети `web`.
-- **postgres** — PostgreSQL 16 в контейнере с persistent volume. **Только** в сети `default`, **без публикации портов** (бэкап — `pg_dump` по cron на хосте + offsite-копия).
-- **redis** — Redis 7 в контейнере (rate limit, idempotency, policy cache). **Только** в сети `default`, **без публикации портов**.
-- **migrate** — одноразовый job (`alembic upgrade head`), запускается до старта `api` при каждом релизе.
-- Single-region, single-host (общий с другими сервисами). Состояние — в volume PostgreSQL + Redis; образ `api` — stateless.
-
-> **Жёсткие требования к нашему `docker-compose` (от владельца сервера, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)):**
-> 1. НЕ публиковать порты 80/443 (никаких `ports: 80/443`) — иначе конфликт с Traefik. Только `expose` внутреннего `8000`.
-> 2. `api` — в сети `web` (`external: true`, общая с Traefik) + `default` (внутренняя для PG/Redis).
-> 3. Маршрут — через docker-labels (Traefik подхватит, см. ниже).
-> 4. SSL/nginx/Caddy НЕ настраивать — TLS целиком Traefik. `postgres`/`redis` — только в `default`, без публикации портов.
-> 5. Внешняя сеть `web` создаётся на сервере однократно: `docker network create web` (уже создана).
-> 6. `DOCKER_MIN_API_VERSION=1.24` уже задан на сервере — не трогать.
-
-> **PostgreSQL/Redis: контейнерные vs managed.** На MVP — контейнерные в том же стеке (минимум инфраструктуры). При росте нагрузки — вынос на managed без изменения контрактов приложения (`DATABASE_URL`/`REDIS_URL`). Бэкап контейнерного PG (`pg_dump` + offsite) **обязателен** до приёма реальных пользователей — см. prod-checklist.
-
-### Маршрутизация через Traefik docker-labels
-Traefik обнаруживает наш `api` через labels на сервисе `api` в `docker-compose`. Значения зафиксированы: `SERVICE_DOMAIN=broadnova.shop` ([Q-017-1](99-open-questions.md)), `TRAEFIK_CERTRESOLVER=le` ([Q-017-2](99-open-questions.md)):
-```
-traefik.enable=true
-traefik.docker.network=web
-traefik.http.routers.<service>.rule=Host(`${SERVICE_DOMAIN}`)
-traefik.http.routers.<service>.entrypoints=websecure
-traefik.http.routers.<service>.tls.certresolver=${TRAEFIK_CERTRESOLVER}   # опционален: le — default на websecure
-traefik.http.services.<service>.loadbalancer.server.port=8000
-```
-- `${SERVICE_DOMAIN}` — домен сервиса = `broadnova.shop` ([Q-017-1](99-open-questions.md)); A-запись `broadnova.shop` → `87.239.135.154` **обязана существовать до запуска** (ACME-challenge Traefik).
-- `${TRAEFIK_CERTRESOLVER}` — имя ACME-certresolver общего Traefik = `le` (`/opt/edge`, [Q-017-2](99-open-questions.md)). Владелец сервера сделал `le` **дефолтным** на entrypoint `websecure` (`--entrypoints.websecure.http.tls.certresolver=le`), поэтому этот label **опционален** — сертификат выпустится автоматически для любого HTTPS-роутера. Явный label `tls.certresolver=le` **рекомендован для надёжности** (детерминированность при изменении дефолта).
-- `loadbalancer.server.port=8000` — Traefik проксирует на внутренний `8000` контейнера `api` по сети `web`.
-
-### Биндинг и доступ
-- `api` **не** публикует 80/443; снаружи доступен только через Traefik (сеть `web`). Прямой доступ из интернета к `api`/`postgres`/`redis` закрыт отсутствием публикации портов + изоляцией сетей.
-- `TRUSTED_PROXY_IPS` в prod **обязан** содержать адрес/подсеть **Traefik** (docker-сеть `web`). Traefik проставляет `X-Forwarded-For`; без доверия к нему per-IP rate limit видит IP Traefik, а не клиента. См. [05-security.md](05-security.md#доверенный-reverse-proxy-и-определение-client-ip-anti-spoofing) и [§Конфигурация](#конфигурация-env).
-
-## Топология №2 — ВЫДЕЛЕННЫЙ сервер с self-hosted Traefik ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md))
-Второй deploy-target **только для `claude-hermes`**: **выделенный** Linux-сервер `87.239.135.156` (root), домен `avorelio.shop` (DNS A → `87.239.135.156`), каталог `/opt/claude-hermes`. На этом сервере **нет** внешнего edge-Traefik — reverse-proxy и TLS становятся **нашими**: в стек добавляется **наш Traefik-контейнер** (self-hosted), держащий порты 80/443 и авто-выпускающий Let's Encrypt-сертификаты. Это **дополняет**, а не отменяет [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) (broadnova `.154` за **внешним** Traefik) — выбор target операционный, код/репозиторий тот же.
+## Топология — выделенный сервер `.156` avorelio, self-hosted Traefik ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md))
+**Единственный** deploy-target `claude-hermes`: **выделенный** Linux-сервер `87.239.135.156` (root), домен `avorelio.shop` (DNS A → `87.239.135.156`), каталог `/opt/claude-hermes`. На этом сервере **нет** внешнего edge-Traefik — reverse-proxy и TLS **наши**: в стек добавляется **наш Traefik-контейнер** (self-hosted), держащий порты 80/443 и авто-выпускающий Let's Encrypt-сертификаты.
 
 ```mermaid
 graph TD
@@ -77,55 +28,53 @@ graph TD
     end
 ```
 
-**Отличия от топологии №1 (broadnova `.154`, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)):**
+**Отличия от унаследованной shared-топологии claude-ios (справочно, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) — НЕ deploy-target claude-hermes):**
 
-| | №1 broadnova `.154` | №2 avorelio `.156` |
+| | унаследованная shared (claude-ios, ADR-017) | claude-hermes `.156` avorelio |
 |---|---|---|
 | Reverse-proxy / TLS | **внешний** Traefik `/opt/edge` | **наш** `traefik`-контейнер в compose |
 | Порты 80/443 на хост | держит внешний Traefik | держит **наш** `traefik` (единственный сервис с `ports:`) |
-| Сеть `web` | `external: true` (создаётся вручную, общая с чужим Traefik) | **внутренняя** сеть compose (потребитель один — наш Traefik) |
+| Сеть `web` | `external: true` (общая с чужим Traefik) | **внутренняя** сеть compose (потребитель один — наш Traefik) |
 | ACME | внешний Traefik | **наш** Traefik (`certResolver le`, HTTP-01, acme.json в named volume, `ACME_EMAIL`) |
-| Домен | `broadnova.shop` и со-инстансы | `avorelio.shop` |
+| Домен | `broadnova.shop` и др. сервисы | `avorelio.shop` |
 | `TRUSTED_PROXY_IPS` | подсеть внешней `web` | подсеть **нашей** `web` |
 | docker.sock читают | `api` (`:ro`) | `traefik` (provider, `:ro`) **И** `api` (`:ro`) |
 
 **Состав стека на `.156`:**
 - **traefik** — наш контейнер (`traefik:v3.x` pinned). Единственный с `ports:` (`80:80`, `443:443`). Static-конфиг — **CLI-флаги в `command:`** (не файл `traefik.yml`): `--providers.docker --providers.docker.exposedbydefault=false`, entrypoints `web`(:80)/`websecure`(:443), HTTP→HTTPS redirect, ACME (`--certificatesresolvers.le.acme.email=${ACME_EMAIL}`, `.storage=/letsencrypt/acme.json`, `.httpchallenge.entrypoint=web`), `--api=false` (dashboard выключен). `docker.sock` `:ro` (provider). Сеть `web`. acme.json — в **named volume** `traefik-acme` (`/letsencrypt`), Traefik создаёт его с правами `600`.
-- **api** — **те же** Traefik-labels, что в топологии №1 (`Host(${SERVICE_DOMAIN})`=`avorelio.shop`, `entrypoints=websecure`, `tls.certresolver=${TRAEFIK_CERTRESOLVER}`=`le`, `loadbalancer.server.port=8000`), **без** `ports:` (только `expose: 8000`). `docker.sock` `:ro` (provision Hermes, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)). Сети `web`+`default`+`hermes-net`.
-- **postgres**/**redis** — только `default`, без портов (как №1).
-- **migrate** — одноразовый job (как №1).
+- **api** — Traefik-labels из базового `docker-compose.prod.yml` (label-контракт `api` унаследован из [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md), server-agnostic): `Host(${SERVICE_DOMAIN})`=`avorelio.shop`, `entrypoints=websecure`, `tls.certresolver=${TRAEFIK_CERTRESOLVER}`=`le`, `loadbalancer.server.port=8000`; **без** `ports:` (только `expose: 8000`). `docker.sock` `:ro` (provision Hermes, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)). Сети `web`+`default`+`hermes-net`.
+- **postgres**/**redis** — только `default`, без портов.
+- **migrate** — одноразовый job (`alembic upgrade head`).
 - **Hermes per-user** — провижинятся control plane через `docker.sock` в `hermes-net` ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md), без изменений).
 
-**Сети на `.156`:** `web` — **внутренняя** compose (на выделенном сервере нет внешнего совладельца сети, поэтому НЕ `external` и НЕ требует ручного `docker network create web`); `default` — внутренняя (api↔pg/redis); `hermes-net` — **остаётся `external: true`** (инвариант [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)/[ADR-056](adr/ADR-056-provision-readiness-gate-and-volume-ownership.md): docker-py control plane должен видеть сеть под плоским именем; создаётся `docker network create hermes-net` ДО деплоя). `TRUSTED_PROXY_IPS` = подсеть нашей `web` (`docker network inspect <project>_web` → `IPAM.Config.Subnet`).
+**Сети на `.156`:** `web` — **внутренняя** compose (на выделенном сервере нет внешнего совладельца сети, поэтому НЕ `external` и НЕ требует ручного `docker network create web`); overlay пиннит имя сети к плоскому `web` (`name: web`), чтобы совпал inherited-label `traefik.docker.network=web`; `default` — внутренняя (api↔pg/redis); `hermes-net` — **остаётся `external: true`** (инвариант [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)/[ADR-056](adr/ADR-056-provision-readiness-gate-and-volume-ownership.md): docker-py control plane должен видеть сеть под плоским именем; создаётся `docker network create hermes-net` ДО деплоя). `TRUSTED_PROXY_IPS` = подсеть нашей `web` (`docker network inspect web` → `IPAM.Config.Subnet`).
 
 **TLS (наш Traefik):** certResolver `le`, challenge **HTTP-01** (дефолт для одиночного домена — нужен лишь доступный порт 80 + публичная A-запись; TLS-ALPN-01 — альтернатива; DNS-01 не нужен). Авто-обновление встроено в Traefik. `ACME_EMAIL` обязателен. Первый выпуск требует доступного 80 и валидной A-записи `avorelio.shop` → `.156`.
 
-**Двойственность `docker-compose.prod.yml` (`traefik`-сервис + internal-`web` для `.156` vs external-`web` без `traefik` для `.154`)** разрешается devops так, чтобы НЕ регрессировать живой broadnova `.154` — [Q-057-1](99-open-questions.md) (рекомендация: отдельный prod-overlay/файл для `.156`).
+**Двойственность `docker-compose.prod.yml`** (базовый файл унаследован от claude-ios: `web` `external: true`, `${COMPOSE_PROJECT_NAME:-claude-ios}`, без сервиса `traefik`) разрешена overlay-файлом [`docker-compose.avorelio.yml`](../docker-compose.avorelio.yml) ([Q-057-1](99-open-questions.md) Closed, [ADR-057 §3](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)): overlay добавляет сервис `traefik` + acme-volume и переопределяет `web` явным **`external: false`** (+ `name: web`). Деплой на `.156` — **всегда** `-f docker-compose.prod.yml -f docker-compose.avorelio.yml`. На `.156` в `.env` задаётся `COMPOSE_PROJECT_NAME=claude-hermes` (перекрывает унаследованный дефолт `claude-ios`).
 
 ## Reverse-proxy / LB — операционные требования к `/v1/preview/*`
 Приложение отдаёт пользовательский (Claude-сгенерированный) HTML/JS на `GET /v1/preview/{projectId}/{token}/{path}` со **своими** sandbox-заголовками (ADR-010, [05-security.md](05-security.md#backend-hosted-preview-отдача-пользовательского-htmljs-adr-010)): `Content-Security-Policy: sandbox ...`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Cache-Control: private, no-store`, без cookies. Этот путь **исключён** из дефолтных security-заголовков middleware, чтобы отдать собственную политику.
 
-Reverse-proxy / LB (в нашей схеме — **внешний Traefik**) **ОБЯЗАН** на `/v1/preview/*`:
+Reverse-proxy / LB (в нашей схеме — **наш self-hosted Traefik** на `.156`) **ОБЯЗАН** на `/v1/preview/*`:
 - **не перетирать и не дублировать** заголовки ответа (`Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Cache-Control`) — pass-through as-is. Не навешивать глобальный `X-Frame-Options: DENY` / общий CSP, применяемый к остальным путям.
 - **не добавлять `Set-Cookie`** и не инжектить session/affinity-cookies на этот префикс (превью открывается прямой ссылкой, авторизация — в signed URL, не в cookie).
 - глобальные политики безопасности прокси для прочих путей (HSTS, `X-Frame-Options: DENY`) применять **в обход** `/v1/preview/*` (отдельный route/middleware без переопределения заголовков приложения).
 
-> **Операционное требование к владельцу Traefik ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)).** На broadnova `.154` reverse-proxy — общий **внешний** Traefik (`/opt/edge`), вне нашего репозитория. Контракт pass-through выше — требование к его конфигурации Host-роутера нашего домена: не навешивать на `/v1/preview/*` глобальные header-/cookie-middleware Traefik, которые перетрут sandbox-заголовки приложения (ADR-010). По умолчанию Traefik **не** модифицирует заголовки ответа без явных middleware — требование сводится к «не добавлять header/cookie-middleware на роутер нашего домена для `/v1/preview/*`».
->
-> **Self-hosted Traefik на avorelio `.156` ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)).** Здесь Traefik — **наш** контейнер, и контракт pass-through становится **нашей** конфигурацией. Тот же инвариант: глобальные security-header-/cookie-middleware (HSTS, `X-Frame-Options: DENY`, CSP) на `/v1/preview/*` **не навешивать** (перетрут sandbox-`CSP: sandbox`/`X-Frame-Options: SAMEORIGIN`/`Cache-Control`/`X-Content-Type-Options` приложения, ADR-010). Дефолт на старте — глобальный headers-middleware **не добавляется** (приложение само ставит HSTS/`nosniff`/`X-Frame-Options`, [05-security.md §Транспорт](05-security.md#транспорт)), что by construction не трогает preview. HTTP→HTTPS redirect на entrypoint безопасен для preview (только смена схемы запроса, не заголовки ответа). Если позже вводится явный headers-middleware — отдельный router с приоритетом для `PathPrefix(/v1/preview/)` **без** этого middleware.
+> **Self-hosted Traefik на avorelio `.156` ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)).** Traefik — **наш** контейнер, и контракт pass-through — **наша** конфигурация. Инвариант: глобальные security-header-/cookie-middleware (HSTS, `X-Frame-Options: DENY`, CSP) на `/v1/preview/*` **не навешивать** (перетрут sandbox-`CSP: sandbox`/`X-Frame-Options: SAMEORIGIN`/`Cache-Control`/`X-Content-Type-Options` приложения, ADR-010). Дефолт на старте — глобальный headers-middleware **не добавляется** (приложение само ставит HSTS/`nosniff`/`X-Frame-Options`, [05-security.md §Транспорт](05-security.md#транспорт)), что by construction не трогает preview. HTTP→HTTPS redirect на entrypoint безопасен для preview (только смена схемы запроса, не заголовки ответа). Если позже вводится явный headers-middleware — отдельный router с приоритетом для `PathPrefix(/v1/preview/)` **без** этого middleware.
 
-Прежние Caddy/nginx-артефакты (legacy, DEPRECATED: [`infra/legacy/Caddyfile`](../infra/legacy/Caddyfile), [`infra/legacy/nginx.conf.example`](../infra/legacy/nginx.conf.example)) в этой схеме **не используются** (TLS/reverse-proxy — внешний Traefik) — перенесены в `infra/legacy/` с DEPRECATED-баннером. См. [§Prod-артефакты](#prod-артефакты-источник-истины--реальные-файлы-в-репозитории).
+Прежние Caddy/nginx-артефакты (legacy, DEPRECATED: [`infra/legacy/Caddyfile`](../infra/legacy/Caddyfile), [`infra/legacy/nginx.conf.example`](../infra/legacy/nginx.conf.example)) в этой схеме **не используются** (TLS/reverse-proxy — наш self-hosted Traefik) — перенесены в `infra/legacy/` с DEPRECATED-баннером. См. [§Prod-артефакты](#prod-артефакты-источник-истины--реальные-файлы-в-репозитории).
 
 **Изоляция origin (операционно, [Q-010-3](99-open-questions.md), не блокер):** старт — single-origin `/v1/preview/*` + sandbox-заголовки (самодостаточно). Prod-рекомендация — вынести превью на отдельный поддомен `preview.<domain>`, чтобы даже при обходе CSP пользовательский JS не имел same-origin доступа к API. При вводе поддомена то же требование pass-through заголовков и запрет cookies сохраняется.
 
 ## Конфигурация (env)
 | Переменная | Назначение |
 |---|---|
-| `DATABASE_URL` | `postgresql+asyncpg://<POSTGRES_USER>:<POSTGRES_PASSWORD>@postgres:5432/<POSTGRES_DB>` — **собирается из `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` целиком**; все три должны совпадать со значением URL. На клоне — свои значения (см. [clone `.env`-контракт](#clone-env-контракт-ключи-claude-ios)). |
+| `DATABASE_URL` | `postgresql+asyncpg://<POSTGRES_USER>:<POSTGRES_PASSWORD>@postgres:5432/<POSTGRES_DB>` — **собирается из `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` целиком**; все три должны совпадать со значением URL. Runtime-роль `app_rw` ([ADR-053](adr/ADR-053-audit-logs-db-append-only.md), см. [§Роли БД](#роли-бд--durable-append-only-audit_logs-adr-053-prod-harden-td-001)). |
 | `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` | креды контейнерного PostgreSQL. `POSTGRES_PASSWORD` — **секрет** (secret manager). Входят в `DATABASE_URL` целиком. На клоне — свои. |
 | `KMS_KEY_ID` | идентификатор облачного KMS-ключа. **На MVP пуст** — используется `LocalKmsClient` (in-process AES-256-GCM под `KMS_LOCAL_MASTER_KEY`, облачного KMS нет, [Q-002-1](99-open-questions.md), [ADR-003](adr/ADR-003-byok-envelope-encryption.md)). Заполняется только при миграции на облачный KMS (post-MVP). |
 | `REDIS_URL` | `redis://...` |
-| `LLM_PROVIDER` | **(провайдер-абстракция, [ADR-033](adr/ADR-033-llm-provider-abstraction.md))** выбор LLM-провайдера: `anthropic` \| `openai`. **Дефолт `anthropic`** = текущее поведение (инстансы `claude-ios`/`avelyra` не задают → no-op). На OpenAI-инстансе (3-й) — `openai`. Public, не секрет. Per-instance. |
+| `LLM_PROVIDER` | **(провайдер-абстракция, [ADR-033](adr/ADR-033-llm-provider-abstraction.md))** выбор LLM-провайдера для контура `/v1/chat/*`: `anthropic` \| `openai`. **Дефолт `anthropic`** (не задавать на claude-hermes → no-op). Public, не секрет. Независим от `HERMES_LLM_PROVIDER` (LLM внутри Hermes-инстанса, [ADR-055](adr/ADR-055-hermes-instance-llm-config-contract.md)). |
 | `ANTHROPIC_API_KEY` | сервисный ключ Claude (mode=credits, **anthropic-инстансы**) |
 | `ANTHROPIC_MODEL` | дефолтная модель Claude (= модель по умолчанию для выбора, помечается `default:true` в `GET /v1/models`) |
 | `ANTHROPIC_MODELS` | **(выбор модели, [ADR-034](adr/ADR-034-user-model-selection.md))** allowlist моделей Claude для `GET /v1/models` / `chat.model`. JSON-объект `{ "<model-id>": "<displayName>" }` (по образцу `TOKEN_PRODUCTS`). Применяется при `LLM_PROVIDER=anthropic`. **Пусто/невалидно/не задан → фолбэк** на единственную модель `ANTHROPIC_MODEL` (обратная совместимость). Public, не секрет. Per-instance. Пример: `{"claude-sonnet-4-5":"Claude Sonnet 4.5","claude-opus-4-1":"Claude Opus 4.1"}`. |
@@ -138,18 +87,18 @@ Reverse-proxy / LB (в нашей схеме — **внешний Traefik**) **�
 | `OPENAI_BYOK_DEFAULT_MODEL` | **(OpenAI)** активная модель в BYOK-ответе при `keyStatus=valid` (`activeModel`), дефолт `gpt-4o` ([ADR-016](adr/ADR-016-extended-byok-statuses.md)/[ADR-033](adr/ADR-033-llm-provider-abstraction.md)). Отдельно от anthropic `BYOK_DEFAULT_MODEL`. |
 | `ANTHROPIC_MAX_TOKENS` | output-бюджет на вызов, дефолт **`16000`** ([ADR-025](adr/ADR-025-parallel-tool-calls-and-max-tokens-truncation.md)); прежний `4096` обрезал генерацию кода/файлов. Non-streaming. **Per-instance** — задать на каждом инстансе. |
 | `ANTHROPIC_TIMEOUT_SECONDS` | таймаут upstream-вызова, дефолт **`120`** ([ADR-025](adr/ADR-025-parallel-tool-calls-and-max-tokens-truncation.md), поднят с 60 под длинную генерацию при `max_tokens=16000`). |
-| `JWT_ISSUER` / `JWT_AUDIENCE` | issuer/audience выпускаемых и проверяемых JWT. Для встроенного issuer: `JWT_ISSUER=https://broadnova.shop`, `JWT_AUDIENCE=claude-ios` ([ADR-018](adr/ADR-018-embedded-auth-issuer.md)). |
+| `JWT_ISSUER` / `JWT_AUDIENCE` | issuer/audience выпускаемых и проверяемых JWT. Для встроенного issuer: `JWT_ISSUER=https://avorelio.shop`, `JWT_AUDIENCE=claude-hermes` ([ADR-018](adr/ADR-018-embedded-auth-issuer.md)). |
 | `JWT_PRIVATE_KEY` / `JWT_PRIVATE_KEY_PATH` | **СЕКРЕТ** — приватный RS256-ключ подписи (встроенный issuer). PEM-строка с `\n`-экранированием **или** путь к файлу (приоритет у `*_PATH`). Только secret manager / mounted-файл, под redaction. **Должен быть сконфигурирован до публичного запуска** (без него `/v1/auth/*` → `503`). [Q-005-1](99-open-questions.md) Closed ([ADR-018](adr/ADR-018-embedded-auth-issuer.md)). |
 | `JWT_PUBLIC_KEY` / `JWT_PUBLIC_KEY_PATH` | публичный RS256-ключ (verify + `/v1/auth/jwks`). PEM-строка (`\n`-экранирование) или файл-путь. Не секрет. |
 | `JWT_KID` | идентификатор ключа (`kid` в заголовке JWT / JWKS); задел под ротацию. |
 | `JWT_JWKS_URL` | **опционально** — verify-only режим внешнего issuer (Firebase и т.п.). Для встроенного issuer не используется (verify по `JWT_PUBLIC_KEY`). Sign in with Apple реализован **не** через этот режим — см. `APPLE_*` ниже ([ADR-043](adr/ADR-043-sign-in-with-apple.md)). |
 | `AUTH_ACCESS_TTL_SECONDS` / `AUTH_REFRESH_TTL_SECONDS` | TTL access-token (дефолт `3600`) / refresh-token (дефолт `2592000`). [ADR-018](adr/ADR-018-embedded-auth-issuer.md). |
 | `AUTH_RATE_LIMIT_PER_IP` / `AUTH_JWKS_ENABLED` | rate-limit `/v1/auth/*` per IP (дефолт `10`/min) / видимость `GET /v1/auth/jwks` (дефолт `true`). |
-| `KMS_LOCAL_MASTER_KEY` | мастер-ключ для envelope encryption BYOK на MVP (`LocalKmsClient`, реальный AES-256-GCM wrap DEK, [ADR-003](adr/ADR-003-byok-envelope-encryption.md)). Высокоэнтропийный (32 байта base64), **только через secret manager/env на сервере** (`.env` в `/opt/<service>`), под redaction. Миграция на облачный KMS — post-MVP ([Q-002-1](99-open-questions.md)). |
+| `KMS_LOCAL_MASTER_KEY` | мастер-ключ для envelope encryption BYOK на MVP (`LocalKmsClient`, реальный AES-256-GCM wrap DEK, [ADR-003](adr/ADR-003-byok-envelope-encryption.md)). Высокоэнтропийный (32 байта base64), **только через secret manager/env на сервере** (`.env` в `/opt/claude-hermes`), под redaction. Миграция на облачный KMS — post-MVP ([Q-002-1](99-open-questions.md)). |
 | `APPSTORE_*` | App Store Server API credentials (`APPSTORE_ENVIRONMENT`/`APPSTORE_BUNDLE_ID`/`APPSTORE_ROOT_CERT_DIR`) |
 | `APPLE_OIDC_ISSUER` | **(Sign in with Apple, [ADR-043](adr/ADR-043-sign-in-with-apple.md))** ожидаемый `iss` Apple identity token. Дефолт `https://appleid.apple.com`. Не секрет. |
 | `APPLE_JWKS_URL` | **(Apple)** JWKS Apple для верификации RS256-подписи. Дефолт `https://appleid.apple.com/auth/keys`. Кэш — общий `JWT_JWKS_CACHE_TTL` (300с). Не секрет. |
-| `APPLE_AUDIENCE` | **(Apple)** ожидаемый `aud` = **bundle id** приложения (нативный Sign in with Apple). **Per-instance** = реальный bundle (broadnova `com.lor.5075claude` / avelyra `com.nad.5112claude` / orvianix `com.ari.5108codex`). Пусто → фолбэк на `APPSTORE_BUNDLE_ID`. Оба пусты → `POST /v1/auth/apple` → `503` (not configured). Не секрет. |
+| `APPLE_AUDIENCE` | **(Apple)** ожидаемый `aud` = **bundle id** приложения (нативный Sign in with Apple) `claude-hermes`. Пусто → фолбэк на `APPSTORE_BUNDLE_ID`. Оба пусты → `POST /v1/auth/apple` → `503` (not configured). Не секрет. |
 | `APPLE_TEST_MODE` | **(Apple)** env-флаг HS256 test-mode для герметичных тестов (образец `STOREKIT_TEST_MODE`). Дефолт `false` (**prod fail-closed**: HS256-токен вне test-mode → `401`). **В prod не включать.** |
 | `APPLE_TEST_SECRET` | **(Apple)** общий секрет (HS256) для тестового Apple-токена. Обязателен при `APPLE_TEST_MODE=true` (пусто → test-mode не активируется). Секрет, под redaction. **В prod не задаётся.** |
 | `STOREKIT_TEST_MODE` | env-флаг тестовой верификации StoreKit. Дефолт `false` (**prod fail-closed, реальная JWS-верификация**). `true` — принимает HS256-тестовую транзакцию (только e2e/CI). При `true` — WARNING в лог на старте. См. [09-e2e-testing.md §2](09-e2e-testing.md#2-storekit_test_mode--env-gated-режим-тестовой-верификации), [TD-007](100-known-tech-debt.md). |
@@ -181,24 +130,24 @@ Reverse-proxy / LB (в нашей схеме — **внешний Traefik**) **�
 | `APNS_*` | credentials APNs для отправки push (`APNS_KEY_ID`/`APNS_TEAM_ID`/`APNS_AUTH_KEY`/`APNS_TOPIC`). **Не задаются в этом проходе** — отправка push отложена ([TD-011](100-known-tech-debt.md)). |
 | `RATE_LIMIT_*` | значения rate limits |
 | `SIZE_LIMIT_*` | size-лимиты payload |
-| `TRUSTED_PROXY_IPS` | comma-separated список IP/CIDR доверенных reverse-proxy/LB. Дефолт `""` → XFF/X-Real-IP не доверяются, используется socket peer IP. **В prod ОБЯЗАН** содержать адрес/подсеть **внешнего Traefik** — подсеть docker-сети `web` (через неё Traefik проксирует на `api`). Иначе `client_ip` берётся как IP Traefik, и per-IP rate limit неработоспособен ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md), [05-security.md](05-security.md#доверенный-reverse-proxy-и-определение-client-ip-anti-spoofing)). Подсеть `web` — `docker network inspect web` (поле `IPAM.Config.Subnet`) на сервере; для bridge-сети по умолчанию вида `172.x.0.0/16`. |
+| `TRUSTED_PROXY_IPS` | comma-separated список IP/CIDR доверенных reverse-proxy/LB. Дефолт `""` → XFF/X-Real-IP не доверяются, используется socket peer IP. **В prod ОБЯЗАН** содержать адрес/подсеть **нашего self-hosted Traefik** (`.156`) — подсеть docker-сети `web` (через неё Traefik проксирует на `api`). Иначе `client_ip` берётся как IP Traefik, и per-IP rate limit неработоспособен ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), [05-security.md](05-security.md#доверенный-reverse-proxy-и-определение-client-ip-anti-spoofing)). Подсеть `web` — `docker network inspect web` (поле `IPAM.Config.Subnet`) на сервере; для bridge-сети по умолчанию вида `172.x.0.0/16`. |
 | `TRUSTED_PROXY_HOP_COUNT` | число доверенных proxy-хопов перед приложением (chained LB/CDN). Дефолт `1`. Client IP берётся `(hop_count + 1)`-м справа из `X-Forwarded-For`. |
 | `DB_POOL_SIZE` | размер пула соединений БД на процесс. Дефолт `10`. |
 | `DB_MAX_OVERFLOW` | доп. соединения сверх `DB_POOL_SIZE` под пик. Дефолт `5`. |
 | `DB_POOL_TIMEOUT` | таймаут ожидания соединения из пула, сек. Дефолт `30`. |
 | `DB_POOL_RECYCLE` | принудительный recycle соединения, сек (борьба с idle-timeout на стороне PG/proxy). Дефолт `1800`. |
 | `METRICS_SCRAPE_TOKEN` | если задан — `GET /metrics` требует заголовок `X-Scrape-Token` с этим значением (иначе 403). Пусто → endpoint открыт, защищать сетевой политикой. |
-| `COMPOSE_PROJECT_NAME` | **(мульти-инстанс, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) §Мульти-инстанс)** имя docker-compose project = инстанс-префикс. Подставляется как `${COMPOSE_PROJECT_NAME:-claude-ios}` в image-теги (`<proj>-backend:prod`) и Traefik router/service-имена (`routers.<proj>`/`services.<proj>`). **Дефолт `claude-ios`** = текущее захардкоженное значение (инвариант обратной совместимости). На живом broadnova.shop **не задаётся** (= no-op). На клоне — имя инстанса (напр. `avelyra`), и деплой выполняется с `-p <proj>`. Public, не секрет. См. [§Мульти-инстанс](#мульти-инстанс--клонирование-сервиса). |
-| `SERVICE_DOMAIN` | домен сервиса. **Две роли:** (1) Traefik Host-роутер (label `Host(`broadnova.shop`)`) + ACME-сертификат ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)); (2) **с [ADR-031](adr/ADR-031-absolute-preview-url.md) читается и самим приложением** (`config.py` `service_domain`) для построения **абсолютного** preview-URL в `site.preview` (`https://<SERVICE_DOMAIN>/v1/preview/...`). Значение нормализуется приложением (срез протокола/хвостового слеша). **Значение для живого инстанса: `broadnova.shop`** ([Q-017-1](99-open-questions.md)); A-запись → `87.239.135.154` до запуска. **На клоне — домен клона** (напр. `avelyraweb.shop`, [§Мульти-инстанс](#мульти-инстанс--клонирование-сервиса)). **Уже задан в `.env` обоих прод-инстансов** (для Traefik) — фикс ADR-031 подхватится после деплоя без изменения prod-env. Пусто (локальная разработка) → `site.preview` отдаёт относительный путь (fallback). TLS/ACME по-прежнему выпускает внешний Traefik, не приложение. PUBLIC, не секрет. |
-| `TRAEFIK_CERTRESOLVER` | имя ACME-certresolver для label `tls.certresolver`. **Значение: `le`**. На broadnova `.154` ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)) — резолвер **внешнего** Traefik (`/opt/edge`, [Q-017-2](99-open-questions.md)), `le` default на entrypoint `websecure`, label опционален (рекомендован явно). На avorelio `.156` ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)) — резолвер **нашего** Traefik-контейнера (объявлен в его static-конфиге), label на `api` тот же. PUBLIC, не секрет. |
-| `ACME_EMAIL` | **(self-hosted Traefik, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md))** email для ACME Let's Encrypt **нашего** Traefik-контейнера (уведомления об истечении). Применяется **только** на deploy-target с self-hosted Traefik (avorelio `.156`): флаг `--certificatesresolvers.le.acme.email=${ACME_EMAIL}`. **Обязателен на `.156`** — пусто → Traefik fail-fast на старте (подстановка `:?`). На broadnova `.154` (внешний Traefik) **не используется** (ACME — ответственность чужого Traefik). PUBLIC, не секрет. |
+| `COMPOSE_PROJECT_NAME` | имя docker-compose project. Подставляется как `${COMPOSE_PROJECT_NAME:-claude-ios}` в image-теги (`<proj>-backend:prod`) и Traefik router/service-имена. **Дефолт `claude-ios`** унаследован из базового `docker-compose.prod.yml` (fork claude-ios, backward-compat) — на `.156` **задаётся `COMPOSE_PROJECT_NAME=claude-hermes`** в `.env` (перекрывает дефолт), деплой — с `-p claude-hermes` (совпадает с basename `/opt/claude-hermes`). Public, не секрет. |
+| `SERVICE_DOMAIN` | домен сервиса. **Две роли:** (1) Traefik Host-роутер (label `Host(`avorelio.shop`)`) + ACME-сертификат ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)); (2) **с [ADR-031](adr/ADR-031-absolute-preview-url.md) читается и самим приложением** (`config.py` `service_domain`) для построения **абсолютного** preview-URL в `site.preview` (`https://<SERVICE_DOMAIN>/v1/preview/...`). Значение нормализуется приложением (срез протокола/хвостового слеша). **Значение: `avorelio.shop`**; A-запись → `87.239.135.156` до запуска. Пусто (локальная разработка) → `site.preview` отдаёт относительный путь (fallback). TLS/ACME выпускает **наш** Traefik-контейнер. PUBLIC, не секрет. |
+| `TRAEFIK_CERTRESOLVER` | имя ACME-certresolver для label `tls.certresolver`. **Значение: `le`** — резолвер **нашего** Traefik-контейнера на `.156` ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), объявлен в его static-конфиге `--certificatesresolvers.le.*`). Label на `api` унаследован из базового compose (server-agnostic label-контракт [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)). PUBLIC, не секрет. |
+| `ACME_EMAIL` | **(self-hosted Traefik, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md))** email для ACME Let's Encrypt **нашего** Traefik-контейнера (уведомления об истечении). Флаг `--certificatesresolvers.le.acme.email=${ACME_EMAIL}` в overlay `docker-compose.avorelio.yml`. **Обязателен** — пусто → Traefik fail-fast на старте (подстановка `:?`). PUBLIC, не секрет. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | трейсы |
 | `LOG_LEVEL` | уровень логирования |
 | `CLIENT_API_KEY` | **(Hermes-интеграция, [ADR-044](adr/ADR-044-client-api-key-auth.md))** единый клиентский ключ для `X-API-Key` (авторизация всех `/v1/*` клиентского контура). Высокоэнтропийный (≥32 байта), **СЕКРЕТ**, secret manager, под redaction. Не задан → клиентский контур недоступен (всегда `401`). Per-instance. |
 | `CLIENT_API_KEY_PREV` | **(Hermes-интеграция, [ADR-044](adr/ADR-044-client-api-key-auth.md))** предыдущий клиентский ключ на grace-период ротации (опц.). Пусто вне ротации. Секрет, под redaction. |
 | `HERMES_IMAGE` | **(Hermes runtime, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md))** **публичный образ Hermes из registry** (pull по pinned-тегу/digest, **не `latest`**), напр. `nousresearch/hermes-agent:<pinned-tag>` (или `nousresearch/hermes-agent@sha256:...`). **Требование самодостаточности: образ тянется ИСКЛЮЧИТЕЛЬНО из публичного registry — сборки из внешних исходников Hermes на сервере нет** (на сервер деплоится только этот репозиторий; docker-py `containers.run(image=...)` авто-pull'ит при отсутствии). Per-instance. Фиксированный тег/digest для воспроизводимости. Предусловие: образ должен быть pullable на хосте daemon (`docker pull <ref>`) до первого `/v1/agent/*` или предзагружен. **Дефолт `''` (пусто) → fail-fast: `provision` без заданного образа невозможен** (явная мис-конфигурация, а не молчаливый `latest`). |
 | `HERMES_DOCKER_NETWORK` | **(Hermes runtime)** имя выделенной docker-сети control plane↔инстансы. Инстансы НЕ публикуют порт на хост — доступ только из этой сети; адресация по DNS контейнера (`hermes-user-<id>:8642`). **Дефолт `hermes-net`.** Создаётся на сервере однократно (`docker network create hermes-net`). |
-| `HERMES_VOLUME_ROOT` | **(Hermes runtime)** корневой путь на хосте для томов `HERMES_HOME` пользователей (`/opt/data` инстанса). Том на пользователя, сохраняется при гибернации. **Дефолт `/opt/data/hermes`** ([Q-046-3](99-open-questions.md): корректность дефолта при мульти-инстанс на shared-сервере). |
+| `HERMES_VOLUME_ROOT` | **(Hermes runtime)** корневой путь на хосте для томов `HERMES_HOME` пользователей (`/opt/data` инстанса). Том на пользователя, сохраняется при гибернации. **Дефолт `/opt/data/hermes`** — корректен на выделенном `.156` (единственный control plane на daemon, [ADR-057 §7](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), [Q-046-3](99-open-questions.md)). |
 | `HERMES_DEFAULT_TOOLSET` | **(Hermes runtime, [05-security.md](05-security.md#multi-tenant-изоляция-hermes-инстансов-adr-046-adr-045))** безопасный набор инструментов для `config.yaml` инстанса (`platform_toolsets.api_server`), дефолт `[web, file, vision, skills, todo]` (БЕЗ terminal/browser/code_execution/computer_use). Конфигурируем (задел под тарифы). |
 | `HERMES_IDLE_TIMEOUT_SECONDS` | **(Hermes runtime)** порог гибернации: контейнер с `last_active_at` старше — останавливается фоновым reaper (`stop_idle`). Будится по запросу. **Дефолт `1800`** (30 мин). |
 | `HERMES_REAPER_INTERVAL_SECONDS` | **(Hermes runtime)** интервал тика фонового reaper в `lifespan` (как часто проверяются idle-инстансы). Отделён от `HERMES_IDLE_TIMEOUT_SECONDS` (порог гибернации). **Дефолт `300`** (5 мин). |
@@ -224,12 +173,12 @@ Reverse-proxy / LB (в нашей схеме — **внешний Traefik**) **�
 Все секреты — из secret manager, не из plaintext `.env` в prod.
 
 ## Hermes runtime — деплой per-user инстансов ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md), [ADR-045](adr/ADR-045-hermes-as-agent-proxy.md))
-Control plane (`api`) управляет персональными Hermes-инстансами (Docker-контейнер + том на пользователя). Операционные требования к топологии shared-server + Traefik ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)):
+Control plane (`api`) управляет персональными Hermes-инстансами (Docker-контейнер + том на пользователя). Операционные требования (deploy-target `.156` avorelio, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md); инварианты runtime — [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)/[ADR-056](adr/ADR-056-provision-readiness-gate-and-volume-ownership.md)):
 
 - **Доступ control plane к Docker daemon (решение Спринта 5).** `api`-контейнеру control plane нужен доступ к Docker daemon для `docker run/start/stop/remove/inspect` инстансов через docker-py ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md)). Зафиксированы два пути:
   - **Основной — смонтированный docker.sock в режиме `:ro`, только в `api`.** В `docker-compose.prod.yml` сервис `api` монтирует `/var/run/docker.sock:/var/run/docker.sock:ro`. Монтируется **только** в `api` control plane — **не** в Hermes-инстансы, не в `postgres`/`redis`. Контейнер `api` работает под **non-root uid 10001** (без рутового пользователя внутри контейнера). Доступ к группе docker для uid 10001 на чтение сокета — операционная настройка хоста (GID docker-группы).
   - **Альтернатива — remote TLS Docker API.** Удалённый Docker API по TLS с **обязательной взаимной проверкой сертификатов** (`DOCKER_HOST=tcp://…`, `DOCKER_TLS_VERIFY=1`, `DOCKER_CERT_PATH`). **Отключение TLS verify запрещено** (`DOCKER_TLS_VERIFY` не снимать; не использовать незащищённый `tcp://` без TLS). Выбор основного пути vs remote — операционный.
-  - ⚠️ **Риск и митигация.** Доступ к Docker daemon ≈ root на хосте даже при `:ro`-сокете (read-only ограничивает запись в файл сокета, но **не** ограничивает Docker API — через него по-прежнему можно запускать привилегированные контейнеры). Это повышенная привилегия ([05-security.md §Multi-tenant изоляция](05-security.md#multi-tenant-изоляция-hermes-инстансов-adr-046-adr-045)). Митигация: сокет только в `api` (минимизация поверхности), non-root uid 10001 внутри `api`, docker.sock НЕ пробрасывается в Hermes-инстансы (toolset инстанса не включает `terminal`/`code_execution` — [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)/[05-security.md](05-security.md#multi-tenant-изоляция-hermes-инстансов-adr-046-adr-045)), на общем сервере — согласование с владельцем инфраструктуры (изоляция от соседних сервисов). Усиление (rootless Docker / socket-proxy с allowlist Docker API) — операционный задел.
+  - ⚠️ **Риск и митигация.** Доступ к Docker daemon ≈ root на хосте даже при `:ro`-сокете (read-only ограничивает запись в файл сокета, но **не** ограничивает Docker API — через него по-прежнему можно запускать привилегированные контейнеры). Это повышенная привилегия ([05-security.md §Multi-tenant изоляция](05-security.md#multi-tenant-изоляция-hermes-инстансов-adr-046-adr-045)). Митигация: сокет только в `api` (минимизация поверхности), non-root uid 10001 внутри `api`, docker.sock НЕ пробрасывается в Hermes-инстансы (toolset инстанса не включает `terminal`/`code_execution` — [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)/[05-security.md](05-security.md#multi-tenant-изоляция-hermes-инстансов-adr-046-adr-045)); на выделенном `.156` соседних чужих сервисов нет — поверхность меньше. Усиление (rootless Docker / socket-proxy с allowlist Docker API) — операционный задел.
 - **Выделенная docker-сеть** `HERMES_DOCKER_NETWORK` (дефолт `hermes-net`, отдельная от `web`/`default`): control plane ↔ Hermes-инстансы. В `docker-compose.prod.yml` сеть объявлена как **`external: true`** — compose **не создаёт** её, а ссылается на уже существующую; поэтому сеть **обязана быть создана на сервере ДО деплоя** control plane (`docker network create hermes-net`) — иначе `docker compose up` падает с ошибкой отсутствующей external-сети. Инстансы подключаются к ней при провижининге; **порт `8642` НЕ публикуется на хост** (`expose` внутри сети, без `ports:`). Адресация — по DNS-имени контейнера (`hermes-user-<id>:8642`). См. предзапусковый шаг в [prod-checklist](#prod-readiness-checklist-must-configure-before-launch).
 - **Том-рут `HERMES_VOLUME_ROOT`** на хосте — корень для томов `HERMES_HOME` (`/opt/data` каждого инстанса). Том на пользователя (приватные память/навыки/сессии), сохраняется при гибернации (`stop_idle`). Бэкап томов (как `pg_dump`) — операционное требование при наличии ценных пользовательских данных агента.
 - **Образ Hermes `HERMES_IMAGE` — публичный образ из registry (требование самодостаточности).** Образ Hermes тянется **исключительно** из публичного registry по **pinned-тегу/digest** (`nousresearch/hermes-agent:<pinned-tag>` или `...@sha256:...`, **не `latest`**). **Сборки из внешних исходников Hermes на сервере нет**: этот сервис (`claude-hermes`) самодостаточен — на сервер деплоится только данный репозиторий, а runtime-образ инстансов pull'ится из registry (`docker pull <ref>` как предусловие/предзагрузка, либо авто-pull docker-py при `provision`). **Зафиксировать тег/digest** для воспроизводимости. Per-instance.
@@ -237,7 +186,7 @@ Control plane (`api`) управляет персональными Hermes-ин�
 - **Cold-start readiness-gate ([ADR-056](adr/ADR-056-provision-readiness-gate-and-volume-ownership.md)):** образ Hermes (~5.3 GB) бутится ~30–40 с (s6 stage2 + запуск `api_server`). Control plane после `docker run` **поллит `GET /health` инстанса до `200`** (бюджет `HERMES_PROVISION_READY_TIMEOUT_SECONDS`=90с, интервал `HERMES_PROVISION_READY_INTERVAL_SECONDS`=2с) ПЕРЕД тем как пометить инстанс `running` и проксировать. Таймаут → cleanup контейнера + `502` (не «быстрый `502` в неготовый инстанс», а либо медленный успех, либо чистый отказ). Инвариант: `HERMES_PROVISIONING_STALE_SECONDS`(120) > `HERMES_PROVISION_READY_TIMEOUT_SECONDS`(90).
 - **Владение томом — `HERMES_UID`/`HERMES_GID` ([ADR-056 §4](adr/ADR-056-provision-readiness-gate-and-volume-ownership.md)):** Hermes-образ при старте (s6 stage2) `chown`'ит `/opt/data` (= host-том) на свой `HERMES_UID` (дефолт образа 10000). Control plane (api, **uid 10001**) пишет в том `config.yaml`. Чтобы владелец тома совпал с пишущим процессом, control plane прокидывает Hermes env **`HERMES_UID`/`HERMES_GID`=10001** (= uid/gid api-контейнера). **Обязательно держать `HERMES_UID`/`HERMES_GID` синхронными с фактическим uid/gid `api`-сервиса в `docker-compose`** — рассинхрон вернёт `PermissionError(13)` при reuse-`provision`. Дополнительно: `config.yaml` пишется идемпотентно (валидный существующий не перезаписывается при reuse).
 - **Health / rollback:** прокси `/v1/agent/*` зависит от доступности инстанса (`health(user_id)`); при недоступности — `502` ([ADR-045 §6](adr/ADR-045-hermes-as-agent-proxy.md)). Rollback образа Hermes — смена `HERMES_IMAGE` тега + пересоздание инстансов (`deprovision`/`provision`); том сохраняется.
-- **Мульти-инстанс control plane ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)):** Hermes-runtime per-instance — у каждого control-plane-инстанса своя docker-сеть/том-рут/`CLIENT_API_KEY`; Hermes-контейнеры именуются с учётом инстанса во избежание коллизий имён на общем Docker daemon.
+- **Одиночный control plane на выделенном `.156` ([ADR-057 §7](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)):** `claude-hermes` — **единственный** control plane на своём Docker daemon, поэтому дефолты `HERMES_DOCKER_NETWORK=hermes-net` + `HERMES_VOLUME_ROOT=/opt/data/hermes` корректны без per-instance-префиксов (коллизии возникали бы только при нескольких control plane на одном daemon — не наш случай). Hermes-контейнеры (`hermes-user-<id>`) на `.156` изолированы от любых других хостов.
 
 ## Роли БД — durable append-only `audit_logs` ([ADR-053](adr/ADR-053-audit-logs-db-append-only.md), prod-harden, [TD-001](100-known-tech-debt.md))
 Для durable-неизменяемости аудита на уровне БД (не только приложения) **runtime и миграции ходят под разными ролями**:
@@ -334,246 +283,90 @@ docker compose -f docker-compose.yml -f docker-compose.e2e.yml -f docker-compose
 ⚠️ `docker.sock` — высокая привилегия (≈ root на хосте даже `:ro`); override — для **локалки/e2e на доверенной машине**, зеркалит prod-митигации (сокет только в `api`, non-root uid 10001, toolset инстанса без `terminal`/`code_execution`). **Не использовать как prod-артефакт.** Процедура e2e-прогона агентного пути — [09-e2e-testing.md §3.3](09-e2e-testing.md#33-процедура-подъёма-bring-up).
 
 ## Prod-артефакты (источник истины — реальные файлы в репозитории)
-Devops заводит/обновляет артефакты под топологию shared-server + Traefik ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)). Документация ниже **обязана** совпадать с этими файлами — при расхождении правится та сторона, что отстала.
+Devops заводит/обновляет артефакты под топологию выделенного сервера `.156` + self-hosted Traefik ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)). Документация ниже **обязана** совпадать с этими файлами — при расхождении правится та сторона, что отстала.
 
 | Файл | Назначение |
 |---|---|
-| [`docker-compose.prod.yml`](../docker-compose.prod.yml) | Prod-стек под Traefik: `api` (Gunicorn+Uvicorn, **`expose: 8000`, без `ports:` 80/443**, в сетях `web` external + `default`, Traefik-labels) + `postgres` 16 (volume, **только** `default`, без портов) + `redis` 7 (**только** `default`, без портов) + одноразовый `migrate`-job. Образ `api`/`migrate` собирается **на сервере** (`build:`), не из registry. Секреты — из `.env`. **Нет** reverse-proxy/Caddy-сервиса (TLS — внешний Traefik). **Мульти-инстанс ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) §Мульти-инстанс): devops параметризует image-теги и Traefik router/service-имена через `${COMPOSE_PROJECT_NAME:-claude-ios}`** (дефолт = текущее `claude-ios`, инвариант обратной совместимости — `compose config` идентичен для существующего `.env`). См. [§Мульти-инстанс](#мульти-инстанс--клонирование-сервиса). |
-| [`.env.prod.example`](../.env.prod.example) | Шаблон prod-конфигурации/секретов (копируется в `.env` в `/opt/<service>` на сервере, заполняется из secret manager). Должен включать `SERVICE_DOMAIN=broadnova.shop` ([Q-017-1](99-open-questions.md)), `TRAEFIK_CERTRESOLVER=le` ([Q-017-2](99-open-questions.md)) и `TRUSTED_PROXY_IPS` = подсеть docker-сети `web`. **Мульти-инстанс ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) §Мульти-инстанс): devops добавляет закомментированный `COMPOSE_PROJECT_NAME` (дефолт `claude-ios`)** — на живом broadnova.shop остаётся незаданным (no-op), на клоне раскомментируется со своим значением. `HERMES_IMAGE` — **публичный pinned-плейсхолдер `nousresearch/hermes-agent:<pinned-tag>`** (не `latest`; пусто → fail-fast). Внизу файла — готовый к раскомментированию **§claude-hermes-блок** (новый инстанс: `COMPOSE_PROJECT_NAME=claude-hermes`, свой `SERVICE_DOMAIN`, `HERMES_DOCKER_NETWORK=claude-hermes-hermes-net`, `HERMES_VOLUME_ROOT=/opt/data/claude-hermes/hermes`, свежие секреты + pre-deploy шаги). Перечень переменных — [§Конфигурация (env)](#конфигурация-env), [prod-checklist](#prod-readiness-checklist-must-configure-before-launch). В образ не попадает. |
+| [`docker-compose.prod.yml`](../docker-compose.prod.yml) | Базовый prod-стек: `api` (Gunicorn+Uvicorn, **`expose: 8000`, без `ports:` 80/443**, в сетях `web`+`default`(+`hermes-net`), Traefik-labels) + `postgres` 16 (volume, **только** `default`, без портов) + `redis` 7 (**только** `default`, без портов) + одноразовый `migrate`-job. Образ `api`/`migrate` собирается **на сервере** (`build:`), не из registry. Секреты — из `.env`. **Сам по себе НЕ содержит сервиса `traefik`** и объявляет `web` как `external: true` — это **унаследованная от claude-ios база** (fork-ancestry); image-теги/router-имена параметризованы `${COMPOSE_PROJECT_NAME:-claude-ios}` (дефолт `claude-ios` перекрывается `COMPOSE_PROJECT_NAME=claude-hermes` в `.env` на `.156`). **Для деплоя `claude-hermes` применяется ТОЛЬКО вместе с overlay [`docker-compose.avorelio.yml`](../docker-compose.avorelio.yml)** (ниже). |
+| [`docker-compose.avorelio.yml`](../docker-compose.avorelio.yml) | **Overlay выделенного сервера `.156`** ([ADR-057 §3](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), [Q-057-1](99-open-questions.md) Closed). Добавляет **наш** сервис `traefik` (`traefik:v3.3` pinned; единственный с `ports: 80:80/443:443`; static-флаги в `command:`: provider docker `exposedbydefault=false`, entrypoints web/websecure, HTTP→HTTPS redirect, ACME `le`/HTTP-01/`acme.json`/`ACME_EMAIL`, `--api=false`; `docker.sock` `:ro`; named volume `traefik-acme`) + `group_add: DOCKER_SOCK_GID` и bind-mount `HERMES_VOLUME_ROOT` на `api` + переопределяет сеть `web` явным **`external: false`** и `name: web`. Деплой на `.156` — **всегда** `-f docker-compose.prod.yml -f docker-compose.avorelio.yml`. Базовый файл не трогается. |
+| [`.env.prod.example`](../.env.prod.example) | Шаблон prod-конфигурации/секретов (копируется в `.env` в `/opt/claude-hermes` на `.156`, заполняется из secret manager). Для `.156`: `COMPOSE_PROJECT_NAME=claude-hermes`, `SERVICE_DOMAIN=avorelio.shop`, `TRAEFIK_CERTRESOLVER=le`, **`ACME_EMAIL=<email>`** (обязателен), `TRUSTED_PROXY_IPS` = подсеть нашей `web`, `HERMES_DOCKER_NETWORK=hermes-net`, `HERMES_VOLUME_ROOT=/opt/data/hermes`. `HERMES_IMAGE` — **публичный pinned-плейсхолдер `nousresearch/hermes-agent:<pinned-tag>`** (не `latest`; пусто → fail-fast). Перечень переменных — [§Конфигурация (env)](#конфигурация-env), [prod-checklist](#prod-readiness-checklist-must-configure-before-launch). В образ не попадает. |
 | [`docker-compose.e2e.hermes.yml`](../docker-compose.e2e.hermes.yml) | **E2E-override** (НЕ prod-артефакт): третий compose-файл поверх `docker-compose.yml` + `docker-compose.e2e.yml`, дающий `api` в e2e доступ к `docker.sock:ro` + подключение к сети `hermes-net` (`external: true`) для **реального** провижининга Hermes-инстанса control plane'ом по пути `/v1/agent/*` (путь «а» [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)). Предусловия (на хосте daemon): `docker network create hermes-net`, `docker pull HERMES_IMAGE`, `DOCKER_SOCK_GID`/`group_add` для uid 10001, writable `HERMES_VOLUME_ROOT`. Команда и нюансы — [§E2E с реальным Hermes](#e2e-с-реальным-hermes--override-docker-composee2ehermesyml-агентный-путь-v1agent), [09-e2e-testing.md §3.3](09-e2e-testing.md#33-процедура-подъёма-bring-up). **Не использовать как prod-артефакт** (docker.sock — высокая привилегия). |
-| [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | Основной CI-pipeline + **gated deploy-job**. Jobs `quality` (ruff format/check + mypy), `test` (pytest c coverage-gate), `build-image` (сборка Docker-образа), затем `deploy` с `needs: [quality, test, build-image]` и `if: github.ref == 'refs/heads/main' && success()`. Deploy запускается **только** после зелёного прохождения всех CI-jobs на ветке `main`; при красном CI deploy не стартует. **Мульти-инстанс ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) §Мульти-инстанс): devops добавляет `INSTANCES`-loop** (`dir:project`, `claude-ios:claude-ios` первым → backward-compat no-op) — deploy-job итерирует по инстансам. Спека — [§CI/CD INSTANCES-loop](#cicd-контракт-instances-loop-мульти-инстанс). См. [§CI/CD (gate)](#cicd-gate), [§Процедура деплоя](#процедура-деплоя-github-actions--ssh). |
-| [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) | **Ручной** deploy-workflow (`workflow_dispatch` only, **без** push-триггера) — резервный запуск выкатки вручную (напр. повторный деплой без нового коммита). Шаги **идентичны** deploy-job в `ci.yml` (`appleboy/ssh-action`, `script_stop: false`; remote-скрипт под `set -uo pipefail` без `-e`): SSH на сервер (`SSH_HOST`/`SSH_USER`/`SSH_PRIVATE_KEY` из GitHub Secrets) → per-instance loop по `$INSTANCES` `build api migrate` → `run --rm migrate` → `up -d --no-build` → readiness-gate (health `${proj}-api-1`) → NON-FATAL smoke `/healthz`; реальные сбои копятся в `$FAILED`, финальный `exit 1` краснит job. См. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh), [§CI/CD INSTANCES-loop](#cicd-контракт-instances-loop-мульти-инстанс). |
+| [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | Основной CI-pipeline + **gated deploy-job `deploy-avorelio`**. Jobs `quality` (ruff format/check + mypy), `test` (pytest c coverage-gate), `build-image` (сборка Docker-образа, validation-only), затем **единственный** deploy-job `deploy-avorelio` с `needs: [quality, test, build-image]` и `if: github.ref == 'refs/heads/main' && success()`. Deploy запускается **только** после зелёного прохождения всех CI-jobs на ветке `main` и идёт **строго на `.156`** (секрет `SSH_HOST_AVORELIO`). **`INSTANCES`-loop / мульти-инстанс-цикл broadnova удалён** (был fork-артефакт claude-ios, деплоил чужие сервисы). См. [§CI/CD (gate)](#cicd-gate), [§Процедура деплоя](#процедура-деплоя-github-actions--ssh-156). |
+| [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) | **Ручной** deploy-workflow (`workflow_dispatch` only, **без** push-триггера) — резервный запуск выкатки вручную (напр. повторный деплой без нового коммита, или после «устаканивания» DNS/ACME). Job **`deploy-avorelio`** идентичен deploy-job в `ci.yml` (`appleboy/ssh-action`, `script_stop: false`; remote-скрипт под `set -uo pipefail` без `-e`): SSH на `.156` (`SSH_HOST_AVORELIO`/`SSH_USER`/`SSH_PRIVATE_KEY`) → `cd /opt/claude-hermes` → `git pull --ff-only` → `build api migrate` (overlay `-f docker-compose.prod.yml -f docker-compose.avorelio.yml`) → `run --rm migrate` → `up -d --no-build` → readiness-gate (health `claude-hermes-api-1`) → NON-FATAL smoke `https://avorelio.shop/healthz`. См. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh-156). |
 | [`docker-compose.prod.observability.yml`](../docker-compose.prod.observability.yml) | Опциональный overlay наблюдаемости (Prometheus scrape `/metrics` и т.п.) поверх prod-стека. Подключается через `-f docker-compose.prod.yml -f docker-compose.prod.observability.yml`. Конфиги — [`infra/observability/`](../infra/observability/). См. [§Наблюдаемость в проде](#наблюдаемость-в-проде). |
 
-> **Legacy-артефакты (DEPRECATED, НЕ используются в схеме shared-server + Traefik, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)).** Reverse-proxy и TLS — ответственность внешнего Traefik, не наша. Следующие файлы — наследие прежней VPS+Caddy-схемы ([TD-005](100-known-tech-debt.md)); перенесены в `infra/legacy/` с DEPRECATED-баннером и в текущей топологии **не подключаются** (не актуальная схема):
-> - [`infra/legacy/Caddyfile`](../infra/legacy/Caddyfile) — наш Caddy не используется (TLS/ACME у Traefik). DEPRECATED.
+> **Legacy-артефакты (DEPRECATED, НЕ используются в схеме `.156` self-hosted Traefik, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)).** Reverse-proxy и TLS — **наш** Traefik-контейнер, отдельный Caddy/nginx не нужен. Следующие файлы — наследие прежней VPS+Caddy-схемы ([TD-005](100-known-tech-debt.md)); перенесены в `infra/legacy/` с DEPRECATED-баннером и в текущей топологии **не подключаются** (не актуальная схема):
+> - [`infra/legacy/Caddyfile`](../infra/legacy/Caddyfile) — наш Caddy не используется (TLS/ACME у нашего Traefik). DEPRECATED.
 > - [`infra/legacy/nginx.conf.example`](../infra/legacy/nginx.conf.example) — наш nginx не используется. DEPRECATED.
-> - [`infra/legacy/deploy-vps.sh`](../infra/legacy/deploy-vps.sh) — VPS/SSH-специализация под registry+immutable-tag; заменена GitHub Actions SSH workflow (per-instance loop: `git pull --ff-only` → explicit `build` → `migrate` → `up -d --no-build` → readiness-gate, см. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh)). DEPRECATED.
+> - [`infra/legacy/deploy-vps.sh`](../infra/legacy/deploy-vps.sh) — VPS/SSH-специализация под registry+immutable-tag; заменена GitHub Actions SSH workflow (`git pull --ff-only` → explicit `build` → `migrate` → `up -d --no-build` → readiness-gate, см. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh-156)). DEPRECATED.
 
-## Процедура деплоя (GitHub Actions → SSH)
-Деплой на общий сервер ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)). Образ **собирается на сервере** из исходников (нет registry/immutable-tag).
+## Процедура деплоя (GitHub Actions → SSH, `.156`)
+Деплой на **выделенный** сервер `.156` avorelio ([ADR-057 §5](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)). Образ **собирается на сервере** из исходников (нет registry/immutable-tag). **Единственный** deploy-job — `deploy-avorelio`; мульти-инстанс-цикла нет.
 
-**Триггер деплоя — gated job в `ci.yml`, не отдельный параллельный workflow.** `deploy`-job в [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) объявлен с `needs: [quality, test, build-image]` и `if: github.ref == 'refs/heads/main' && success()`: deploy выполняется **только после** успешного прохождения всех CI-jobs (lint/format/type-check + test + build-image) на ветке `main`. При красном CI (любой fail в `quality`/`test`/`build-image`) deploy **не стартует** — нет выкатки непрошедшего проверки кода. Ручной запуск без нового коммита — через `deploy.yml` (`workflow_dispatch`, см. [§Prod-артефакты](#prod-артефакты-источник-истины--реальные-файлы-в-репозитории)).
+**Триггер деплоя — gated job `deploy-avorelio` в `ci.yml`, не отдельный параллельный workflow.** Job объявлен с `needs: [quality, test, build-image]` и `if: github.ref == 'refs/heads/main' && success()`: deploy выполняется **только после** успешного прохождения всех CI-jobs (lint/format/type-check + test + build-image) на ветке `main`. При красном CI deploy **не стартует**. Ручной запуск без нового коммита — через `deploy.yml` (`workflow_dispatch`, тот же job `deploy-avorelio`, см. [§Prod-артефакты](#prod-артефакты-источник-истины--реальные-файлы-в-репозитории)). Job-level `concurrency: deploy-avorelio` (`cancel-in-progress: false`) — один in-flight деплой не отменяется на полпути.
 
-Сами шаги выкатки (SSH по серверу) **идентичны** в gated deploy-job (`ci.yml`) и ручном `deploy.yml` — это per-instance loop по `$INSTANCES` (полная спека — [§CI/CD INSTANCES-loop](#cicd-контракт-instances-loop-мульти-инстанс)). Деплой-скрипт выполняется под `set -uo pipefail` **намеренно без `-e`** (см. ниже), а `appleboy/ssh-action` вызывается с `script_stop: false` (иначе action инжектит `set -e` поверх нашего и оборвёт loop на первой же ненулевой команде).
+Шаги выкатки (SSH на `.156`) **идентичны** в gated deploy-job (`ci.yml`) и ручном `deploy.yml`. Деплой-скрипт выполняется под `set -uo pipefail` **намеренно без `-e`** (реальные сбои ловятся явными rc-проверками + readiness-gate; фьюзированный rc `up --build` не доверяется), а `appleboy/ssh-action` вызывается с `script_stop: false` (иначе action инжектит `set -e` поверх нашего).
 
 ```
-# GitHub Actions step (appleboy/ssh-action, script_stop: false):
-set -uo pipefail   # NO `-e` — loop ОБЯЗАН пройти ВСЕ инстансы; per-instance ошибки копятся в $FAILED
-INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio claude-hermes:claude-hermes"   # claude-ios первым (backward-compat)
-FAILED=""
-for entry in $INSTANCES; do
-  dir="${entry%%:*}"; proj="${entry##*:}"
-  cd "/opt/$dir"                                  || { FAILED="$FAILED $proj"; continue; }
-  git pull --ff-only                              || { FAILED="$FAILED $proj"; continue; }
-  # (1) explicit build (реальная ошибка сборки => fail инстанса)
-  docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env build api migrate \
-                                                  || { FAILED="$FAILED $proj"; continue; }
-  # (2) explicit migrate ПЕРЕД api (реальная ошибка миграции => fail инстанса)
-  docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate \
-                                                  || { FAILED="$FAILED $proj"; continue; }
-  # (3) start only — rc НЕ доверяется (фиксируется в up_rc, решает readiness-gate)
-  up_rc=0
-  docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --no-build || up_rc=$?
-  # (4) readiness-gate: poll health контейнера ${proj}-api-1 = healthy (30×2s ≈ 60s)
-  ready=0
-  for i in $(seq 1 30); do
-    h="$(docker inspect "${proj}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
-    [ "$h" = "healthy" ] && { ready=1; break; }
-    sleep 2
-  done
-  [ "$ready" -eq 1 ] || { docker logs "${proj}-api-1" --tail 40 || true; FAILED="$FAILED $proj"; continue; }
-  # (5) per-instance smoke по SERVICE_DOMAIN из /opt/$dir/.env — NON-FATAL (warning, не fail)
-  # ... curl -fsS https://$SERVICE_DOMAIN/healthz (12×5s); неуспех => ::warning, не FAILED
+# GitHub Actions step (appleboy/ssh-action, script_stop: false), host = SSH_HOST_AVORELIO (.156):
+set -uo pipefail   # NO `-e` (реальные сбои — через явные rc-проверки + readiness-gate)
+DIR=/opt/claude-hermes
+PROJ=claude-hermes
+COMPOSE="docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env"
+cd "$DIR"                          || { echo "::error::cd failed"; exit 1; }
+git pull --ff-only                 || { echo "::error::git pull failed"; exit 1; }
+# (1) build api + migrate НА СЕРВЕРЕ (реальная ошибка сборки => fail)
+$COMPOSE build api migrate         || { echo "::error::build failed"; exit 1; }
+# (2) migrate ПЕРЕД api (реальная ошибка миграции => fail)
+$COMPOSE run --rm migrate          || { echo "::error::migrate failed"; exit 1; }
+# (3) start (traefik + api + postgres + redis); rc НЕ доверяется, решает readiness-gate
+up_rc=0
+$COMPOSE up -d --no-build          || up_rc=$?
+# (4) readiness-gate: health контейнера claude-hermes-api-1 = healthy (30×2s ≈ 60s;
+#     compose healthcheck = GET /ready: db+redis)
+ready=0
+for i in $(seq 1 30); do
+  h="$(docker inspect "${PROJ}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
+  [ "$h" = "healthy" ] && { ready=1; break; }
+  sleep 2
 done
+[ "$ready" -eq 1 ] || { docker logs "${PROJ}-api-1" --tail 40 || true; echo "::error::api not healthy"; exit 1; }
+# (5) public smoke через НАШ Traefik (TLS+Host) — NON-FATAL (первый ACME/DNS могут устаканиваться)
+for i in $(seq 1 12); do curl -fsS --max-time 5 https://avorelio.shop/healthz >/dev/null && break; sleep 5; done  # неуспех => ::warning, не fail
 docker image prune -f || true
-# Job RED iff хотя бы один инстанс РЕАЛЬНО упал (cd/pull/build/migrate/api-not-healthy):
-[ -n "$FAILED" ] && { echo "::error::instance(s) failed:$FAILED"; exit 1; }
 ```
 
-GitHub Secrets (обязательны для workflow): `SSH_HOST=87.239.135.154`, `SSH_USER=root`, `SSH_PRIVATE_KEY` (приватный ключ для SSH; публичный — в `~/.ssh/authorized_keys` на сервере).
+GitHub Secrets (обязательны для workflow): `SSH_HOST_AVORELIO=87.239.135.156` (**отдельный** секрет хоста), `SSH_USER=root`, `SSH_PRIVATE_KEY` (приватный ключ; публичный — в `~/.ssh/authorized_keys` на `.156`). `.env` в `/opt/claude-hermes` — на сервере вручную из secret manager (не через GitHub Secrets), переживает `git pull` (`.gitignore`).
 
-**Почему `set -uo pipefail` БЕЗ `-e` + `script_stop: false` (намеренно, не баг).** `-e` оборвал бы loop на первой ненулевой команде первого инстанса — и второй инстанс (avelyra) никогда бы не задеплоился. Вместо обрыва deploy-скрипт:
-- пропускает `-e` и ловит **реальные** ошибки явными rc-проверками (`cd`/`git pull --ff-only`/`build`/`migrate`) — на ошибке инстанс заносится в `$FAILED` и loop делает `continue` к следующему (один сбойный инстанс **не** обрывает остальные);
-- аккумулирует упавшие инстансы в `$FAILED` и в конце, **вне** loop и **вне** любого guard, делает `exit 1` если `$FAILED` непуст — реальный сбой любого инстанса краснит job;
-- `script_stop: false` обязателен: при `true` action инжектит `set -e` в remote-скрипт поверх нашего `set -uo pipefail`, что вернуло бы поведение обрыва на первой ошибке.
+**Почему `set -uo pipefail` БЕЗ `-e` + `script_stop: false` (намеренно, не баг).** Совмещённый прежде `up -d --build` фьюзил в один exit code три операции (BuildKit-сборку, one-shot `migrate`-зависимость с `restart:"no"`, старт `api`) и отдавал транзиентный non-zero сразу после `api Started`, что под `set -e`/`script_stop:true` ложно краснило job, хотя `api` поднимался healthy. Поэтому: `-e` не используется, build/migrate — **явные** шаги с rc-проверкой (ловят реальные ошибки), rc `up` не доверяется, а готовность `api` — источник истины **readiness-gate** (health контейнера). `script_stop: false` обязателен: при `true` action инжектит `set -e` поверх нашего `set -uo pipefail`.
 
-Что делает workflow по шагам **на каждый инстанс** (`dir:project` из `$INSTANCES`, claude-ios первым):
+Шаги по порядку:
 
-1. **SSH на сервер** (`appleboy/ssh-action`, `script_stop: false`), затем loop по `$INSTANCES`; для инстанса `cd /opt/<dir>` (каталог стека: `docker-compose.prod.yml` + `.env`; сеть `web` уже создана). Неуспех `cd` → `$FAILED` + `continue`.
-2. **`git pull --ff-only`** — подтянуть актуальный код в `/opt/<dir>`. Неуспех → `$FAILED` + `continue`.
-3. **Build (явный):** `docker compose -p <proj> -f docker-compose.prod.yml --env-file .env build api migrate` — собирает образ `api`/`migrate` **на сервере**. Реальная ошибка сборки → `$FAILED` + `continue`.
-4. **Миграции (явные, ПЕРЕД api):** `docker compose -p <proj> ... run --rm migrate` (= `alembic upgrade head`, цепочка `0001`→`0007`) — до старта нового `api`. Миграции expand/contract (backward-compatible), старый `api` продолжает работать на время накатки. Реальная ошибка миграции → `$FAILED` + `continue`.
-5. **Старт (только up, без build):** `docker compose -p <proj> ... up -d --no-build` — поднимает новый `api` (образ уже собран в шаге 3). **rc этой команды НЕ доверяется** (фиксируется в `up_rc` через `|| up_rc=$?`): one-shot `migrate`-зависимость и BuildKit-сессия могут вернуть транзиентный non-zero при здоровом `api`. Источник истины готовности — readiness-gate (шаг 6), а не rc `up`.
-6. **Readiness-gate (источник истины):** poll `docker inspect ${proj}-api-1 --format '{{.State.Health.Status}}'` = `healthy`, 30 попыток × 2s (≈60s; compose healthcheck = `GET /ready`: db+redis). Не стал healthy → `::error` + `docker logs ... --tail 40` + `$FAILED` + `continue` (РЕАЛЬНЫЙ сбой инстанса).
-7. **Per-instance smoke (NON-FATAL):** `curl -fsS https://$SERVICE_DOMAIN/healthz` по домену из `/opt/<dir>/.env` (12×5s). Неуспех → `::warning` (на первом деплое DNS/ACME-сертификат могут ещё «устаканиваться»), **не** заносит в `$FAILED`. Нет `SERVICE_DOMAIN` в `.env` → smoke для этого инстанса пропускается.
-8. **Финал (вне loop):** `docker image prune -f` (best-effort); если `$FAILED` непуст → `::error` + `exit 1` (job RED). Иначе job зелёный.
+1. **SSH на `.156`** (`appleboy/ssh-action`, `script_stop: false`), `cd /opt/claude-hermes` (каталог стека: `docker-compose.prod.yml` + overlay + `.env`; сеть `hermes-net` создана до деплоя, `web` создаёт compose). Неуспех `cd` → `::error` + `exit 1`.
+2. **`git pull --ff-only`** — актуальный код в `/opt/claude-hermes`. Неуспех → `exit 1`.
+3. **Build (явный):** `$COMPOSE build api migrate` (overlay включён) — собирает образ `api`/`migrate` **на сервере**. Реальная ошибка сборки → `exit 1`.
+4. **Миграции (явные, ПЕРЕД api):** `$COMPOSE run --rm migrate` (= `alembic upgrade head`) — до старта нового `api`. Миграции expand/contract (backward-compatible). Реальная ошибка → `exit 1`.
+5. **Старт (только up, без build):** `$COMPOSE up -d --no-build` — поднимает `traefik`+`api`+`postgres`+`redis`. **rc НЕ доверяется** (`|| up_rc=$?`). Источник истины — readiness-gate.
+6. **Readiness-gate (источник истины):** poll `docker inspect claude-hermes-api-1 --format '{{.State.Health.Status}}'` = `healthy`, 30×2s (≈60s; compose healthcheck = `GET /ready`: db+redis). Не стал healthy → `::error` + `docker logs --tail 40` + `exit 1`.
+7. **Public smoke (NON-FATAL):** `curl -fsS https://avorelio.shop/healthz` (12×5s) через **наш** Traefik. Неуспех → `::warning` (на первом деплое **наш** Traefik ещё выпускает Let's Encrypt-сертификат HTTP-01, DNS может «устаканиваться»), **не** краснит job.
+8. **Финал:** `docker image prune -f` (best-effort).
 
-> **Источник истины готовности — readiness-gate, не rc `up`.** Переход с прежнего совмещённого `docker compose up -d --build` на явные шаги build → migrate → `up -d --no-build` → readiness-gate устранил инцидент: совмещённая команда фьюзила в один exit code три разные операции (BuildKit-сборку, one-shot `migrate`-зависимость с `restart:"no"`, старт `api`) и отдавала транзиентный non-zero сразу после `api Started`, что под прежним `set -e`/`script_stop:true` обрывало loop **до** второго инстанса и ложно краснило job, хотя `api` поднимался healthy. Теперь build/migrate — явные шаги с rc-проверкой (ловят **реальные** ошибки), а готовность `api` верифицируется readiness-gate'ом (а не ненадёжным rc `up`).
+<a id="мульти-инстанс--клонирование-сервиса"></a><a id="cicd-контракт-instances-loop-мульти-инстанс"></a>
+## Отдельные сервисы (fork-ancestry) — НЕ деплоятся из этого репозитория
+> Прежние разделы «Мульти-инстанс / клонирование сервиса» и «CI/CD-контракт: INSTANCES-loop» **удалены** (fork-артефакт claude-ios). Входящие ссылки ведут сюда. Актуальная топология — [§Топология](#топология--выделенный-сервер-156-avorelio-self-hosted-traefik-adr-057).
 
-## Мульти-инстанс / клонирование сервиса
+`claude-hermes` отпочкован от `claude-ios`, у которого была схема мульти-инстанс-клонирования за общим Traefik на `.154` ([ADR-017 §Мульти-инстанс](adr/ADR-017-shared-server-traefik-deploy.md)). **Для `claude-hermes` эта схема неприменима** — сервис деплоится ровно на один выделенный сервер `.156` (см. [§Топология](#топология--выделенный-сервер-156-avorelio-self-hosted-traefik-adr-057), [§Процедура деплоя](#процедура-деплоя-github-actions--ssh-156)).
 
-> Расширение [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md) (раздел «Мульти-инстанс», 2026-06-10). Паттерн портирован из соседнего сервиса lovable-ai и **упрощён** под архитектуру claude-ios (`api`+`postgres`+`redis`+`migrate`+per-instance `.secrets/` JWT keypair — без build-фермы, egress-proxy, worker/beat, S3, host-dir провижининга). Статус выката второго инстанса — [Q-017-3](99-open-questions.md).
+Следующие инстансы — **самостоятельные сервисы** (свои репозитории, серверы, домены, БД, секреты) и к деплою `claude-hermes` **отношения не имеют** (не путать):
 
-### Назначение
-Один и тот же код claude-ios запускается **несколькими изолированными инстансами** на том же общем сервере (`87.239.135.154`) за тем же общим edge-Traefik (`/opt/edge`), каждый под **своим доменом**:
-- `claude-ios` (живой) — `broadnova.shop`, каталог `/opt/claude-ios`.
-- `avelyra` — `avelyraweb.shop` (DNS уже → `87.239.135.154`), каталог `/opt/avelyra`.
-- `orvianix` (OpenAI-инстанс, [ADR-033](adr/ADR-033-llm-provider-abstraction.md)) — `orvianix.shop`, каталог `/opt/orvianix`, `LLM_PROVIDER=openai` + per-instance `OPENAI_API_KEY`.
-- `veltrio` (2-й OpenAI-инстанс, [ADR-033](adr/ADR-033-llm-provider-abstraction.md)) — `veltriohub.shop`, каталог `/opt/veltrio`, `LLM_PROVIDER=openai` + per-instance `OPENAI_API_KEY`.
-- `claude-hermes` (Hermes-per-user control plane, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)) — свой домен (per-instance), каталог `/opt/claude-hermes`. **Новый самодостаточный инстанс** (не переименование claude-ios): своя БД/секреты/JWT keypair + **отдельные** Hermes-ресурсы (`HERMES_DOCKER_NETWORK=claude-hermes-hermes-net`, `HERMES_VOLUME_ROOT=/opt/data/claude-hermes/hermes`) во избежание коллизий на общем Docker daemon ([Q-046-3](99-open-questions.md)). Образ Hermes — только публичный pinned из registry ([§Hermes runtime](#hermes-runtime--деплой-per-user-инстансов-adr-046-adr-045)).
-
-Инстансы **полностью изолированы** по данным, секретам и JWT keypair. Разделяется **только** внешняя сеть `web` + сам Traefik (общие для всех сервисов сервера). StoreKit/preview/website-builder работают **в каждом инстансе как есть** на своих per-instance секретах (`PREVIEW_URL_SECRET`, `STOREKIT_TEST_SECRET` и т.д.) — поведение модулей не меняется, меняется только конфигурация на инстанс.
-
-> **OpenAI-инстансы (3-й `orvianix` и 4-й `veltrio`, провайдер-абстракция, [ADR-033](adr/ADR-033-llm-provider-abstraction.md)).** Тот же код, провайдер выбирается env: на OpenAI-клоне задаётся `LLM_PROVIDER=openai` + per-instance `OPENAI_API_KEY` (секрет) и при необходимости `OPENAI_MODEL`/`OPENAI_MAX_TOKENS`/`OPENAI_TIMEOUT_SECONDS`/`OPENAI_MAX_RETRIES`/`OPENAI_BYOK_DEFAULT_MODEL` ([§Конфигурация (env)](#конфигурация-env), [clone `.env`-контракт](#clone-env-контракт-ключи-claude-ios)). Процедура провижининга идентична — добавляется только `LLM_PROVIDER=openai`/`OPENAI_*` в `.env` клона, прочее (JWT keypair, изоляция БД/секретов, `-p <inst>`) без отличий. `INSTANCES`-loop расширяется на одну запись на каждый инстанс (см. [§CI/CD INSTANCES-loop](#cicd-контракт-instances-loop-мульти-инстанс)). Анти-инвариант: на anthropic-инстансах `LLM_PROVIDER` не задаётся (дефолт `anthropic`) — `compose config`/поведение не меняются.
-
-### Инвариант обратной совместимости (КРИТИЧНО — не сломать живой broadnova.shop)
-Любая параметризация `docker-compose.prod.yml` **обязана** иметь дефолт = текущему захардкоженному значению (`claude-ios`). Формальный критерий приёмки для devops:
-```
-# Для СУЩЕСТВУЮЩЕГО /opt/claude-ios/.env (без ключа COMPOSE_PROJECT_NAME):
-docker compose -f docker-compose.prod.yml --env-file .env config
-```
-даёт **идентичный** результат до и после параметризации — те же project-name (`claude-ios`), image (`claude-ios-backend:prod`), router/service-имена (`claude-ios`), сети, тома. Любое расхождение = регрессия живого прода.
-Эквивалентность команд для живого инстанса (обе дают project-name `claude-ios`):
-- текущая: `docker compose -f docker-compose.prod.yml --env-file .env up -d` (БЕЗ `-p`; project = basename `/opt/claude-ios`);
-- новая: `docker compose -p claude-ios -f docker-compose.prod.yml --env-file .env up -d` — **no-op** относительно текущей.
-
-### Что параметризуется в `docker-compose.prod.yml` (спека для devops)
-Единственный новый ключ — `COMPOSE_PROJECT_NAME` (дефолт `claude-ios`). Подставляется как `${COMPOSE_PROJECT_NAME:-claude-ios}` в трёх местах:
-
-| Текущее (хардкод) | После параметризации | Где |
-|---|---|---|
-| `image: claude-ios-backend:prod` | `image: ${COMPOSE_PROJECT_NAME:-claude-ios}-backend:prod` | сервисы `migrate` **и** `api` |
-| `traefik.http.routers.claude-ios.rule` (и `.entrypoints`/`.tls`/`.tls.certresolver`) | `traefik.http.routers.${COMPOSE_PROJECT_NAME:-claude-ios}.rule` (и остальные router-labels) | labels сервиса `api` |
-| `traefik.http.services.claude-ios.loadbalancer.server.port` | `traefik.http.services.${COMPOSE_PROJECT_NAME:-claude-ios}.loadbalancer.server.port` | labels сервиса `api` |
-
-**Уже параметризовано (не трогать):** `Host(\`${SERVICE_DOMAIN}\`)`, `tls.certresolver=${TRAEFIK_CERTRESOLVER}` (значения — из `.env` каждого инстанса).
-**Изолируется автоматически по project-name (без правок compose):** контейнеры, `default`-сеть, тома `pgdata`/`redisdata` (становятся `<project>_pgdata`/`<project>_redisdata`). Внешняя сеть `web` остаётся общей (`external: true`).
-**Передача `-p`:** project-name задаётся флагом `-p <inst>` в команде деплоя (приоритет: CLI `-p` > `COMPOSE_PROJECT_NAME` env > top-level `name:` > basename каталога). Top-level `name:` в файл **не добавляется** — иначе он переопределит basename для живого инстанса при деплое без `-p`.
-
-### Clone `.env`-контракт (ключи claude-ios)
-Клон копирует `.env.prod.example` → `/opt/<inst>/.env` и переопределяет помеченные ключи **свежими** значениями (НЕ копиями соседа). Полный перечень переменных и дефолтов — [§Конфигурация (env)](#конфигурация-env); ниже — что обязательно меняется на инстанс:
-
-| Ключ | На клоне | Тип | Примечание |
+| Сервис | Домен | Провайдер | Отношение к этому репозиторию |
 |---|---|---|---|
-| `COMPOSE_PROJECT_NAME` | имя инстанса (напр. `avelyra`) | новый, public | Дефолт `claude-ios`. На живом — не задаётся (= no-op). |
-| `SERVICE_DOMAIN` | домен клона (`avelyraweb.shop`) | public | Host-роутер Traefik + ACME. DNS A-запись → `87.239.135.154` до старта. |
-| `JWT_ISSUER` | `https://<домен>` (`https://avelyraweb.shop`) | public | Совпадает с доменом ([ADR-018](adr/ADR-018-embedded-auth-issuer.md)). |
-| `JWT_AUDIENCE` | по умолчанию `claude-ios` (можно оставить) | public | Аудиенс токена; меняется только если у клона своё iOS-приложение/bundle. |
-| `TRUSTED_PROXY_IPS` | подсеть docker-сети `web` | public | `docker network inspect web` → `IPAM.Config.Subnet`. Та же `web`, что у соседа → значение совпадает. |
-| `TRAEFIK_CERTRESOLVER` | `le` (тот же общий резолвер) | public | Общий для всех инстансов. |
-| `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD` | **свои** (свежий пароль `openssl rand -base64 32`) | `POSTGRES_PASSWORD` — **секрет** | Своя изолированная БД — свои `POSTGRES_USER`/`POSTGRES_DB`/`POSTGRES_PASSWORD`. **`DATABASE_URL` собирается из этих трёх целиком** (`postgresql+asyncpg://<POSTGRES_USER>:<POSTGRES_PASSWORD>@postgres:5432/<POSTGRES_DB>`) — все три значения должны совпадать с `DATABASE_URL` клона. См. CLONE NOTE в `.env.prod.example`. |
-| `KMS_KEY_ID` | **пуст** (на MVP) | public | На MVP `KMS_KEY_ID` пуст: используется `LocalKmsClient` (in-process AES-256-GCM wrap под `KMS_LOCAL_MASTER_KEY`, облачного KMS пока нет, [Q-002-1](99-open-questions.md), [ADR-003](adr/ADR-003-byok-envelope-encryption.md)). Шифрование at-rest — на свежем per-instance `KMS_LOCAL_MASTER_KEY` (см. ниже); BYOK-шифр между инстансами не переносим. |
-| `LLM_PROVIDER` | `anthropic` (дефолт) ИЛИ `openai` (на OpenAI-клоне) | public | **(провайдер-абстракция, [ADR-033](adr/ADR-033-llm-provider-abstraction.md))** На anthropic-клонах не задаётся (= no-op, дефолт `anthropic`). На OpenAI-инстансе — `openai`. |
-| `ANTHROPIC_API_KEY` | **свой** ключ с балансом (anthropic-инстанс) | **секрет** | Не делить ключ между инстансами (квоты/биллинг). На OpenAI-инстансе не используется в рантайме. |
-| `OPENAI_API_KEY` | **свой** ключ с балансом (на OpenAI-инстансе) | **секрет** | **(OpenAI, [ADR-033](adr/ADR-033-llm-provider-abstraction.md))** Обязателен при `LLM_PROVIDER=openai`. Не делить между инстансами. На anthropic-инстансах не задаётся. |
-| `ADMIN_API_SECRET` | **свежий** | **секрет** | Изолированный admin-доступ ([ADR-009](adr/ADR-009-admin-token-auth.md)). |
-| `KMS_LOCAL_MASTER_KEY` | **свежий** base64-32 | **секрет** | BYOK envelope-ключ ([ADR-003](adr/ADR-003-byok-envelope-encryption.md)). Разные → BYOK-шифр не переносим между инстансами (и не должен). |
-| `PREVIEW_URL_SECRET` | **свежий** | **секрет** | HMAC preview signed URL ([ADR-010](adr/ADR-010-backend-hosted-preview.md)). |
-| `METRICS_SCRAPE_TOKEN` | **свежий** | **секрет** | Защита `/metrics`. |
-| `STOREKIT_TEST_SECRET` | **свежий** (если `STOREKIT_TEST_MODE=true`) | **секрет** | Только staging/test-mode; в prod пусто. |
-| `ADAPTY_WEBHOOK_SECRET` | **свежий** | **секрет** | Bearer Adapty-вебхука ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)). То же значение задаётся в Adapty UI инстанса. Не делить между инстансами. |
-| JWT keypair `.secrets/jwt_private.pem`+`jwt_public.pem` | **свежая** RSA-пара в `/opt/<inst>/.secrets/` | **секрет** | См. процедуру ниже. Никогда не копировать у соседа. |
+| `claude-ios` | `broadnova.shop` | Anthropic | родитель форка; отдельный сервис на `.154` |
+| `avelyra` | `avelyraweb.shop` | Anthropic | отдельный сервис на `.154` |
+| `orvianix` | `orvianix.shop` | OpenAI | отдельный сервис на `.154` |
+| `veltrio` | `veltriohub.shop` | OpenAI | отдельный сервис на `.154` |
 
-| `ANTHROPIC_MODELS` / `OPENAI_MODELS` | опц. allowlist моделей для выбора | public | **(выбор модели, [ADR-034](adr/ADR-034-user-model-selection.md))** JSON `{id:displayName}` моделей активного провайдера для `GET /v1/models`. Per-instance. **Не задан → фолбэк** на единственную дефолтную модель (`ANTHROPIC_MODEL`/`OPENAI_MODEL`) — поведение как до фичи. `ANTHROPIC_MODELS` действует при `LLM_PROVIDER=anthropic`, `OPENAI_MODELS` — при `openai`. |
-
-Остальные ключи (`SUBSCRIPTION_CREDITS_PER_PERIOD`, `TOKEN_PRODUCTS`, `ADAPTY_PRODUCT_TOKENS`, `ADAPTY_SUBSCRIPTION_TOKENS_GRANT`, `BYOK_DEFAULT_MODEL`, `ANTHROPIC_MODELS`/`OPENAI_MODELS` (опц., [ADR-034](adr/ADR-034-user-model-selection.md); не задан → фолбэк на дефолтную модель), `ANTHROPIC_MAX_TOKENS` (дефолт `16000`, [ADR-025](adr/ADR-025-parallel-tool-calls-and-max-tokens-truncation.md)), `ANTHROPIC_TIMEOUT_SECONDS` (дефолт `120`), на OpenAI-инстансе — `OPENAI_MODEL` (дефолт `gpt-4o`)/`OPENAI_MAX_TOKENS` (`16000`)/`OPENAI_TIMEOUT_SECONDS` (`120`)/`OPENAI_MAX_RETRIES` (`2`)/`OPENAI_BYOK_DEFAULT_MODEL` (`gpt-4o`) ([ADR-033](adr/ADR-033-llm-provider-abstraction.md)), лимиты `PREVIEW_*`/`ATTACHMENT_*`, `DB_POOL_*`, `DOCS_ENABLED`, `LOG_LEVEL`) — берутся из дефолтов `.env.prod.example`, переопределяются по необходимости инстанса. `ANTHROPIC_MAX_TOKENS` одинаков для всех инстансов (значение из дефолта), но **должен присутствовать в `.env` каждого** (раскатка нового дефолта 16000 на оба инстанса при выкатке ADR-025).
-
-### Процедура провижининга клона (пошагово, для devops)
-Выполняется на сервере `87.239.135.154` (root). Пример для `avelyra` / `avelyraweb.shop`:
-
-1. **Предусловие DNS:** A-запись `avelyraweb.shop` → `87.239.135.154` существует (уже выполнено) — нужна для ACME-challenge Traefik.
-2. **Клонировать код в отдельный каталог:**
-   ```
-   git clone <repo> /opt/avelyra
-   cd /opt/avelyra
-   ```
-   (тот же репозиторий, что и `/opt/claude-ios`; **не** трогать `/opt/claude-ios`).
-3. **Создать `.env`:** скопировать `.env.prod.example` → `/opt/avelyra/.env`, заполнить по [clone `.env`-контракту](#clone-env-контракт-ключи-claude-ios): `COMPOSE_PROJECT_NAME=avelyra`, `SERVICE_DOMAIN=avelyraweb.shop`, `JWT_ISSUER=https://avelyraweb.shop`, `TRUSTED_PROXY_IPS`=подсеть `web`, и **свежие** секреты (`openssl rand -base64 32` на каждый).
-4. **Сгенерировать СВЕЖИЙ JWT keypair** (не копировать у broadnova):
-   ```
-   mkdir -p /opt/avelyra/.secrets
-   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /opt/avelyra/.secrets/jwt_private.pem
-   openssl rsa -in /opt/avelyra/.secrets/jwt_private.pem -pubout -out /opt/avelyra/.secrets/jwt_public.pem
-   chown -R 10001:10001 /opt/avelyra/.secrets
-   chmod 750 /opt/avelyra/.secrets
-   chmod 640 /opt/avelyra/.secrets/jwt_private.pem /opt/avelyra/.secrets/jwt_public.pem
-   ```
-   (`10001` — uid/gid контейнерного пользователя; `.secrets/` смонтирован `:ro` в `api`, пути — `JWT_PRIVATE_KEY_PATH=/app/.secrets/jwt_private.pem`/`JWT_PUBLIC_KEY_PATH=/app/.secrets/jwt_public.pem`).
-5. **Валидация config (инвариант):** убедиться, что для клона рендер корректен, а для соседа неизменен:
-   ```
-   docker compose -p avelyra -f docker-compose.prod.yml --env-file .env config   # клон: image avelyra-backend:prod, router/service avelyra, Host(avelyraweb.shop)
-   # и (на /opt/claude-ios) проверка no-op для живого:
-   docker compose -f docker-compose.prod.yml --env-file .env config               # ДОЛЖНО остаться claude-ios-* без изменений
-   ```
-6. **Деплой клона (`-p` ОБЯЗАТЕЛЕН) — та же последовательность, что и deploy-loop (build → migrate → up --no-build → readiness-gate):**
-   ```
-   cd /opt/avelyra
-   docker compose -p avelyra -f docker-compose.prod.yml --env-file .env build api migrate
-   docker compose -p avelyra -f docker-compose.prod.yml --env-file .env run --rm migrate
-   docker compose -p avelyra -f docker-compose.prod.yml --env-file .env up -d --no-build
-   # readiness-gate: дождаться health контейнера avelyra-api-1 = healthy
-   for i in $(seq 1 30); do [ "$(docker inspect avelyra-api-1 --format '{{.State.Health.Status}}' 2>/dev/null)" = healthy ] && break; sleep 2; done
-   ```
-7. **Верификация клона:** `GET https://avelyraweb.shop/healthz` → `200` (Traefik роутит, TLS выпущен ACME-резолвером `le`); `GET https://avelyraweb.shop/docs` (если `DOCS_ENABLED=true`); round-trip auth `POST /v1/auth/register` → `200` с `accessToken`, `GET /v1/auth/jwks` → публичный ключ клона.
-8. **Проверка, что сосед не затронут:** `GET https://broadnova.shop/healthz` → `200`; `docker volume ls` показывает раздельные `claude-ios_pgdata` и `avelyra_pgdata`; `docker ps` — оба набора контейнеров живы.
-
-### Критичные правила (чек-лист безопасности клонирования)
-- **`-p <inst>` обязателен** для каждого клона (кроме `claude-ios`, где он опционален и = basename). Забыть `-p` → клон поднимется как project `avelyra`-по-каталогу… **но** если каталог назван не как project — риск коллизии. Всегда передавай `-p` явно.
-- **Свежие секреты** на каждый инстанс — никогда не копировать `.env`-секреты и JWT keypair у соседа.
-- **Не трогать чужие `/opt/*`** — операции с клоном выполняются только в его каталоге.
-- **Общая — только сеть `web`** (`external: true`) и сам Traefik. БД/Redis/тома/секреты — изолированы.
-- **Top-level `name:` в compose не добавлять** — он переопределит basename для живого инстанса.
-
-## CI/CD-контракт: INSTANCES-loop (мульти-инстанс)
-
-> Спецификация для devops. Существующий single-instance deploy переходит на итерацию по списку инстансов с **сохранением backward-compat**.
-
-Deploy-job (gated в `ci.yml` и ручной `deploy.yml`) получает нормативную переменную `INSTANCES` — список инстансов в формате `dir:project`, разделённый пробелами, **claude-ios первым** (backward-compat). **Нормативное значение (совпадает с фактическим `ci.yml` + `deploy.yml`):**
-```
-INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio claude-hermes:claude-hermes"
-```
-**Нормативный список инстансов (источник истины, docs ↔ оба workflow совпадают):**
-
-| dir (`/opt/<dir>`) | project (`-p`) | домен (`SERVICE_DOMAIN`) | провайдер | Порядок |
-|---|---|---|---|---|
-| `claude-ios` | `claude-ios` | `broadnova.shop` | Anthropic (дефолт) | 1-й (backward-compat no-op) |
-| `avelyra` | `avelyra` | `avelyraweb.shop` | Anthropic (дефолт) | 2-й |
-| `orvianix` | `orvianix` | `orvianix.shop` | OpenAI (`LLM_PROVIDER=openai`) | 3-й |
-| `veltrio` | `veltrio` | `veltriohub.shop` | OpenAI (`LLM_PROVIDER=openai`) | 4-й |
-| `claude-hermes` | `claude-hermes` | свой (per-instance) | Anthropic (дефолт) | 5-й (Hermes-per-user control plane) |
-
-> **3-й и 4-й инстансы (OpenAI, [ADR-033](adr/ADR-033-llm-provider-abstraction.md)) — в loop.** OpenAI-клоны `orvianix` (`/opt/orvianix`, `orvianix.shop`) и `veltrio` (`/opt/veltrio`, `veltriohub.shop`) добавлены в `INSTANCES` третьей и четвёртой записями, claude-ios по-прежнему первым (backward-compat). Единственное отличие их `.env` от anthropic-клонов — `LLM_PROVIDER=openai` + `OPENAI_*` (см. [clone `.env`-контракт](#clone-env-контракт-ключи-claude-ios)); процедура provision/deploy/readiness-gate идентична. Провижининг `/opt/orvianix` и `/opt/veltrio` (`.env` + `.secrets/`) выполняется отдельно (ON THE SERVER).
-
-> **5-й инстанс `claude-hermes` (Hermes-per-user control plane, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)) — в loop, последним.** `claude-hermes` — **новый самодостаточный инстанс** (не переименование claude-ios), `/opt/claude-hermes`, свой `SERVICE_DOMAIN`, **отдельная** Hermes-сеть `HERMES_DOCKER_NETWORK=claude-hermes-hermes-net` и `HERMES_VOLUME_ROOT=/opt/data/claude-hermes/hermes` (изоляция от соседей на общем Docker daemon — [Q-046-3](99-open-questions.md)). Добавлен в `INSTANCES` пятой записью (claude-ios по-прежнему первым, backward-compat). Готовый к раскомментированию `.env`-блок — внизу [`.env.prod.example`](../.env.prod.example) (§claude-hermes). **Pre-deploy на сервере (однократно, до первого деплоя):** `docker network create claude-hermes-hermes-net`; `docker pull nousresearch/hermes-agent:<pinned-tag>`; `mkdir -p /opt/data/claude-hermes/hermes`; затем `git clone` в `/opt/claude-hermes`, `.env` + `.secrets/` (свежая RSA JWT-пара), и CI-loop отрабатывает build → migrate → up → readiness-gate для `claude-hermes`.
-
-- `dir` — имя каталога в `/opt/<dir>` на сервере; `project` — значение для `-p <project>`.
-- Deploy-job по SSH (`appleboy/ssh-action`, `script_stop: false`; remote-скрипт под `set -uo pipefail` **без `-e`**) **итерирует** по списку, выполняя per-instance последовательность **build → migrate → up --no-build → readiness-gate → smoke** с аккумуляцией реальных сбоев в `$FAILED`:
-  ```
-  set -uo pipefail   # NO `-e` — loop обязан пройти ВСЕ инстансы
-  FAILED=""
-  for entry in $INSTANCES; do
-    dir="${entry%%:*}"; proj="${entry##*:}"
-    cd "/opt/$dir"                                                                          || { FAILED="$FAILED $proj"; continue; }
-    git pull --ff-only                                                                      || { FAILED="$FAILED $proj"; continue; }
-    docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env build api migrate  || { FAILED="$FAILED $proj"; continue; }   # (1) explicit build
-    docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env run --rm migrate   || { FAILED="$FAILED $proj"; continue; }   # (2) explicit migrate перед api
-    up_rc=0
-    docker compose -p "$proj" -f docker-compose.prod.yml --env-file .env up -d --no-build   || up_rc=$?                                # (3) start only; rc НЕ доверяется
-    ready=0; for i in $(seq 1 30); do                                                                                                  # (4) readiness-gate = источник истины
-      [ "$(docker inspect "${proj}-api-1" --format '{{.State.Health.Status}}' 2>/dev/null)" = healthy ] && { ready=1; break; }; sleep 2
-    done
-    [ "$ready" -eq 1 ] || { FAILED="$FAILED $proj"; continue; }
-    # (5) per-instance smoke https://$SERVICE_DOMAIN/healthz из /opt/$dir/.env — NON-FATAL (::warning)
-  done
-  [ -n "$FAILED" ] && { echo "::error::instance(s) failed:$FAILED"; exit 1; }                                                          # job RED при реальном сбое
-  ```
-- **Backward-compat:** `claude-ios:claude-ios` первым → `-p claude-ios` = тот же project-name, что и сейчас при деплое без `-p` (basename `/opt/claude-ios`) → **no-op** для живого инстанса. Переход single→loop не меняет поведение существующего деплоя.
-- **Устойчивость loop (намеренно):** `set -uo pipefail` **без `-e`** + `script_stop: false` — один сбойный инстанс заносится в `$FAILED` и `continue`'ит к следующему (не обрывает остальные); финальный `exit 1` вне loop краснит job при любом реальном сбое. `up -d --build` **заменён** на explicit `build` → explicit `migrate` → `up -d --no-build` + readiness-gate, т.к. совмещённый `up --build` отдавал транзиентный non-zero (fused build + one-shot migrate + start), который под прежним `set -e`/`script_stop:true` обрывал loop до второго инстанса. Готовность `api` определяется **readiness-gate** (health контейнера), а не rc `up`.
-- Smoke-gate выполняется **на каждый инстанс** по его `SERVICE_DOMAIN` (`https://<домен>/healthz` → `200`).
-- Добавление инстанса = добавить `dir:project` в `INSTANCES` (после провижининга его `/opt/<dir>` + `.env` + `.secrets/` по процедуре выше). Удаление — убрать из списка (каталог/тома чистятся вручную).
-
-> **Текущий статус: ВНЕДРЕНО.** `INSTANCES`-loop и compose-параметризация (`${COMPOSE_PROJECT_NAME:-claude-ios}`) внесены в **оба** workflow (`ci.yml` gated deploy-job + ручной `deploy.yml`) и `docker-compose.prod.yml`; фактическое значение в обоих workflow — `INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio claude-hermes:claude-hermes"` (claude-ios первым). Второй инстанс `avelyra` (`avelyraweb.shop`) развёрнут и изолирован ([Q-017-3](99-open-questions.md) Closed). Третий инстанс `orvianix` (`orvianix.shop`, OpenAI, [ADR-033](adr/ADR-033-llm-provider-abstraction.md)) и четвёртый `veltrio` (`veltriohub.shop`, OpenAI) добавлены в loop; `/opt/orvianix` и `/opt/veltrio` провижинятся отдельно (`.env` с `LLM_PROVIDER=openai` + `OPENAI_*` + `.secrets/`). `veltrio` провижинен и развёрнут на сервере (`/opt/veltrio`, healthy). **Пятый инстанс `claude-hermes` (Hermes-per-user control plane, [ADR-046](adr/ADR-046-per-user-hermes-runtime.md)) добавлен в loop последним** — новый самодостаточный инстанс (`/opt/claude-hermes`, своя БД/секреты/JWT keypair + отдельные `HERMES_DOCKER_NETWORK=claude-hermes-hermes-net`/`HERMES_VOLUME_ROOT=/opt/data/claude-hermes/hermes`); провижинится отдельно (`.env` из готового §claude-hermes-блока [`.env.prod.example`](../.env.prod.example) + `.secrets/`, pre-deploy шаги — см. таблицу инстансов выше). Инвариант обратной совместимости (`-p claude-ios` = basename → no-op) сохранён — живой broadnova.shop не затронут. Зафиксированная здесь спека — нормативный контракт; docs ↔ оба workflow совпадают.
+> Прежний CI-контур `claude-hermes` содержал `INSTANCES`-loop (`INSTANCES="claude-ios:claude-ios avelyra:avelyra orvianix:orvianix veltrio:veltrio claude-hermes:claude-hermes"`), который циклом деплоил ВСЕ эти сервисы (включая дубль `claude-hermes` как co-located инстанс на `.154`). Этот цикл — **fork-артефакт claude-ios — удалён** из `.github/workflows/ci.yml` и `deploy.yml`. Теперь `claude-hermes` деплоится только на `.156` (`deploy-avorelio`), а перечисленные сервисы деплоятся из своих репозиториев/пайплайнов, не отсюда.
 
 ## Миграции
 - Alembic. `uv run alembic upgrade head` в `migrate`-job (`docker compose run --rm migrate`) до старта `api`.
@@ -590,81 +383,69 @@ Pipeline — единый workflow [`.github/workflows/ci.yml`](../.github/workf
 3. job `test`: `uv run pytest --cov=src --cov-fail-under=80`
 4. job `build-image`: сборка Docker-образа `api`/`migrate`
 
-**Gated deploy-job (в том же `ci.yml`, не отдельный параллельный workflow):**
-5. job `deploy` — `needs: [quality, test, build-image]`, `if: github.ref == 'refs/heads/main' && success()`. Выполняется **только после** зелёного прохождения jobs 2–4 на ветке `main`; при любом fail CI-job (или не-`main` ref) deploy **не стартует**. Шаги: GitHub Actions SSH на сервер (`appleboy/ssh-action`, `script_stop: false`; remote-скрипт под `set -uo pipefail` без `-e`, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)) — per-instance loop по `$INSTANCES`: explicit `build api migrate` → `run --rm migrate` → `up -d --no-build` (rc не доверяется) → readiness-gate (health `${proj}-api-1` = healthy) → NON-FATAL per-instance smoke `/healthz`; реальные сбои инстансов копятся в `$FAILED`, финальный `exit 1` вне loop краснит job (образ собирается **на сервере**; см. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh), [§CI/CD INSTANCES-loop](#cicd-контракт-instances-loop-мульти-инстанс)).
+**Gated deploy-job `deploy-avorelio` (в том же `ci.yml`, не отдельный параллельный workflow):**
+5. job `deploy-avorelio` — `needs: [quality, test, build-image]`, `if: github.ref == 'refs/heads/main' && success()`. Выполняется **только после** зелёного прохождения jobs 2–4 на ветке `main`; при любом fail CI-job (или не-`main` ref) deploy **не стартует**. **Единственный** deploy-job (мульти-инстанс-цикла нет). Шаги: SSH на `.156` (`appleboy/ssh-action`, `script_stop: false`; remote-скрипт под `set -uo pipefail` без `-e`, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)) → `cd /opt/claude-hermes` → `git pull --ff-only` → explicit `build api migrate` (overlay `docker-compose.avorelio.yml`) → `run --rm migrate` → `up -d --no-build` (rc не доверяется) → readiness-gate (health `claude-hermes-api-1` = healthy) → NON-FATAL smoke `https://avorelio.shop/healthz` (образ собирается **на сервере**; см. [§Процедура деплоя](#процедура-деплоя-github-actions--ssh-156)).
 
-Ручной запуск выкатки без нового коммита — отдельный workflow [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) с триггером `workflow_dispatch` (**без** push-триггера; те же SSH-шаги).
+Ручной запуск выкатки без нового коммита — отдельный workflow [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) с триггером `workflow_dispatch` (**без** push-триггера; тот же job `deploy-avorelio`).
 
-GitHub Secrets для деплоя: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`. Любой fail в CI-jobs `quality`/`test`/`build-image` блокирует merge и не допускает `deploy`-job.
+GitHub Secrets для деплоя: `SSH_HOST_AVORELIO`, `SSH_USER`, `SSH_PRIVATE_KEY`. Любой fail в CI-jobs `quality`/`test`/`build-image` блокирует merge и не допускает `deploy-avorelio`-job.
 
 ## Health / readiness
 - `GET /health` — liveness (процесс жив).
-- `GET /healthz` — **алиас `/health`**, `200`, публичный, без auth. Для healthcheck Traefik и smoke-проверки ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)). Контракт — [API-REFERENCE.md](API-REFERENCE.md#служебные-эндпоинты) и [api-gateway/02-api-contracts.md](modules/api-gateway/02-api-contracts.md).
+- `GET /healthz` — **алиас `/health`**, `200`, публичный, без auth. Для healthcheck Traefik и smoke-проверки ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)). Контракт — [API-REFERENCE.md](API-REFERENCE.md#служебные-эндпоинты) и [api-gateway/02-api-contracts.md](modules/api-gateway/02-api-contracts.md).
 - `GET /ready` — readiness (БД и Redis доступны).
 - `GET /metrics` — Prometheus exposition (защищён сетевой политикой / scrape-токеном).
 
 ## Откат
-- Образ собирается на сервере из исходников (нет immutable registry-tag, [ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)). Rollback = `git checkout <prev-commit>` в `/opt/<service>` + пересборка/перезапуск. Ручной rollback использует ту же последовательность, что и deploy-loop — **build → (при необходимости) migrate → up --no-build**:
+- Образ собирается на сервере из исходников (нет immutable registry-tag, [ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)). Rollback на `.156` = `git checkout <prev-commit>` в `/opt/claude-hermes` + пересборка/перезапуск (overlay `docker-compose.avorelio.yml` обязателен). Ручной rollback использует ту же последовательность, что и deploy — **build → (при необходимости) migrate → up --no-build**:
   ```
-  cd /opt/<service>
+  cd /opt/claude-hermes
   git log --oneline -n 5 ; git checkout <prev-commit>
-  docker compose -f docker-compose.prod.yml --env-file .env build api migrate
-  docker compose -f docker-compose.prod.yml --env-file .env run --rm migrate   # обычно НЕ нужен при откате (expand/contract); запускать только если схема требует
-  docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build
+  docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env build api migrate
+  docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env run --rm migrate   # обычно НЕ нужен при откате (expand/contract); запускать только если схема требует
+  docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env up -d --no-build
   ```
-- Миграции expand/contract позволяют откатить код без отката схемы (схема не реверсится — старый код совместим с новой схемой).
+- Контейнер `traefik` при откате **не** меняется (образ pinned, конфиг в overlay). Миграции expand/contract позволяют откатить код без отката схемы (схема не реверсится — старый код совместим с новой схемой).
 
 ## Prod-readiness checklist (must-configure-before-launch)
 Чек-лист, который **обязан** быть выполнен перед приёмом реальных пользователей (публичный запуск). Часть пунктов не блокирует подготовку инфры/staging, но блокирует публичный релиз.
 
-> **Применимость при мульти-инстансе ([§Мульти-инстанс](#мульти-инстанс--клонирование-сервиса), [Q-017-3](99-open-questions.md)).** Этот чек-лист применяется к **КАЖДОМУ инстансу отдельно** (`claude-ios`/`broadnova.shop`, `avelyra`/`avelyraweb.shop` и т.д.) — на своих per-instance секретах, домене, JWT keypair и режимах. Закрытие пункта на одном инстансе **не** закрывает его на другом. Перед публичным запуском любого инстанса его staging-режимы (`DOCS_ENABLED=true`, `STOREKIT_TEST_MODE=true`) должны быть выключены и сконфигурирован собственный JWT signing key.
+> **Единственный инстанс.** Чек-лист применяется к единственному инстансу `claude-hermes` на выделенном сервере `.156` (`avorelio.shop`). Мульти-инстанс-клонирование claude-ios здесь неприменимо (см. [§Отдельные сервисы](#отдельные-сервисы-fork-ancestry--не-деплоятся-из-этого-репозитория)).
 
-> **Фактический deploy-статус (2026-06-10):**
-> - **`claude-ios` — РАЗВЁРНУТ на `broadnova.shop`** за внешним Traefik (certresolver `le`). Все контейнеры healthy, миграции `0001`→`0005` применены. Текущие режимы staging: `DOCS_ENABLED=true` (Swagger доступен), `STOREKIT_TEST_MODE=true` (Apple prod-certs отложены, [Q-007-1](99-open-questions.md)/[TD-007](100-known-tech-debt.md)).
-> - **`avelyra` — РАЗВЁРНУТ на `avelyraweb.shop`** (2-й инстанс, [Q-017-3](99-open-questions.md) Closed), изолирован (свои тома/секреты/JWT keypair), `healthz`/`docs` → `200`, broadnova не затронут. **Staging-паритет с broadnova:** `DOCS_ENABLED=true`, `STOREKIT_TEST_MODE=true`; `ANTHROPIC_API_KEY` переиспользован по согласованию. **Перед публичным запуском avelyra выключить эти режимы** (`DOCS_ENABLED=false`, `STOREKIT_TEST_MODE=false` + Apple prod-certs) и сконфигурировать собственный JWT signing key (свежая RSA-пара уже в `/opt/avelyra/.secrets/`) — по этому же чек-листу, на per-instance основе.
->
-> **Клиентская авторизация — `CLIENT_API_KEY` ([ADR-044](adr/ADR-044-client-api-key-auth.md)/[ADR-058](adr/ADR-058-x-user-id-string-identity.md)).** **Реальный предзапусковый блокер клиентского контура — задать высокоэнтропийный `CLIENT_API_KEY` в `.env`** (без него все `/v1/*` → `401`; см. env-таблицу). **JWT issuer — спящий код, HTTP-поверхность `/v1/auth/*` retired** ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)): роутер не смонтирован (`/v1/auth/*` → `404`), поэтому **RSA-пара подписи БОЛЬШЕ НЕ является блокером публичного запуска** — она нужна только при будущей реактивации issuer'а (аддитивным ADR). Пункты ниже с пометкой «блокер публичного запуска» (`DOCS_ENABLED=false`, `CLIENT_API_KEY` задан, `STOREKIT_TEST_MODE=false` + Apple prod-certs) **остаются открытыми** до приёма реальных пользователей — **по каждому инстансу отдельно**.
+> **Клиентская авторизация — `CLIENT_API_KEY` ([ADR-044](adr/ADR-044-client-api-key-auth.md)/[ADR-058](adr/ADR-058-x-user-id-string-identity.md)).** **Реальный предзапусковый блокер клиентского контура — задать высокоэнтропийный `CLIENT_API_KEY` в `.env`** (без него все `/v1/*` → `401`; см. env-таблицу). **JWT issuer — спящий код, HTTP-поверхность `/v1/auth/*` retired** ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)): роутер не смонтирован (`/v1/auth/*` → `404`), поэтому **RSA-пара подписи БОЛЬШЕ НЕ является блокером публичного запуска** — она нужна только при будущей реактивации issuer'а (аддитивным ADR). Пункты ниже с пометкой «блокер публичного запуска» (`DOCS_ENABLED=false`, `CLIENT_API_KEY` задан, `STOREKIT_TEST_MODE=false` + Apple prod-certs) **остаются открытыми** до приёма реальных пользователей.
 
 **Конфигурация / режимы:**
 - [ ] `DOCS_ENABLED=false` — скрыть Swagger/OpenAPI в prod ([08-api-documentation.md](08-api-documentation.md#r7-доступность-docs-в-prod-env-флаг)).
 - [ ] **`CLIENT_API_KEY` — сгенерировать и задать (клиентский контур, [ADR-044](adr/ADR-044-client-api-key-auth.md))** — высокоэнтропийный (≥32 байта) секрет для `X-API-Key`; без него все `/v1/*` → `401`. Secret manager, под redaction, per-instance. **Блокер публичного запуска** (заменяет прежний блокер «JWT signing key» — issuer retired). Опц. `CLIENT_API_KEY_PREV` — на grace-период ротации.
 - [ ] `JWT signing key` — **НЕ блокер запуска (issuer retired, [ADR-044 §4a](adr/ADR-044-client-api-key-auth.md))**. HTTP-поверхность `/v1/auth/*` не смонтирована (`404`), поэтому RSA-пара подписи для запуска НЕ требуется. Настраивать только при **реактивации** спящего issuer'а (отдельным ADR): сгенерировать RSA-пару (≥2048 бит) и задать `JWT_PRIVATE_KEY(_PATH)`/`JWT_PUBLIC_KEY(_PATH)` + `JWT_ISSUER`/`JWT_AUDIENCE`/`JWT_KID` в `.env`. (Спящий verify-only `JwtVerifier` и `JWT_PUBLIC_KEY` остаются валидны как задел; issuer-эндпоинты `503`-логика неактуальна, т.к. роутер не смонтирован.)
 - [ ] **`STOREKIT_TEST_MODE=false`** + Apple root CA, реальный `APPSTORE_BUNDLE_ID`, заведённые IAP-продукты (подписка + consumable token-продукты). **Блокер публичного запуска ([Q-007-1](99-open-questions.md), [TD-007](100-known-tech-debt.md)).** На MVP/staging — sandbox/test-mode.
-- [ ] `APPLE_AUDIENCE` = реальный per-instance bundle id (или подтверждён фолбэк на `APPSTORE_BUNDLE_ID`) — иначе `POST /v1/auth/apple` → `503` ([ADR-043](adr/ADR-043-sign-in-with-apple.md)). Per-instance, как STOREKIT.
-- [ ] `TRUSTED_PROXY_IPS` = подсеть **внешнего Traefik** (docker-сеть `web`, `docker network inspect web` → `IPAM.Config.Subnet`). Иначе `client_ip` = IP Traefik, per-IP rate limit неработоспособен ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md), [05-security.md](05-security.md#доверенный-reverse-proxy-и-определение-client-ip-anti-spoofing)).
+- [ ] `APPLE_AUDIENCE` — конфиг спящего Apple-issuer'а ([ADR-043](adr/ADR-043-sign-in-with-apple.md)). **HTTP-поверхность `/v1/auth/*` retired** ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md), роутер не смонтирован → `POST /v1/auth/apple` = `404`, не `503`), поэтому для публичного запуска **НЕ требуется**. Настраивать только при аддитивной реактивации issuer'а.
+- [ ] `TRUSTED_PROXY_IPS` = подсеть **нашего self-hosted Traefik** (docker-сеть `web`, `docker network inspect web` → `IPAM.Config.Subnet`). Иначе `client_ip` = IP Traefik, per-IP rate limit неработоспособен ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), [05-security.md](05-security.md#доверенный-reverse-proxy-и-определение-client-ip-anti-spoofing)).
 - [ ] DB pool sizing проверен: `(DB_POOL_SIZE + DB_MAX_OVERFLOW) * workers * replicas < Postgres max_connections` (см. [§Sizing пула](#sizing-пула-соединений-бд)).
 
-**Топология / Traefik ([ADR-017](adr/ADR-017-shared-server-traefik-deploy.md)):**
-- [ ] **A-запись `broadnova.shop` → `87.239.135.154`** существует **до** запуска (нужна для ACME-challenge Traefik; [Q-017-1](99-open-questions.md)). `SERVICE_DOMAIN=broadnova.shop` в `.env` заполнен.
-- [ ] **`TRAEFIK_CERTRESOLVER=le`** заполнен в `.env` ([Q-017-2](99-open-questions.md)). `le` — default на entrypoint `websecure` общего Traefik, поэтому label `tls.certresolver` опционален (рекомендован явно для надёжности).
-- [ ] `.env` в `/opt/<service>` заполнен (`SERVICE_DOMAIN=broadnova.shop`, `TRAEFIK_CERTRESOLVER=le`, секреты, `TRUSTED_PROXY_IPS`).
-- [ ] Traefik-labels на `api` (`traefik.enable=true`, `Host(${SERVICE_DOMAIN})` = `broadnova.shop`, `entrypoints=websecure`, `tls.certresolver=${TRAEFIK_CERTRESOLVER}` = `le` (опционален — default на `websecure`), `loadbalancer.server.port=8000`) + сеть `web` (`external: true`) подключена; внешняя сеть `web` создана на сервере (`docker network create web`).
-- [ ] **НЕ публикуются порты 80/443** в нашем `docker-compose` (конфликт с Traefik); `api` — только `expose: 8000`; `postgres`/`redis` — без публикации портов, только сеть `default`.
-- [ ] `GET /healthz` → `200` через публичный домен (`https://broadnova.shop/healthz`) — Traefik роутит, TLS выпущен.
-
-**Топология №2 — avorelio `.156` self-hosted Traefik ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)) — применяется ТОЛЬКО к deploy-target `.156`:**
+**Топология — avorelio `.156` self-hosted Traefik ([ADR-057](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)) — ЕДИНСТВЕННЫЙ deploy-target:**
 - [ ] **A-запись `avorelio.shop` → `87.239.135.156`** существует **до** первого деплоя (нужна для ACME HTTP-01 нашего Traefik — порт 80 должен быть публично достижим при выпуске).
-- [ ] `.env` в `/opt/claude-hermes`: `COMPOSE_PROJECT_NAME=claude-hermes`, `SERVICE_DOMAIN=avorelio.shop`, `TRAEFIK_CERTRESOLVER=le`, **`ACME_EMAIL=<email>`** (обязателен — пусто → Traefik fail-fast), `JWT_ISSUER=https://avorelio.shop`, `JWT_AUDIENCE=claude-hermes`, `TRUSTED_PROXY_IPS`=подсеть **нашей** `web` (`docker network inspect <project>_web` → `IPAM.Config.Subnet`).
+- [ ] `.env` в `/opt/claude-hermes`: `COMPOSE_PROJECT_NAME=claude-hermes`, `SERVICE_DOMAIN=avorelio.shop`, `TRAEFIK_CERTRESOLVER=le`, **`ACME_EMAIL=<email>`** (обязателен — пусто → Traefik fail-fast), `JWT_ISSUER=https://avorelio.shop`, `JWT_AUDIENCE=claude-hermes`, `TRUSTED_PROXY_IPS`=подсеть **нашей** `web` (`docker network inspect web` → `IPAM.Config.Subnet`).
+- [ ] Деплой — **всегда** с overlay: `-f docker-compose.prod.yml -f docker-compose.avorelio.yml`.
 - [ ] Сервис **`traefik`** в стеке: `ports: 80:80, 443:443` (единственный с публикацией портов); static-флаги в `command:` (provider docker `exposedbydefault=false`, entrypoints web/websecure, HTTP→HTTPS redirect, ACME `le`/HTTP-01/`acme.json`/`ACME_EMAIL`, `--api=false`); `docker.sock` `:ro`; named volume `traefik-acme` → `/letsencrypt`. `api`/`postgres`/`redis`/Hermes — **без** host-портов.
 - [ ] Сеть `web` — **внутренняя** compose (НЕ `external`, НЕ создавать `docker network create web` вручную). `hermes-net` — `external`, создана: `docker network create hermes-net`. Том Hermes: `mkdir -p $HERMES_VOLUME_ROOT` (дефолт `/opt/data/hermes`).
 - [ ] **docker.sock читают ДВА сервиса** (`traefik` provider + `api` provision), оба `:ro`. Риск ≈ root — socket-proxy задел ([ADR-057 §4](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), [Q-057-2](99-open-questions.md)). docker.sock НЕ монтируется в `postgres`/`redis`/Hermes.
 - [ ] **`/v1/preview/*` pass-through:** глобальные security-header/cookie-middleware Traefik на этот префикс НЕ навешаны (sandbox-заголовки ADR-010 не перетёрты) — см. [§Reverse-proxy](#reverse-proxy--lb--операционные-требования-к-v1preview).
-- [ ] GitHub Secrets для `.156`: **`SSH_HOST_AVORELIO=87.239.135.156`** (отдельно от broadnova `SSH_HOST=87.239.135.154`), `SSH_USER=root`, `SSH_PRIVATE_KEY`. `.env` — на сервере вручную (из secret manager), не из GitHub Secrets.
+- [ ] GitHub Secrets для `.156`: **`SSH_HOST_AVORELIO=87.239.135.156`**, `SSH_USER=root`, `SSH_PRIVATE_KEY`. `.env` — на сервере вручную (из secret manager), не из GitHub Secrets.
 - [ ] Первый деплой: build → migrate → up → readiness-gate (`claude-hermes-api-1` healthy = `/ready`) → наш Traefik выпустил TLS для `avorelio.shop` → `GET https://avorelio.shop/healthz` = `200` (на первом деплое ACME/DNS могут «устаканиваться» — smoke NON-FATAL).
-- [ ] **Двойственность prod-файла — overlay `.156`** ([Q-057-1](99-open-questions.md) Closed, [ADR-057 §3](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)): применяется `-f docker-compose.prod.yml -f docker-compose.traefik.yml`; overlay добавляет сервис `traefik` + acme volume и переопределяет `web` явным **`networks.web.external: false`** (пустой `web: {}` НЕ срабатывает — наследует `external:true`). Базовый файл не трогается → broadnova `.154` (деплой без overlay) НЕ регрессирует.
-- [ ] **Имя project/путь `claude-hermes` на `.156` совпадает с co-located инстансом broadnova `.154` — намеренно** ([ADR-057 §7](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md), Вариант A): техн. коллизии нет (разные хосты/daemon, отдельные SSH-секреты). **Дисциплина оператора:** инстанс различается **ХОСТОМ/доменом** (`.154` co-located vs `.156`/`avorelio.shop`), не именем. Запись `.156` **НЕ** добавлять в broadnova INSTANCES-loop (он ходит на `.154`).
+- [ ] **Двойственность prod-файла — overlay `.156`** ([Q-057-1](99-open-questions.md) Closed, [ADR-057 §3](adr/ADR-057-dedicated-server-self-hosted-traefik-deploy.md)): применяется `-f docker-compose.prod.yml -f docker-compose.avorelio.yml`; overlay добавляет сервис `traefik` + acme volume и переопределяет `web` явным **`networks.web.external: false`** + `name: web` (пустой `web: {}` НЕ срабатывает — наследует `external:true`). Базовый файл (унаследованная от claude-ios база) не трогается.
 
 **Hermes runtime ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md), [§Hermes runtime](#hermes-runtime--деплой-per-user-инстансов-adr-046-adr-045)):**
-- [ ] **External docker-сеть `hermes-net` (`HERMES_DOCKER_NETWORK`) создана на сервере ДО деплоя** control plane: `docker network create hermes-net`. Compose ссылается на неё как `external: true` и **не** создаёт её — без предсуществующей сети `docker compose up` падает. Per-instance при мульти-инстансе (своё имя сети на инстанс, [§Мульти-инстанс](#мульти-инстанс--клонирование-сервиса)).
+- [ ] **External docker-сеть `hermes-net` (`HERMES_DOCKER_NETWORK=hermes-net`) создана на сервере ДО деплоя** control plane: `docker network create hermes-net`. Compose ссылается на неё как `external: true` и **не** создаёт её — без предсуществующей сети `docker compose up` падает.
 - [ ] **Доступ `api` к Docker daemon настроен** одним из путей: (а) `docker.sock` смонтирован `:ro` **только** в `api` (uid 10001 имеет доступ к GID docker-группы хоста); либо (б) remote TLS Docker API (`DOCKER_HOST`/`DOCKER_TLS_VERIFY=1`/`DOCKER_CERT_PATH`, **TLS verify не отключать**). docker.sock НЕ монтируется в Hermes-инстансы/`postgres`/`redis`. Риски/митигация — [§Hermes runtime](#hermes-runtime--деплой-per-user-инстансов-adr-046-adr-045), [05-security.md §Multi-tenant изоляция](05-security.md#multi-tenant-изоляция-hermes-инстансов-adr-046-adr-045).
 - [ ] `HERMES_IMAGE` задан фиксированным тегом (не `latest`); образ доступен Docker daemon. `HERMES_VOLUME_ROOT` заполнен. `HERMES_LLM_PROVIDER` — валидный провайдер allowlist образа (НЕ `openai`/`auto`), `HERMES_LLM_API_KEY` соответствует провайдеру, `HERMES_MODEL` непуст («голое» имя), `HERMES_LLM_BASE_URL` задан для `custom`/`azure-foundry` ([ADR-055](adr/ADR-055-hermes-instance-llm-config-contract.md), [§Конфигурация (env)](#конфигурация-env)).
 - [ ] **Readiness/ownership ([ADR-056](adr/ADR-056-provision-readiness-gate-and-volume-ownership.md)):** `HERMES_PROVISION_READY_TIMEOUT_SECONDS`(90) < `HERMES_PROVISIONING_STALE_SECONDS`(120) — иначе `config.py` fail-fast на старте. `HERMES_UID`/`HERMES_GID` (дефолт `10001`) **совпадают с uid/gid `api`-сервиса** в `docker-compose` (рассинхрон → `PermissionError(13)` при reuse-`provision`).
-- [ ] GitHub Secrets заведены: `SSH_HOST=87.239.135.154`, `SSH_USER=root`, `SSH_PRIVATE_KEY`.
+- [ ] GitHub Secrets заведены: `SSH_HOST_AVORELIO=87.239.135.156`, `SSH_USER=root`, `SSH_PRIVATE_KEY`.
 
-**Секреты (только через secret manager / `.env` в `/opt/<service>` на сервере, не в образе):**
+**Секреты (только через secret manager / `.env` в `/opt/claude-hermes` на `.156`, не в образе):**
 - [ ] `ANTHROPIC_API_KEY` — реальный, **с положительным балансом** (готов).
 - [ ] `KMS_LOCAL_MASTER_KEY` — высокоэнтропийный master key (`LocalKmsClient`, [ADR-003](adr/ADR-003-byok-envelope-encryption.md)). Облачный KMS — post-MVP ([Q-002-1](99-open-questions.md)).
-- [ ] `JWT_PRIVATE_KEY` / `JWT_PRIVATE_KEY_PATH` — приватный RS256-ключ подписи (встроенный issuer, [ADR-018](adr/ADR-018-embedded-auth-issuer.md)). Отдельный секрет, не пересекается с прочими. PEM через файл-путь (prod-рекомендация) или `\n`-экранированную строку.
+- [ ] `JWT_PRIVATE_KEY` / `JWT_PRIVATE_KEY_PATH` — **опциональный/dormant** секрет: приватный RS256-ключ подписи спящего issuer'а ([ADR-018](adr/ADR-018-embedded-auth-issuer.md)). HTTP-поверхность `/v1/auth/*` retired ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md), роутер не смонтирован) → **для публичного запуска НЕ требуется**; задать только при аддитивной реактивации issuer'а. PEM через файл-путь или `\n`-экранированную строку.
 - [ ] `ADMIN_API_SECRET` — высокоэнтропийный ([ADR-009](adr/ADR-009-admin-token-auth.md)).
 - [ ] `PREVIEW_URL_SECRET` — высокоэнтропийный, отдельный ([ADR-010](adr/ADR-010-backend-hosted-preview.md)).
 - [ ] `METRICS_SCRAPE_TOKEN` — задан (иначе `/metrics` защищать только сетевой политикой).
@@ -676,10 +457,10 @@ GitHub Secrets для деплоя: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`. �
 **Данные / инфра:**
 - [ ] Миграции **`0001`→`0002`→`0003`→`0004`→`0005`→`0006`→`0007`→`0008`→`0009`→`0010`** применены (`docker compose run --rm migrate`). `0005` — `auth_devices`/`auth_refresh_tokens` (auth-issuer); `0006` — `chat_steps.seq` ([ADR-021](adr/ADR-021-deterministic-step-order-and-block-normalization.md), BUG-5); `0007` — `chat_sessions.project_id` nullable ([ADR-022](adr/ADR-022-optional-project-and-tool-gating.md)); `0008` — `adapty_webhook_events` ([ADR-029](adr/ADR-029-adapty-subscription-webhook.md)); `0009` — `user_preferences.notifications_enabled` default `false` ([ADR-032](adr/ADR-032-notifications-enabled-default-false.md)); `0010` — `chat_sessions.model` nullable ([ADR-034](adr/ADR-034-user-model-selection.md)).
 - [ ] Бэкап контейнерного PostgreSQL настроен (`pg_dump` по cron + offsite-копия).
-- [ ] Внешний Traefik выпустил валидный TLS-сертификат для `broadnova.shop`; `api` не доступен из интернета напрямую (нет публикации портов, доступ только через Traefik по сети `web`).
+- [ ] Наш Traefik выпустил валидный TLS-сертификат для `avorelio.shop`; `api` не доступен из интернета напрямую (нет публикации портов, доступ только через Traefik по сети `web`).
 - [ ] Smoke: `/healthz`, `/ready` (db=ok, redis=ok) зелёные через публичный домен.
 
-> Пункты с пометкой **«блокер публичного запуска»**: JWT signing key ([Q-005-1](99-open-questions.md) Closed реализацией — код auth-issuer готов, осталось сгенерировать и задать RSA-пару) и StoreKit prod ([Q-007-1](99-open-questions.md)). Они **не** блокируют подготовку инфры и staging-прогон, но **обязаны** быть закрыты до приёма реальных пользователей. До конфигурации ключа `/v1/auth/*` отвечают `503`; StoreKit работает в test-режиме.
+> Пункты с пометкой **«блокер публичного запуска»**: `CLIENT_API_KEY` ([ADR-044](adr/ADR-044-client-api-key-auth.md); без него все `/v1/*` → `401`), `DOCS_ENABLED=false` и StoreKit prod ([Q-007-1](99-open-questions.md)). Они **не** блокируют подготовку инфры и staging-прогон, но **обязаны** быть закрыты до приёма реальных пользователей. **JWT signing key — НЕ блокер публичного запуска:** HTTP-поверхность `/v1/auth/*` **retired** ([ADR-044 §4a](adr/ADR-044-client-api-key-auth.md)) — роутер не смонтирован, `/v1/auth/*` = `404` (не `503`); RSA-пара подписи нужна только при аддитивной реактивации спящего issuer'а. StoreKit работает в test-режиме до конфигурации prod-верификации.
 
 ## Наблюдаемость в проде
 - Метрики из [01-architecture.md](01-architecture.md#наблюдаемость) → Prometheus + дашборды.
