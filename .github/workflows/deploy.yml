@@ -16,8 +16,10 @@
 #
 # Flow: SSH to .156 -> cd /opt/claude-hermes -> git pull --ff-only ->
 #   compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml build api migrate ->
-#   run --rm migrate -> up -d --no-build -> readiness gate (claude-hermes-api-1 healthy =
-#   compose healthcheck GET /ready: db+redis) -> NON-FATAL public smoke https://avorelio.shop/healthz.
+#   run --rm migrate -> up postgres redis traefik (normal) + up --force-recreate api (ONLY api,
+#   adopts the freshly built image; stateful/edge untouched) -> readiness gate
+#   (claude-hermes-api-1 healthy = compose healthcheck GET /ready: db+redis) -> NON-FATAL public
+#   smoke https://avorelio.shop/healthz.
 #
 # GitHub Secrets (Settings -> Secrets and variables -> Actions): NEVER hardcode these.
 #   SSH_HOST_AVORELIO=87.239.135.156
@@ -31,7 +33,9 @@
 #   git log --oneline -n 5 ; git checkout <prev-commit>
 #   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env build api migrate
 #   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env run --rm migrate  # if needed
-#   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env up -d --no-build
+#   docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-file .env up -d --no-build --no-deps --force-recreate api
+# (force-recreate ONLY api so it adopts the rolled-back image — the stale-code footgun applies to
+# rollback too; postgres/redis/traefik stay up and are NOT force-recreated.)
 # The traefik container is NOT changed on rollback (pinned image, config in the overlay).
 # Schema is NOT reverted (expand/contract migrations keep the old code compatible). See
 # docs/07-deployment.md §Откат and infra/deploy/README.md.
@@ -89,10 +93,24 @@ jobs:
             if ! $COMPOSE run --rm migrate; then
               echo "::error title=migrate failed::alembic upgrade head returned non-zero"; exit 1
             fi
-            echo "[avorelio] up -d --no-build (rc recorded, not trusted; readiness gate decides)"
+            # SPLIT up (incident fix, identical to ci.yml deploy-avorelio): force-recreate ONLY
+            # api so it adopts the freshly built image; NEVER force-recreate postgres/redis/traefik.
+            # ROOT CAUSE: `up -d` keys recreation off the service CONFIG hash, which references the
+            # image by its STABLE TAG (…-backend:prod), not the resolved image ID; a rebuild under
+            # the same tag leaves that hash unchanged, so a plain `up -d --no-build` kept the OLD api
+            # container (stale code) while /ready (db+redis) stayed green.
+            #   (3a) stateful/edge — NORMAL up (start if down, leave healthy untouched). --no-deps so
+            #        traefik does not drag api in. Protects postgres(data)/redis(cache)/traefik(:443+ACME).
+            echo "[avorelio] up postgres redis traefik (normal up — protect stateful/ACME; NO force-recreate)"
+            up_infra_rc=0
+            $COMPOSE up -d --no-build --no-deps postgres redis traefik || up_infra_rc=$?
+            echo "[avorelio] up(infra) rc=$up_infra_rc (informational)"
+            #   (3b) api ONLY — --force-recreate (unconditional) + --no-deps (deps already satisfied:
+            #        migrate ran in step 2, infra up in 3a; guarantees stateful services are untouched).
+            echo "[avorelio] up --force-recreate api ONLY (adopt freshly built image; stateful UNTOUCHED)"
             up_rc=0
-            $COMPOSE up -d --no-build || up_rc=$?
-            echo "[avorelio] up rc=$up_rc (informational)"
+            $COMPOSE up -d --no-build --no-deps --force-recreate api || up_rc=$?
+            echo "[avorelio] up(api) rc=$up_rc (informational; readiness gate decides)"
             echo "[avorelio] readiness gate: api container health"
             ready=0
             for i in $(seq 1 30); do
