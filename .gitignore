@@ -40,6 +40,10 @@ build/
 .idea/
 .vscode/
 
+# ── OS-generated junk ───────────────────────────────────────────
+# macOS Finder metadata — appears in any directory browsed in Finder, never source.
+.DS_Store
+
 # ── Local scratch / run artifacts (not part of the repo) ────────
 # Captured test/run output logs from local runs.
 *_err.txt
