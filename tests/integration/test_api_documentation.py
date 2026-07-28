@@ -88,8 +88,8 @@ _TAG_ORDER = [
 # Endpoint -> expected single tag (R4 table, ADR-059 §7 full surface). The retired /v1/auth/* issuer
 # and the retired POST /v1/subscription/sync are ABSENT from the schema and therefore not listed.
 _ENDPOINT_TAG = {
-    # Agent (ADR-045/047): 4 client-contour /v1/agent/* endpoints, all tag=Agent. The route path
-    # params are declared as {run_id} (FastAPI emits the function param name verbatim), so the
+    # Agent (ADR-045/047/064/066): 6 client-contour /v1/agent/* endpoints, all tag=Agent. The route
+    # path params are declared as {run_id} (FastAPI emits the function param name verbatim), so the
     # OpenAPI path strings are /v1/agent/runs/{run_id}/* — the docs' {runId} is the
     # external-narrative spelling (agent-proxy/02). Security is the client-contour AND form
     # (clientApiKey+userId), asserted via _CLIENT_V1_OPERATIONS below.
@@ -97,6 +97,10 @@ _ENDPOINT_TAG = {
     ("/v1/agent/runs/{run_id}/events", "get"): "Agent",
     ("/v1/agent/runs/{run_id}/approval", "post"): "Agent",
     ("/v1/agent/runs/{run_id}/stop", "post"): "Agent",
+    # ADR-064: resume a paused run as a continuation child.
+    ("/v1/agent/runs/{run_id}/resume", "post"): "Agent",
+    # ADR-066: read-only run state snapshot (the UI-restore route).
+    ("/v1/agent/runs/{run_id}/state", "get"): "Agent",
     # Chat (ADR-059 §7 restored): the tool-loop contour is documented again.
     ("/v1/chat/run", "post"): "Chat",
     ("/v1/chat/tool-result", "post"): "Chat",
@@ -365,7 +369,18 @@ _AGENT_OPERATIONS = [
     ("/v1/agent/runs/{run_id}/events", "get"),
     ("/v1/agent/runs/{run_id}/approval", "post"),
     ("/v1/agent/runs/{run_id}/stop", "post"),
+    ("/v1/agent/runs/{run_id}/resume", "post"),
+    ("/v1/agent/runs/{run_id}/state", "get"),
 ]
+
+
+def test_agent_state_route_documents_its_response_codes(openapi_schema: dict[str, Any]) -> None:
+    # ADR-066 §5 / agent-proxy/09-testing.md: the state route documents 200/401/404/429 and,
+    # deliberately, NO 200-blocked variant and no 502 (no policy-gate, no call to Hermes).
+    op = _operation(openapi_schema, "/v1/agent/runs/{run_id}/state", "get")
+    codes = set(op.get("responses", {}))
+    assert {"200", "401", "404", "429"} <= codes, codes
+    assert "502" not in codes, "GET /state never talks to Hermes (ADR-066 §5)"
 
 
 @pytest.mark.parametrize(("path", "method"), _AGENT_OPERATIONS)

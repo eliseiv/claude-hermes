@@ -88,7 +88,7 @@ flowchart TB
 | 16 | **Token Purchase** | Consumable StoreKit IAP → идемпотентный grant кредитов ([ADR-015](adr/ADR-015-consumable-token-iap.md)), отдельно от подписки. | [modules/token-purchase](modules/token-purchase/README.md) |
 | 17 | **Notifications** | Toggle (в preferences) + регистрация APNs device-токена. Отправка push → [TD-011](100-known-tech-debt.md). | [modules/notifications](modules/notifications/README.md) |
 | 19 | **Hermes Runtime** ([ADR-046](adr/ADR-046-per-user-hermes-runtime.md)) | Жизненный цикл per-user Hermes-инстансов: `HermesInstanceManager` (provision/ensure_running/stop_idle/deprovision/health), `docker_backend` (расширяемый `RuntimeBackend`), `registry` (таблица `hermes_instances`), гибернация + фоновый reaper в `lifespan`. Шифрование `API_SERVER_KEY` через `byok.kms`. | [modules/hermes-runtime](modules/hermes-runtime/README.md) |
-| 20 | **Agent Proxy** ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)) | Контур `/v1/agent/*`: прокси к Hermes `POST /v1/runs`, SSE-ретрансляция событий на iOS, policy-gate до прогона, биллинг по usage на `run.completed` ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)). `httpx.AsyncClient`. | [modules/agent-proxy](modules/agent-proxy/README.md) |
+| 20 | **Agent Proxy** ([ADR-045](adr/ADR-045-hermes-as-agent-proxy.md)) | Контур `/v1/agent/*`: прокси к Hermes `POST /v1/runs`, SSE-ретрансляция событий на iOS, policy-gate до прогона, биллинг по usage на `run.completed` ([ADR-047](adr/ADR-047-usage-based-billing-for-agent.md)). Персистит lifecycle прогона (`agent_runs`, [ADR-064](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) и **снапшот состояния** (`agent_run_snapshots`) побочным эффектом relay → read-only `GET /v1/agent/runs/{runId}/state` для восстановления UI после обрыва клиента ([ADR-066](adr/ADR-066-agent-run-state-snapshot.md)). `httpx.AsyncClient`. | [modules/agent-proxy](modules/agent-proxy/README.md) |
 | 18 | **Auth** | **Встроенный issuer** ([ADR-018](adr/ADR-018-embedded-auth-issuer.md), закрывает [Q-005-1](99-open-questions.md)): выпуск RS256 JWT (`/v1/auth/register|token|refresh`, `jwks`), device-based identity, refresh-rotation. **Sign in with Apple** ([ADR-043](adr/ADR-043-sign-in-with-apple.md), закрывает [Q-018-2](99-open-questions.md)): `/v1/auth/apple` — верификация Apple identity token → НАША пара, кросс-девайс аккаунт (`auth_identities`). Верификация НАШИХ токенов — существующим `JwtVerifier` (API Gateway). | [modules/auth](modules/auth/README.md) |
 | — | **Observability** | Cross-cutting: метрики, структурированные логи с correlation id, трейсы, алерты. | этот документ + [05-security.md](05-security.md) |
 
@@ -207,6 +207,9 @@ sequenceDiagram
         AP->>W: consume(userId, amount(usage), idempotency_key=runId)  // ADR-047
         AP-->>C: run.completed
     end
+    Note over AP: relay попутно пишет agent_runs + agent_run_snapshots (ADR-066)
+    C->>AP: GET /v1/agent/runs/{runId}/state  // после kill приложения
+    AP-->>C: 200 снапшот из БД (Hermes НЕ опрашивается, инстанс НЕ будится)
 ```
 
 ## Tool-calling протокол: client-side vs server-side ([ADR-011](adr/ADR-011-server-side-tools.md), [ADR-026](adr/ADR-026-global-server-side-tools-and-time-now.md))

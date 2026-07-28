@@ -63,6 +63,7 @@ def _settings() -> Settings:
 def _proxy(session: AsyncSession) -> AgentProxyService:
     """Real AgentProxyService with REAL WalletService + AuditService over the test session."""
     from app.agent_proxy.runs_repo import AgentRunsRepository
+    from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository
 
     audit = AuditService(session)
     wallet = WalletService(session, audit)
@@ -75,6 +76,8 @@ def _proxy(session: AsyncSession) -> AgentProxyService:
         # ADR-064: post-hoc path (flag OFF default) never writes agent_runs, but the constructor
         # requires the repo; pass a real one so the wiring matches production.
         runs=AgentRunsRepository(session),
+        # ADR-066: relay-side snapshot writer (real repo — production wiring).
+        snapshots=AgentRunSnapshotsRepository(session),
     )
 
 

@@ -83,25 +83,81 @@ class AgentRunsRepository:
             {"run_id": run_id, "step": step_index, "credits": credits},
         )
 
-    async def mark_paused(self, run_id: str, reason: str) -> None:
-        """Mark a run ``paused`` with a reason (ADR-064 §3, e.g. ``credits_exhausted``)."""
-        await self._session.execute(
-            text(
-                "UPDATE agent_runs SET status = 'paused', paused_reason = :reason, "
-                "updated_at = now() WHERE run_id = :run_id"
-            ),
-            {"run_id": run_id, "reason": reason},
-        )
+    async def mark_paused(self, run_id: str, reason: str) -> int:
+        """Mark a run ``paused`` with a reason (ADR-064 §3, e.g. ``credits_exhausted``).
 
-    async def mark_status(self, run_id: str, status: str) -> None:
-        """Set the run status (ADR-064 §2/§6), e.g. ``completed`` on finalization."""
-        await self._session.execute(
-            text(
-                "UPDATE agent_runs SET status = CAST(:status AS agent_run_status), "
-                "updated_at = now() WHERE run_id = :run_id"
+        Conditional like every other status transition (ADR-066 §3): a run that is already terminal
+        (e.g. the client sent ``POST …/stop`` a moment earlier) must not be flipped back to
+        ``paused``. Returns the affected rowcount.
+        """
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                text(
+                    "UPDATE agent_runs SET status = 'paused', paused_reason = :reason, "
+                    "updated_at = now() "
+                    "WHERE run_id = :run_id AND status IN ('running', 'resumed')"
+                ),
+                {"run_id": run_id, "reason": reason},
             ),
-            {"run_id": run_id, "status": status},
         )
+        return result.rowcount or 0
+
+    async def mark_status(self, run_id: str, status: str) -> int:
+        """Set a TERMINAL run status — conditional on the run still being active (ADR-066 §3).
+
+        ``WHERE status IN ('running','resumed')`` is MANDATORY for every terminal transition
+        (``completed``/``failed``/``cancelled``), not only for ``cancelled``. An unconditional write
+        would create a last-writer-wins race: after ``POST …/stop`` Hermes keeps flushing buffered
+        events into the still-open relay, and a late ``run.completed``/``run.failed`` would
+        overwrite the recorded ``cancelled`` — the client would see ``completed`` for a run it
+        stopped itself, and the history would lose it. The condition makes the FIRST terminal
+        status the winner and protects ``paused`` from being overwritten as well.
+
+        A missing row (a run started before this row became unconditional) updates 0 rows
+        harmlessly. Returns the affected rowcount.
+        """
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                text(
+                    "UPDATE agent_runs SET status = CAST(:status AS agent_run_status), "
+                    "updated_at = now() "
+                    "WHERE run_id = :run_id AND status IN ('running', 'resumed')"
+                ),
+                {"run_id": run_id, "status": status},
+            ),
+        )
+        return result.rowcount or 0
+
+    async def mark_stopped(self, run_id: str, user_id: uuid.UUID) -> int:
+        """Mark a run ``cancelled`` after a 2xx CLIENT ``POST …/stop`` (ADR-066 §3). Owner-scoped.
+
+        Named separately from :meth:`mark_status` because the CALL SITE is the invariant: this must
+        be invoked ONLY on the client stop path, never on the internal Hermes interrupt that
+        pause-at-zero performs (ADR-064 §3). Marking the status inside the shared interrupt would
+        make a credits-exhausted run transiently ``cancelled`` instead of ``paused`` — ``/state``
+        would report ``stopped`` (so the client would not offer a top-up) and ``POST …/resume``
+        would answer ``409 run_not_resumable`` inside that window.
+
+        ``AND user_id = :uid`` is MANDATORY here (unlike the relay-driven transitions, whose run id
+        comes from the stream the caller is already authorised for): the stop path takes ``run_id``
+        straight from the request path and Hermes may answer 2xx for an unknown/foreign run
+        (idempotent-stop semantics), so an unscoped UPDATE would let user A cancel user B's run.
+        A foreign id simply updates 0 rows — no 403 is surfaced (RBAC-404 contract).
+        """
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                text(
+                    "UPDATE agent_runs SET status = 'cancelled', updated_at = now() "
+                    "WHERE run_id = :run_id AND user_id = :uid "
+                    "AND status IN ('running', 'resumed')"
+                ),
+                {"run_id": run_id, "uid": str(user_id)},
+            ),
+        )
+        return result.rowcount or 0
 
     async def active_child(self, parent_run_id: str) -> AgentRun | None:
         """Return the continuation child of a paused run, or None (ADR-064 §5 idempotent)."""

@@ -43,6 +43,17 @@ os.environ["DOCS_ENABLED"] = "true"
 os.environ["METRICS_SCRAPE_TOKEN"] = ""
 os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
 
+# Rate limiting must FAIL OPEN deterministically (the suite ships no Redis container; dedicated
+# limiter behaviour is unit-tested with a fake client). The default redis://localhost:6379/0 makes
+# the suite non-hermetic on a developer machine that happens to run an unrelated Redis: the
+# rate_limit module caches ONE redis.Redis singleton (`_redis_client`) while pytest-asyncio gives
+# every test a FRESH event loop, so a connection opened on loop A is reused on loop B and its
+# teardown raises RuntimeError("Event loop is closed") — which is NOT a redis.RedisError and
+# therefore escapes the fail-open guard, 500-ing whichever route rate-limits (first observed on
+# GET /v1/agent/runs/{runId}/state, ADR-066). Pointing at a closed loopback port makes every
+# attempt a clean connection error → the documented fail-open path, on every machine.
+os.environ["REDIS_URL"] = "redis://127.0.0.1:1/0"
+
 # JWT: tokens are signed below with an ephemeral RSA key (_PRIVATE_PEM); the service must
 # verify with the matching JWT_PUBLIC_KEY and the iss/aud baked into make_jwt(). Force a
 # static public-key posture (no JWKS) and a fixed issuer/audience the factory mirrors.
@@ -154,6 +165,10 @@ async def _engine(_migrated: str):
 
 _TABLES = (
     "audit_logs",
+    # ADR-066 (migration 0019): agent-run state snapshot. FK→agent_runs CASCADE + FK→users
+    # CASCADE. Listed explicitly (BEFORE agent_runs) so it is reset deterministically between
+    # snapshot/state tests instead of relying on the TRUNCATE ... CASCADE fan-out.
+    "agent_run_snapshots",
     # ADR-064 (migration 0018): agent-run lifecycle + resume chain. run_id TEXT PK, FK→users
     # CASCADE + a self-FK (continued_from_run_id). Listed explicitly (before users) so it is reset
     # deterministically between incremental-billing / resume tests.
@@ -494,6 +509,7 @@ async def client(
     # The routers imported the names at module load — patch there too. The subscription router was
     # RETIRED (TD-021/ADR-029 revision): POST /v1/subscription/sync no longer exists, so there is no
     # subscription router to patch here (importing it would ImportError and break the whole suite).
+    from app.api_gateway.routers import agent as agent_router
     from app.api_gateway.routers import byok as byok_router
     from app.api_gateway.routers import chat as chat_router
     from app.api_gateway.routers import wallet as wallet_router
@@ -501,6 +517,10 @@ async def client(
     chat_router.enforce_chat_limits = _allow_chat  # type: ignore[assignment]
     wallet_router.enforce_other_limits = _allow_other  # type: ignore[assignment]
     byok_router.enforce_other_limits = _allow_other  # type: ignore[assignment]
+    # ADR-066: GET /v1/agent/runs/{runId}/state is the first /v1/agent/* route behind the shared
+    # `enforce_other_limits` gate (same contour as `chats`), so the agent router needs the same
+    # deterministic override as the others — it imported the name at module load.
+    agent_router.enforce_other_limits = _allow_other  # type: ignore[assignment]
 
     app = create_app()
     app.dependency_overrides[deps.get_db] = _override_db
@@ -514,6 +534,7 @@ async def client(
     chat_router.enforce_chat_limits = orig_chat  # type: ignore[assignment]
     wallet_router.enforce_other_limits = orig_other  # type: ignore[assignment]
     byok_router.enforce_other_limits = orig_other  # type: ignore[assignment]
+    agent_router.enforce_other_limits = orig_other  # type: ignore[assignment]
 
 
 # ----------------------------- DB seeding helpers -----------------------------

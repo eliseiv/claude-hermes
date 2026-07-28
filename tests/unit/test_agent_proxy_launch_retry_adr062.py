@@ -47,8 +47,9 @@ def _settings(**overrides: Any) -> Settings:
 
 def _service(settings: Settings) -> AgentProxyService:
     # _launch_run only touches self._settings + self._bearer_headers, so the DB/manager/wallet/
-    # audit/runs collaborators are irrelevant here and passed as None (never dereferenced here).
-    # ADR-064: the constructor now requires ``runs``; None is safe on this path.
+    # audit/runs/snapshots collaborators are irrelevant here and passed as None (never dereferenced
+    # here). ADR-064: the constructor requires ``runs``; ADR-066: it also requires ``snapshots``
+    # (the relay-side state writer). Both are safe as None on this path.
     return AgentProxyService(
         session=None,  # type: ignore[arg-type]
         manager=None,  # type: ignore[arg-type]
@@ -56,6 +57,7 @@ def _service(settings: Settings) -> AgentProxyService:
         audit=None,  # type: ignore[arg-type]
         settings=settings,
         runs=None,  # type: ignore[arg-type]
+        snapshots=None,  # type: ignore[arg-type]
     )
 
 

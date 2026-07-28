@@ -3,6 +3,9 @@
 ## Состав
 - `src/app/api_gateway/routers/agent.py` — роутер `/v1/agent/*`, регистрируется в `main.py`.
 - `src/app/schemas/agent.py` — Pydantic request/response.
+- `src/app/agent_proxy/service.py` — `AgentProxyService`: `run`/`stream_events`/`approval`/`stop`/`resume`/`get_state`. Терминальный статус пишет **сервисная** обёртка `_mark_terminal(run_id, status)` (вызывает репозиторный `mark_status`, делает `commit` и **проглатывает `SQLAlchemyError`** — сбой записи статуса не рвёт SSE-стрим); порядок обязателен: `_mark_terminal` **до** биллинга и независимо от его исхода ([ADR-066 §3](../../adr/ADR-066-agent-run-state-snapshot.md)).
+- `src/app/agent_proxy/runs_repo.py` — репозиторий lifecycle-строки `agent_runs` ([ADR-064](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)): `create_running`, `record_step`, `mark_paused`, `active_child`, **`mark_status(run_id, status)`** (условный переход `WHERE status IN ('running','resumed')` — источник защиты терминальных статусов от затирания) и **owner-scoped `mark_stopped(run_id, user_id)`** (`AND user_id=:uid`) — [ADR-066 §3](../../adr/ADR-066-agent-run-state-snapshot.md).
+- `src/app/agent_proxy/snapshots_repo.py` — репозиторий снапшота `agent_run_snapshots` ([ADR-066](../../adr/ADR-066-agent-run-state-snapshot.md)): upsert с per-column replay-guard, **`clear_pending_approval(run_id, user_id)`** (owner-scoped снятие approval после 2xx `POST …/approval` — **единственный owner-scoped writer** снапшота и третья точка снятия `pending_approval`; без `INSERT`, коммит — teardown request-сессии), чтение для `/state`, retention-sweep. Пишется **только** из relay-пути и этого клиентского вызова; `/state` — чистое чтение.
 - Потребляет: `HermesInstanceManager` ([Hermes Runtime](../hermes-runtime/README.md)), `PolicyEngine`, `WalletService`, `AuditService`.
 - HTTP — `httpx.AsyncClient` (+ `.stream` для SSE), уже в стеке ([02-tech-stack.md](../../02-tech-stack.md)).
 

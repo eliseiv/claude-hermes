@@ -132,13 +132,45 @@
 ### GET /v1/agent/runs/{runId}/events  (SSE)
 Поток событий прогона (ретрансляция из Hermes): `run.queued|run.running|message.delta|tool.started|tool.completed|approval.request|usage.delta|run.completed|run.failed|run.paused`. На `run.completed{usage}` backend списывает кредиты по usage (идемпотентно по `runId`). `run.failed` → без списания. Заголовки: `X-API-Key` + `X-User-Id`.
 - **`usage.delta`** ([ADR-064](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md), под флагом `AGENT_INCREMENTAL_BILLING_ENABLED`) — per-step usage (`{step_index, cumulative_input_tokens, cumulative_output_tokens, ...}`); драйвер пошагового списания. Клиент может игнорировать.
-- **`run.paused`** ([ADR-064 §3](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) — **терминальное** синтетическое событие при исчерпании баланса: `{event:"run.paused", run_id, reason:"credits_exhausted", status:"paused", output:"<промежуточный текст>", steps, billed:<кредиты>, balance:0, usage:{cumulative_input_tokens, cumulative_output_tokens}}`. Стрим закрывается **без** `run.completed`, долг не создаётся. Промежуточный текст ответа — в ключе **`output`** (не `message`). Клиент показывает `output`/`steps` и предлагает пополнение → `resume`. Тип события — в JSON-поле `"event"` (диспетчеризация по нему).
+- **`run.paused`** ([ADR-064 §3](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) — **терминальное** синтетическое событие при исчерпании баланса: `{event:"run.paused", run_id, reason:"credits_exhausted", status:"paused", output:"<промежуточный текст>", steps, billed:<кредиты>, balance:0, usage:{cumulative_input_tokens, cumulative_output_tokens}}`. Стрим закрывается **без** `run.completed`, долг не создаётся. Промежуточный текст ответа — в ключе **`output`** (не `message`), **ограничен 64 KB (`AGENT_STATE_RESULT_TEXT_MAX_CHARS`) с сохранением начала** ([ADR-066 §6](adr/ADR-066-agent-run-state-snapshot.md)); полный текст — через `/events`. Клиент показывает `output`/`steps` и предлагает пополнение → `resume`. Тип события — в JSON-поле `"event"` (диспетчеризация по нему).
+
+### GET /v1/agent/runs/{runId}/state
+Снапшот состояния прогона **из БД** ([ADR-066](adr/ADR-066-agent-run-state-snapshot.md)). Для восстановления UI после kill приложения / смены сети / гибернации Hermes: `/events` события **не персистит**, переподключение к закрытому стриму отдаёт `200` без событий.
+
+**Заголовки:** `X-API-Key` + `X-User-Id`. Тела нет.
+
+**Строго read-only:** контейнер Hermes **не будится** (`ensure_running` не вызывается), обращения к Hermes нет, кредиты не списываются, policy-gate не выполняется (`200 {status:blocked}` на этом маршруте не бывает).
+
+**Response 200:**
+```json
+{
+  "runId": "run_7f3c1a",
+  "sessionId": "b2b4b0e6-8f2a-4b5d-9d31-6a1c2f0e9a77",
+  "status": "waiting_approval",
+  "resultText": "Нашёл три подходящих варианта, свожу в таблицу…",
+  "lastTool": "web_search",
+  "pendingApproval": { "tool": "file_write", "preview": "report.md (12 KB)" },
+  "blockReason": null,
+  "usage": { "inputTokens": 18432, "outputTokens": 2110 },
+  "updatedAt": "2026-07-28T11:42:07Z",
+  "continuedFrom": null
+}
+```
+
+- `status` ∈ `queued|running|waiting_approval|paused|completed|failed|stopped`. `waiting_approval` — прогон ждёт ответа на `approval.request` (показать `pendingApproval` и вызвать `POST …/approval`); `stopped` — прогон был остановлен через `POST …/stop`; `queued` в v1 не эмитится (зарезервирован).
+- `blockReason` — **причина паузы** (в v1 только `credits_exhausted`), непусто при `status=paused`. Это **не** policy-`blockReason` из `POST /v1/agent/run` (`credits_empty`/…): валидировать тем enum'ом нельзя.
+- `resultText` — накопленный текст ответа (обрезан с сохранением начала до 64 KB). `usage` — накопленный расход. `continuedFrom` — родительский `runId` для прогона, созданного через `/resume`.
+- `updatedAt` — время последней записи снапшота; **детектор устаревания**.
+- Снапшота ещё нет (прогон только стартовал) → всё равно `200` с дефолтами (`resultText:""`, `usage:{0,0}`).
+- `401` — auth. `404` — чужой/несуществующий прогон (RBAC; 403 не возвращается) **и** прогоны, запущенные до деплоя [ADR-066](adr/ADR-066-agent-run-state-snapshot.md). `429` — rate limit.
+
+> **Рецепт клиента:** `GET /state` → если `running`/`waiting_approval` → **переподключиться к `/events`** и догнать поток. Снапшот обновляется только пока к `/events` кто-то подключён, поэтому у активного прогона с отключённым клиентом `resultText` отстаёт (видно по `updatedAt`). `stop → stopped` — eventual consistency (Hermes может ещё дофлашивать события).
 
 ### POST /v1/agent/runs/{runId}/approval
-Подтверждение действия агента, ожидающего approval: `{ "choice": "string" }` (passthrough к Hermes).
+Подтверждение действия агента, ожидающего approval: `{ "choice": "string" }` (passthrough к Hermes). Server-side снимает `pendingApproval` в снапшоте после 2xx ([ADR-066](adr/ADR-066-agent-run-state-snapshot.md)).
 
 ### POST /v1/agent/runs/{runId}/stop
-Остановка прогона (passthrough к Hermes).
+Остановка прогона (passthrough к Hermes). После 2xx прогон помечается `cancelled` → в `/state` отображается как `stopped` ([ADR-066 §3](adr/ADR-066-agent-run-state-snapshot.md)); уже завершённый/`paused` прогон статус не меняет.
 
 ### POST /v1/agent/runs/{runId}/resume
 Возобновление прогона, остановленного по исчерпании баланса (`run.paused`, [ADR-064 §5](adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)). Continuation: запускается **новый** прогон в той же Hermes-сессии (память/контекст целы). `session_id` клиенту хранить не нужно.
@@ -766,6 +798,8 @@ Steps-view — агрегированные шаги одного message-шаг
 | `max_tokens` | Ответ Claude обрезан лимитом output-токенов ([ADR-025](adr/ADR-025-parallel-tool-calls-and-max-tokens-truncation.md)) | «Ответ слишком длинный — повторите или сократите запрос». **Отличие от прочих причин:** срабатывает **после** начала генерации — `usage`/`messageStepId`/`stepId` присутствуют; **кредит не списан**; инструменты (обрезанные) не отдаются. Не входит в `policy/effective.reasons[]`. |
 
 > `reasons[]` в `GET /v1/policy/effective` содержит подмножество policy-причин (без `rate_limited` и без `max_tokens` — обе не являются предсказуемой до-генерационной policy-причиной) — для предварительной отрисовки доступности режимов в UI.
+>
+> ⚠️ **Одноимённое поле в `GET /v1/agent/runs/{runId}/state` — другое пространство значений** ([ADR-066 §5](adr/ADR-066-agent-run-state-snapshot.md)): там `blockReason` несёт **причину паузы прогона** (`paused_reason`, в v1 только `credits_exhausted`) и валидировать его этими 9 policy-значениями **нельзя**. Справочник выше относится к `status="blocked"` (`/chat/run`, `/v1/agent/run`, `/v1/agent/runs/{runId}/resume`) и к `reasons[]` в `/policy/effective`.
 
 ---
 

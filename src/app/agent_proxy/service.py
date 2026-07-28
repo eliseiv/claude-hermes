@@ -13,18 +13,22 @@ forwards every event byte-for-event to the client and, on the terminal ``run.com
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_proxy.billing import usage_to_credits
 from app.agent_proxy.runs_repo import AgentRunsRepository
+from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository, SnapshotUpsertResult
 from app.audit.service import (
     EVENT_BILLING_DEBIT_INSUFFICIENT,
     AuditEvent,
@@ -51,8 +55,14 @@ logger = logging.getLogger("app.agent_proxy.service")
 EVENT_AGENT_RUN = "agent_run"
 
 # Terminal SSE event name that triggers billing (Hermes external contract, agent-proxy/05-events).
-# run.failed needs no special handling — it is relayed like any other event, without a debit.
 _EVENT_RUN_COMPLETED = "run.completed"
+# ADR-066 §3: terminal failure. No debit (no usage) — but it DOES flush the snapshot and record
+# agent_runs.status='failed', which before ADR-066 was never written (a crashed run stayed
+# 'running' forever).
+_EVENT_RUN_FAILED = "run.failed"
+# ADR-066 §6: the run is waiting for the user to answer an approval request. Persisted so the
+# derived client status waiting_approval survives an SSE drop / app kill.
+_EVENT_APPROVAL_REQUEST = "approval.request"
 # ADR-064 §7: per-LLM-call usage event emitted inside the Hermes tool-loop (image patch). Carries
 # cumulative_input_tokens/cumulative_output_tokens (billing source) + step_index (per-step key).
 _EVENT_USAGE_DELTA = "usage.delta"
@@ -106,6 +116,98 @@ class RunResumeResult:
     continued_from: str | None = None
 
 
+# Client-facing run status of GET .../state (ADR-066 §4). Derived on read from agent_runs.status
+# (+ pending approval); the DB enum agent_run_status is NOT extended. `queued` is not emitted in v1
+# (forward-compat member only).
+ClientRunStatus = Literal[
+    "queued", "running", "waiting_approval", "paused", "completed", "failed", "stopped"
+]
+
+# Terminal DB statuses → client status. running/resumed are handled separately (they depend on the
+# pending approval), `cancelled` is renamed to the client vocabulary (`POST /stop` → `stopped`).
+_CLIENT_STATUS_BY_DB: dict[str, ClientRunStatus] = {
+    "paused": "paused",
+    "completed": "completed",
+    "failed": "failed",
+    "cancelled": "stopped",
+}
+
+
+@dataclass(frozen=True)
+class RunStateView:
+    """Read-only state snapshot of a run for ``GET /v1/agent/runs/{runId}/state`` (ADR-066 §5).
+
+    Assembled from ``agent_runs`` (lifecycle: status, session, resume chain, pause reason) plus the
+    optional ``agent_run_snapshots`` row (UX state: text, tool, approval, tokens). ``status`` is
+    already the CLIENT-facing value (see :func:`map_client_status`).
+    """
+
+    run_id: str
+    session_id: str
+    status: ClientRunStatus
+    result_text: str
+    last_tool: str | None
+    pending_approval: dict[str, Any] | None
+    block_reason: str | None
+    input_tokens: int
+    output_tokens: int
+    updated_at: datetime.datetime
+    continued_from: str | None
+
+
+@dataclass
+class _RelayState:
+    """Relay-local accumulation for the run snapshot and the synthetic ``run.paused`` body.
+
+    Lives for one ``stream_events`` call. Accumulated ALWAYS — outside the
+    ``agent_incremental_billing_enabled`` branch (ADR-066 §6): the snapshot is written regardless of
+    the billing flag, and with the flag OFF the token counters are filled from ``run.completed``
+    instead of ``usage.delta``.
+    """
+
+    # message.delta pieces. COLLAPSED into a single head-truncated element on every flush, so the
+    # buffer is bounded by AGENT_STATE_RESULT_TEXT_MAX_CHARS regardless of run length and the join
+    # never walks an ever-growing list. Consequence: the run.paused `output` is bounded by the same
+    # cap — acceptable, that body is a convenience snapshot, not an authoritative transcript.
+    partial_text: list[str] = field(default_factory=list)
+    # Raw tool.* payloads — the `steps` array of the synthetic run.paused body (ADR-064 §3).
+    # Bounded by the number of tool calls of a single run (units-to-hundreds), not by stream volume.
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    last_tool: str | None = None
+    # The relay's belief about a pending approval. Asserted to the DB only on immediate flushes —
+    # the client can answer POST …/approval out of band, so a throttled text flush must not
+    # resurrect a stale value (see _flush_snapshot).
+    pending_approval: dict[str, Any] | None = None
+    # Cumulative token counters (monotonic; also the run.paused usage anchors).
+    input_tokens: int = 0
+    output_tokens: int = 0
+    # time.monotonic() of the last DB flush; 0.0 => the first delta flushes immediately.
+    last_flush_at: float = 0.0
+    # One-shot latches: each anomaly is logged ONCE per relay (on transition), not per flush —
+    # a frozen text or a tenancy collision persists for the rest of the stream and would otherwise
+    # emit a line every few seconds for the whole run.
+    tenancy_skip_logged: bool = False
+    text_frozen_logged: bool = False
+
+
+def map_client_status(db_status: str, *, has_pending_approval: bool) -> ClientRunStatus:
+    """Map ``agent_runs.status`` (+ approval presence) to the client status (ADR-066 §4). Pure.
+
+    ``running``/``resumed`` → ``running``, or ``waiting_approval`` when an approval is pending —
+    a DERIVED status computed on read, deliberately NOT a value of the ``agent_run_status`` enum
+    (a DB enum migration is more expensive than a mapping, and duplicating the status into the
+    snapshot would create a second source of truth). ``resumed`` belongs to the PARENT row after a
+    resume — the work continues in the child run whose id ``/resume`` returned — so it maps to
+    ``running`` too. ``cancelled`` → ``stopped`` (the client vocabulary follows ``POST …/stop``;
+    the server enum value is not renamed). ``queued`` is never emitted in v1 (forward-compat only).
+    """
+    if db_status in ("running", "resumed"):
+        return "waiting_approval" if has_pending_approval else "running"
+    # paused/completed/failed pass through, cancelled becomes stopped. An unknown value can only
+    # come from a future enum member; degrade to `running` rather than emit an off-contract status.
+    return _CLIENT_STATUS_BY_DB.get(db_status, "running")
+
+
 class AgentProxyService:
     """Proxies the client agent contour to the user's Hermes instance (ADR-045)."""
 
@@ -118,6 +220,7 @@ class AgentProxyService:
         audit: AuditService,
         settings: Settings,
         runs: AgentRunsRepository,
+        snapshots: AgentRunSnapshotsRepository,
     ) -> None:
         self._session = session
         self._manager = manager
@@ -125,6 +228,7 @@ class AgentProxyService:
         self._audit = audit
         self._settings = settings
         self._runs_repo = runs
+        self._snapshots_repo = snapshots
 
     # --- run launch -------------------------------------------------------------------------
 
@@ -192,14 +296,15 @@ class AgentProxyService:
             hermes_body["model"] = model
 
         run_id, status = await self._launch_run(endpoint, hermes_body)
-        # ADR-064 §5: under the incremental flag, create the ROOT agent_runs row (continued_from
-        # NULL). Flag OFF => no row is written and resume is unavailable (post-hoc ADR-047 mode).
-        # Committed by the request session_scope teardown (run() is a plain handler, like the audit
-        # rows below).
-        if self._settings.agent_incremental_billing_enabled:
-            await self._runs_repo.create_running(
-                run_id, user_id, effective_session_id, model, status="running"
-            )
+        # ADR-066 §3: the ROOT agent_runs row (continued_from NULL) is created ALWAYS — the row is
+        # an unconditional LIFECYCLE record, no longer gated by agent_incremental_billing_enabled
+        # (with the flag OFF the default configuration used to store no agent runs at all, so
+        # neither /state nor any run history existed). The flag keeps gating only the BILLING
+        # fields/operations. Committed by the request session_scope teardown (run() is a plain
+        # handler, like the audit rows below).
+        await self._runs_repo.create_running(
+            run_id, user_id, effective_session_id, model, status="running"
+        )
         await self._audit.record(
             AuditEvent(
                 user_id=user_id,
@@ -289,6 +394,14 @@ class AgentProxyService:
         remainder (``owed_final - charged``) is finalized. Flag OFF => ``charged`` stays 0 and
         ``run.completed`` bills the full usage once (idempotency_key=run_id) — the ADR-047 behaviour
         unchanged. ``run.failed`` is forwarded without any debit (ADR-047 §4).
+
+        ADR-066 §6 — SNAPSHOT SIDE EFFECT (independent of the billing flag): the same pass upserts
+        the run state into ``agent_run_snapshots`` (text/last tool/pending approval/tokens, each
+        write committed explicitly — the streaming context runs after the request-session teardown)
+        and records terminal statuses in ``agent_runs`` (``completed``/``failed``, conditional).
+        This is the ONLY source of ``GET /v1/agent/runs/{runId}/state``: while nobody is subscribed
+        here, the snapshot of an active run does not move (a known v1 limitation — a background
+        consumer is deferred, ADR-066 §8).
         """
         incremental = self._settings.agent_incremental_billing_enabled
         endpoint = await self._manager.ensure_running(user_id)
@@ -305,11 +418,9 @@ class AgentProxyService:
         # not re-bill already-charged steps (per-step idempotency guarantees it directly; the seed
         # avoids redundant no-op consume calls too). Post-hoc mode keeps charged == 0.
         charged = await self._wallet.charged_for_run(user_id, run_id) if incremental else 0
-        # Local relay buffer for the synthetic run.paused body (ADR-064 §3): assistant text + tools.
-        partial_text: list[str] = []
-        steps: list[dict[str, Any]] = []
-        last_cum_in = 0
-        last_cum_out = 0
+        # Local relay buffer: feeds BOTH the synthetic run.paused body (ADR-064 §3) and the
+        # agent_run_snapshots writer (ADR-066 §6) — accumulated regardless of the billing flag.
+        state = _RelayState()
         try:
             async with (
                 httpx.AsyncClient(timeout=timeout) as client,
@@ -323,37 +434,90 @@ class AgentProxyService:
                 async for block, raw in _iter_sse_blocks(response):
                     # Relay the raw bytes verbatim to the client (no re-encoding drift).
                     yield raw
-                    if incremental:
-                        name = _event_name(block)
-                        if name == _EVENT_MESSAGE_DELTA:
-                            text_piece = _extract_delta_text(block)
-                            if text_piece:
-                                partial_text.append(text_piece)
-                        elif name is not None and name.startswith(_TOOL_EVENT_PREFIX):
-                            steps.append(block.data)
-                        elif name == _EVENT_USAGE_DELTA:
-                            last_cum_in = _as_int(block.data.get("cumulative_input_tokens"))
-                            last_cum_out = _as_int(block.data.get("cumulative_output_tokens"))
+                    name = _event_name(block)
+                    if name == _EVENT_MESSAGE_DELTA:
+                        text_piece = _extract_delta_text(block)
+                        if text_piece:
+                            state.partial_text.append(text_piece)
+                            # Throttled: text is the only high-frequency writer (ADR-066 §6.1).
+                            await self._flush_snapshot(
+                                user_id=user_id, run_id=run_id, state=state, immediate=False
+                            )
+                    elif name is not None and name.startswith(_TOOL_EVENT_PREFIX):
+                        state.steps.append(block.data)
+                        tool = _extract_tool_name(block)
+                        if tool:
+                            state.last_tool = tool
+                        # The agent moved on => any pending approval is resolved (ADR-066 §6).
+                        state.pending_approval = None
+                        await self._flush_snapshot(
+                            user_id=user_id, run_id=run_id, state=state, immediate=True
+                        )
+                    elif name == _EVENT_APPROVAL_REQUEST:
+                        state.pending_approval = self._build_pending_approval(block)
+                        # IMMEDIATE, bypassing the throttle: a delayed write would leave the client
+                        # unaware that the run is waiting for its answer (ADR-066 §6.1).
+                        await self._flush_snapshot(
+                            user_id=user_id, run_id=run_id, state=state, immediate=True
+                        )
+                    elif name == _EVENT_USAGE_DELTA:
+                        # Cumulative token anchors — recorded for the snapshot even with billing
+                        # OFF (a patched image may emit usage.delta regardless).
+                        state.input_tokens = max(
+                            state.input_tokens,
+                            _as_int(block.data.get("cumulative_input_tokens")),
+                        )
+                        state.output_tokens = max(
+                            state.output_tokens,
+                            _as_int(block.data.get("cumulative_output_tokens")),
+                        )
+                        if incremental:
                             charged, depleted = await self._bill_step(
                                 user_id=user_id, run_id=run_id, event=block, charged=charged
                             )
                             if depleted:
-                                # Pause-at-zero: stop the run, persist paused, emit the synthetic
-                                # terminal run.paused, and close the stream (no run.completed).
+                                # Pause-at-zero: interrupt the run, persist paused, emit the
+                                # synthetic terminal run.paused, close the stream (no
+                                # run.completed).
                                 yield await self._pause_run(
                                     user_id=user_id,
                                     run_id=run_id,
                                     charged=charged,
-                                    partial_text=partial_text,
-                                    steps=steps,
-                                    cumulative_input=last_cum_in,
-                                    cumulative_output=last_cum_out,
+                                    state=state,
                                 )
                                 return
-                    if not billed and _is_run_completed(block):
-                        billed = await self._bill_completed(
-                            user_id=user_id, run_id=run_id, event=block, charged=charged
+                    elif name == _EVENT_RUN_FAILED:
+                        # No debit (no usage). ADR-066 §3: final flush + a CONDITIONAL failed
+                        # status — before ADR-066 a crashed run stayed 'running' forever.
+                        state.pending_approval = None
+                        await self._flush_snapshot(
+                            user_id=user_id, run_id=run_id, state=state, immediate=True
                         )
+                        await self._mark_terminal(run_id, "failed")
+                    elif name == _EVENT_RUN_COMPLETED:
+                        # Flag OFF => there are no usage.delta events, so the snapshot token
+                        # counters come from the terminal usage payload (ADR-066 §6).
+                        usage = _extract_usage(block)
+                        state.input_tokens = max(
+                            state.input_tokens, _as_int(usage.get("input_tokens"))
+                        )
+                        state.output_tokens = max(
+                            state.output_tokens, _as_int(usage.get("output_tokens"))
+                        )
+                        state.pending_approval = None
+                        await self._flush_snapshot(
+                            user_id=user_id, run_id=run_id, state=state, immediate=True
+                        )
+                        # ADR-066 §3: the lifecycle status is recorded HERE, before billing and
+                        # independently of its outcome. Inside _bill_completed it would be skipped
+                        # whenever an unexpected billing error hit the generic rollback branch,
+                        # leaving the run 'running' forever and making /state lie indefinitely.
+                        # The transition is conditional, so a replayed run.completed is a no-op.
+                        await self._mark_terminal(run_id, "completed")
+                        if not billed:
+                            billed = await self._bill_completed(
+                                user_id=user_id, run_id=run_id, event=block, charged=charged
+                            )
         except httpx.HTTPError as exc:
             # A mid-stream transport drop: the client connection ends. Billing idempotency by
             # run_id (and per-step run_id:step) lets a re-subscription complete billing later
@@ -437,26 +601,172 @@ class AgentProxyService:
         depleted = actual < want
         return charged, depleted
 
+    # --- snapshot writer (ADR-066 §6) ---------------------------------------------------------
+
+    async def _flush_snapshot(
+        self, *, user_id: uuid.UUID, run_id: str, state: _RelayState, immediate: bool
+    ) -> None:
+        """Persist the accumulated relay state into ``agent_run_snapshots`` (ADR-066 §6).
+
+        ``immediate=False`` (the ``message.delta`` path) is THROTTLED to at most one write per
+        ``AGENT_STATE_FLUSH_INTERVAL_SECONDS``; terminal events and ``approval.request`` pass
+        ``immediate=True`` and bypass the throttle.
+
+        ``result_text`` is truncated HEAD-preserving to ``AGENT_STATE_RESULT_TEXT_MAX_CHARS``:
+        keeping the beginning keeps the prefix stable, which is what the per-column replay-guard
+        (prefix-continuation check, ADR-066 §6.2) relies on. Once the cap is reached the length
+        freezes, and every subsequent write submits exactly the same first N characters — incoming
+        and stored values coincide in full, so both the length and the prefix condition hold and
+        updates keep going through (the write is simply a no-op for that column, while tools,
+        approval and tokens still advance). The full text always remains available through
+        ``/events``. The joined+truncated text REPLACES the delta buffer,
+        so a long run neither grows the buffer without bound nor re-joins an ever-longer list every
+        few seconds; the operation is idempotent w.r.t. the value (concatenating the collapsed head
+        with the following deltas yields the same head).
+
+        ``pending_approval`` is asserted ONLY on immediate flushes. Every immediate flush is
+        triggered by an event that carries authoritative approval information (``approval.request``
+        sets it; ``tool.*`` and the terminal events clear it), whereas a throttled ``message.delta``
+        flush knows nothing about it: the client may have answered ``POST …/approval`` out of band,
+        and re-asserting the relay's cached value would resurrect a false ``waiting_approval``.
+
+        An explicit ``commit()`` is required (streaming context: the request-session teardown has
+        already run, ADR-064 pattern ``_bill_step``). A persistence failure must NEVER break the
+        relay — most notably a foreign-key miss for a run started before ``agent_runs`` became an
+        unconditional lifecycle row: it is rolled back and logged WITHOUT any user content.
+        """
+        if not immediate:
+            elapsed = time.monotonic() - state.last_flush_at
+            if elapsed < self._settings.agent_state_flush_interval_seconds:
+                return
+        result_text = "".join(state.partial_text)
+        max_chars = self._settings.agent_state_result_text_max_chars
+        if len(result_text) > max_chars:
+            result_text = result_text[:max_chars]  # head-preserving (never the tail)
+        # Collapse the buffer: bounded memory for a long run and an O(1)-sized join next time.
+        state.partial_text = [result_text]
+        try:
+            written = await self._snapshots_repo.upsert(
+                run_id=run_id,
+                user_id=user_id,
+                result_text=result_text,
+                last_tool=state.last_tool,
+                pending_approval=state.pending_approval,
+                input_tokens=state.input_tokens,
+                output_tokens=state.output_tokens,
+                assert_pending_approval=immediate,
+            )
+            await self._session.commit()
+            self._log_write_anomaly(
+                run_id=run_id, state=state, written=written, submitted_length=len(result_text)
+            )
+        except SQLAlchemyError:
+            # Generic log (no run text, no approval preview — this is user content, ADR-066 §5).
+            logger.warning("agent run snapshot write failed run_id=%s", run_id)
+            await self._session.rollback()
+        # Reset the throttle window even on failure so a permanently failing write (e.g. a missing
+        # agent_runs parent row) cannot turn every single message.delta into a DB round-trip.
+        state.last_flush_at = time.monotonic()
+
+    @staticmethod
+    def _log_write_anomaly(
+        *,
+        run_id: str,
+        state: _RelayState,
+        written: SnapshotUpsertResult,
+        submitted_length: int,
+    ) -> None:
+        """Surface the two SILENT refusal modes of a snapshot upsert. One line per relay each.
+
+        Both outcomes are indistinguishable from a successful flush at the call site, yet each is
+        the observable signal behind an open question:
+
+        * not applied → the tenancy guard rejected the write, i.e. this ``run_id`` already belongs
+          to another user's snapshot — the evidence needed to settle whether Hermes run ids are
+          globally unique (Q-066-2). WARNING: it means the snapshot of this run is not being
+          persisted at all.
+        * applied but the stored text is shorter than what was submitted → ``result_text`` did not
+          advance because the incoming text does not continue the stored one (Q-066-1: replay-from-
+          start vs. new-events-only relay semantics). DEBUG: the run keeps working, the snapshot
+          simply freezes at its fullest known text; tools/approval/tokens still update.
+
+        Latched per relay so a persistent condition costs one line, not one every few seconds. Only
+        ids and LENGTHS are logged — never ``result_text`` or the approval preview (user content,
+        ADR-066 §5).
+        """
+        if not written.applied:
+            if not state.tenancy_skip_logged:
+                state.tenancy_skip_logged = True
+                logger.warning("agent run snapshot upsert skipped (tenancy) run_id=%s", run_id)
+            return
+        if written.stored_text_length < submitted_length and not state.text_frozen_logged:
+            state.text_frozen_logged = True
+            logger.debug(
+                "agent run snapshot result_text frozen run_id=%s stored=%d submitted=%d",
+                run_id,
+                written.stored_text_length,
+                submitted_length,
+            )
+
+    def _build_pending_approval(self, event: _SseEvent) -> dict[str, Any]:
+        """Build the ``{tool, preview}`` payload of an ``approval.request`` (ADR-066 §6).
+
+        The event shape is Hermes' external contract, so both carriers are probed defensively; a
+        miss yields ``None`` for that field rather than dropping the pending state (the fact that an
+        approval is awaited matters more than its label). The preview is bounded by the same
+        ``AGENT_STATE_RESULT_TEXT_MAX_CHARS`` cap as the run text — it is user content stored in
+        JSONB and must not be unbounded; no separate knob is introduced.
+        """
+        preview = _extract_approval_preview(event)
+        if preview is not None:
+            max_chars = self._settings.agent_state_result_text_max_chars
+            if len(preview) > max_chars:
+                preview = preview[:max_chars]
+        return {"tool": _extract_tool_name(event), "preview": preview}
+
+    async def _mark_terminal(self, run_id: str, status: str) -> None:
+        """Record a terminal ``agent_runs.status`` (ADR-066 §3) and commit (streaming context).
+
+        Unconditional w.r.t. the billing flag (the lifecycle row now always exists) but CONDITIONAL
+        on the run still being active (``WHERE status IN ('running','resumed')``, enforced by the
+        repository) so the FIRST terminal status wins and a late event cannot overwrite a
+        ``cancelled``/``paused`` that was recorded meanwhile.
+
+        Like :meth:`_flush_snapshot`, a DB failure must not escape the relay generator: it would
+        bypass the ``httpx.HTTPError`` handler, surface as a raw error mid-stream and leave the
+        session without a rollback. It is logged and rolled back instead — the status simply stays
+        as it was, and a re-subscription re-applies the same conditional transition.
+        """
+        try:
+            await self._runs_repo.mark_status(run_id, status)
+            await self._session.commit()
+        except SQLAlchemyError:
+            logger.warning("agent run status write failed run_id=%s status=%s", run_id, status)
+            await self._session.rollback()
+
     async def _pause_run(
         self,
         *,
         user_id: uuid.UUID,
         run_id: str,
         charged: int,
-        partial_text: list[str],
-        steps: list[dict[str, Any]],
-        cumulative_input: int,
-        cumulative_output: int,
+        state: _RelayState,
     ) -> bytes:
         """Stop the run at zero balance, build the synthetic terminal ``run.paused`` (ADR-064 §3).
 
-        NOT a generator: (1) ``stop`` the Hermes run (existing passthrough) so no further loop
-        API-calls happen; (2) persist ``status=paused``/``paused_reason`` and commit (streaming
-        context); (3) return a self-contained ``run.paused`` SSE block built from the LOCAL relay
-        buffer (accumulated message.delta text + collected tool events) — no round-trip to Hermes.
+        NOT a generator: (1) INTERRUPT the Hermes run so no further loop API-calls happen — via
+        ``_interrupt_run``, which deliberately does NOT mark the run ``cancelled`` (ADR-066 §3: the
+        status belongs to the client ``/stop`` path only, otherwise a credits-exhausted run would
+        transiently read as ``stopped`` and ``/resume`` would answer 409); (2) flush the final
+        snapshot and persist ``status=paused``/``paused_reason``, committing (streaming context);
+        (3) return a self-contained ``run.paused`` SSE block built from the LOCAL relay buffer
+        (accumulated message.delta text + collected tool events) — no round-trip to Hermes.
         No debt is created (the last debit was ``charge <= balance``); balance is 0.
         """
-        await self.stop(user_id=user_id, run_id=run_id)
+        await self._interrupt_run(user_id=user_id, run_id=run_id)
+        # Terminal for the client: nothing is awaited from them any more (ADR-066 §6).
+        state.pending_approval = None
+        await self._flush_snapshot(user_id=user_id, run_id=run_id, state=state, immediate=True)
         await self._runs_repo.mark_paused(run_id, _REASON_CREDITS_EXHAUSTED)
         await self._session.commit()
         payload: dict[str, Any] = {
@@ -464,13 +774,13 @@ class AgentProxyService:
             "run_id": run_id,
             "reason": _REASON_CREDITS_EXHAUSTED,
             "status": "paused",
-            "output": "".join(partial_text),
-            "steps": steps,
+            "output": "".join(state.partial_text),
+            "steps": state.steps,
             "billed": charged,
             "balance": 0,
             "usage": {
-                "cumulative_input_tokens": cumulative_input,
-                "cumulative_output_tokens": cumulative_output,
+                "cumulative_input_tokens": state.input_tokens,
+                "cumulative_output_tokens": state.output_tokens,
             },
         }
         logger.info("agent run paused run_id=%s billed=%d", run_id, charged)
@@ -489,6 +799,12 @@ class AgentProxyService:
         is possible only in a rare race (fallback). Insufficient balance: ``consume`` rolls back its
         savepoint (no orphan row, balance untouched — ADR-047 §6) and the uncharged delta is an
         audit-only ``billing_debit_insufficient`` event; the relay is never broken.
+
+        Billing ONLY — the terminal ``agent_runs.status`` is NOT written here (ADR-066 §3). The
+        lifecycle status is recorded by the ``run.completed`` handler in :meth:`stream_events`
+        BEFORE this call, so that it never depends on the outcome of a debit: an unexpected billing
+        failure (the generic ``except`` below rolls back and swallows) used to leave the run
+        ``running`` forever and make ``/state`` lie indefinitely.
         """
         usage = _extract_usage(event)
         input_tokens = _as_int(usage.get("input_tokens"))
@@ -510,7 +826,6 @@ class AgentProxyService:
                 owed,
                 charged,
             )
-            await self._mark_completed(run_id)
             return True
 
         meta: dict[str, Any] = {
@@ -554,7 +869,6 @@ class AgentProxyService:
             # runId: a replay re-commits the same (or no) state harmlessly. The chat path is
             # unaffected — it bills in the plain POST handler whose session_scope teardown commits.
             await self._session.commit()
-            await self._mark_completed(run_id)
             return True
         except Exception:
             # Never break the SSE relay on a non-insufficient billing failure: the run is already
@@ -579,20 +893,7 @@ class AgentProxyService:
             amount,
             result.idempotent_replay,
         )
-        await self._mark_completed(run_id)
         return True
-
-    async def _mark_completed(self, run_id: str) -> None:
-        """Mark the agent_runs row ``completed`` on run.completed (ADR-064 §2). Flag-gated.
-
-        Only under ``AGENT_INCREMENTAL_BILLING_ENABLED`` (post-hoc mode writes no agent_runs row);
-        a missing row updates 0 rows harmlessly. Own commit (streaming context — teardown already
-        ran).
-        """
-        if not self._settings.agent_incremental_billing_enabled:
-            return
-        await self._runs_repo.mark_status(run_id, "completed")
-        await self._session.commit()
 
     async def _record_insufficient(
         self,
@@ -642,11 +943,47 @@ class AgentProxyService:
     async def approval(
         self, *, user_id: uuid.UUID, run_id: str, body: dict[str, Any]
     ) -> dict[str, Any]:
-        """Passthrough ``POST {base}/v1/runs/{runId}/approval`` (ADR-045 §3)."""
-        return await self._passthrough_post(user_id, f"/v1/runs/{run_id}/approval", body)
+        """Passthrough ``POST {base}/v1/runs/{runId}/approval`` (ADR-045 §3).
+
+        ADR-066 §6: AFTER a 2xx passthrough the stored ``pending_approval`` is dropped — the third
+        clearing point besides ``tool.*`` and the terminal events. Without it the derived
+        ``waiting_approval`` status would stick in ``/state`` after the user already answered.
+        Owner-scoped and never INSERTs; a snapshot-less run simply has nothing to clear. Committed
+        by the request session_scope teardown (this is a plain handler, not the streaming context).
+        """
+        result = await self._passthrough_post(user_id, f"/v1/runs/{run_id}/approval", body)
+        await self._snapshots_repo.clear_pending_approval(run_id, user_id)
+        return result
 
     async def stop(self, *, user_id: uuid.UUID, run_id: str) -> dict[str, Any]:
-        """Passthrough ``POST {base}/v1/runs/{runId}/stop`` (ADR-045 §3)."""
+        """CLIENT stop path: passthrough ``POST {base}/v1/runs/{runId}/stop`` + ``cancelled``.
+
+        ADR-066 §3: after a 2xx passthrough the run is marked ``cancelled`` — CONDITIONALLY
+        (``WHERE status IN ('running','resumed')``), so stopping an already finished/paused run does
+        not overwrite its terminal status. This method is the CLIENT path ONLY: the internal
+        Hermes interrupt of pause-at-zero goes through :meth:`_interrupt_run`, which performs the
+        very same passthrough WITHOUT touching the status (ADR-064 §3) — marking it there would make
+        a credits-exhausted run transiently ``cancelled``, so ``/state`` would report ``stopped``
+        instead of ``paused`` (no top-up offer in the UI) and ``POST …/resume`` would answer
+        ``409 run_not_resumable`` inside that window. Committed by the request session_scope
+        teardown (plain handler). ``stop → stopped`` is eventually consistent: Hermes may still be
+        flushing buffered events into an open relay at this point.
+
+        The status write is OWNER-SCOPED (``mark_stopped(run_id, user_id)``): ``run_id`` arrives
+        straight from the request path and Hermes may answer 2xx for an unknown/foreign run
+        (idempotent-stop semantics), so an unscoped UPDATE would let one user cancel another user's
+        run. A foreign id updates 0 rows; the passthrough result is still returned (no 403).
+        """
+        result = await self._interrupt_run(user_id=user_id, run_id=run_id)
+        await self._runs_repo.mark_stopped(run_id, user_id)
+        return result
+
+    async def _interrupt_run(self, *, user_id: uuid.UUID, run_id: str) -> dict[str, Any]:
+        """Interrupt the Hermes run WITHOUT recording any status (ADR-066 §3).
+
+        The transport-level half of :meth:`stop`, shared with the internal pause-at-zero path. Kept
+        separate precisely so the ``cancelled`` status can never leak onto the internal path.
+        """
         return await self._passthrough_post(user_id, f"/v1/runs/{run_id}/stop", None)
 
     async def _passthrough_post(
@@ -675,6 +1012,58 @@ class AgentProxyService:
         except ValueError:
             data = {}
         return data if isinstance(data, dict) else {}
+
+    # --- state snapshot (read-only) ---------------------------------------------------------
+
+    async def get_state(self, *, user_id: uuid.UUID, run_id: str) -> RunStateView:
+        """``GET /v1/agent/runs/{runId}/state`` — STRICTLY read-only snapshot (ADR-066 §5).
+
+        Invariants, all deliberate:
+
+        * **No ``ensure_running``** — reading the state never wakes a hibernated container, which
+          would otherwise cost a cold start (~30-40 s, ADR-056) on every background polling tick.
+        * **No call to Hermes at all** — only ``SELECT`` from ``agent_runs`` +
+          ``agent_run_snapshots`` (after hibernation Hermes lost its in-memory run registry anyway).
+        * **No debit** — reading is free, ``WalletService`` is not involved.
+        * **No policy-gate** — a credits block applies to STARTING a generation, not to reading what
+          already happened, so ``200 {status:blocked}`` cannot occur on this route.
+
+        Ownership follows the ``/resume`` pattern: a missing row OR a foreign ``user_id`` raises
+        :class:`NotFoundError` → 404, never 403 (agent-proxy/06-rbac.md). Runs launched before this
+        feature was deployed have no ``agent_runs`` row and therefore also answer 404 (no backfill —
+        the source data never existed).
+
+        The snapshot row may be ABSENT while the lifecycle row exists (the relay writer has not
+        flushed a single event yet) → 200 with defaults: empty text, no tool, no approval, zero
+        usage and ``updated_at`` taken from ``agent_runs``.
+        """
+        run = await self._runs_repo.get(run_id)
+        if run is None or run.user_id != user_id:
+            raise NotFoundError("run not found")
+        # Owner-scoped read as well (defense-in-depth): the RBAC decision above is already made on
+        # agent_runs, but a Hermes run_id colliding across tenants (Q-064-4) must not surface
+        # another user's text — a mismatch degrades to the empty-snapshot defaults, never a leak.
+        snapshot = await self._snapshots_repo.get(run_id, user_id)
+        pending_approval = snapshot.pending_approval if snapshot is not None else None
+        status = map_client_status(run.status, has_pending_approval=pending_approval is not None)
+        return RunStateView(
+            run_id=run.run_id,
+            session_id=run.session_id,
+            status=status,
+            result_text=snapshot.result_text if snapshot is not None else "",
+            last_tool=snapshot.last_tool if snapshot is not None else None,
+            pending_approval=pending_approval,
+            # ADR-066 §5: this carries agent_runs.paused_reason (v1: only 'credits_exhausted') and
+            # is NOT the policy blockReason enum of ADR-004 — the value sets do not overlap. Filled
+            # only while the run is actually paused.
+            block_reason=run.paused_reason if status == "paused" else None,
+            input_tokens=snapshot.input_tokens if snapshot is not None else 0,
+            output_tokens=snapshot.output_tokens if snapshot is not None else 0,
+            # Staleness detector for the client: with no subscriber on /events an active run's
+            # snapshot does not move. The retention sweep never shifts it.
+            updated_at=snapshot.updated_at if snapshot is not None else run.updated_at,
+            continued_from=run.continued_from_run_id,
+        )
 
     # --- resume (continuation) --------------------------------------------------------------
 
@@ -915,8 +1304,31 @@ def _event_name(event: _SseEvent) -> str | None:
     return None
 
 
-def _is_run_completed(event: _SseEvent) -> bool:
-    return _event_name(event) == _EVENT_RUN_COMPLETED
+def _extract_tool_name(event: _SseEvent) -> str | None:
+    """Tool name of a ``tool.*`` / ``approval.request`` block (ADR-066 §6). Best-effort.
+
+    The payload shape is Hermes' external contract (``{tool, ...}`` per agent-proxy/05-events.md);
+    the common aliases are probed defensively so an upstream rename degrades to ``None`` instead of
+    breaking the relay.
+    """
+    for key in ("tool", "tool_name", "name"):
+        value = event.data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _extract_approval_preview(event: _SseEvent) -> str | None:
+    """Human-readable preview of what an ``approval.request`` is asking to approve (§6).
+
+    Only string carriers are accepted — a structured payload is not serialised into the snapshot
+    (the preview is a UI label, not a transcript; the full event is always available via /events).
+    """
+    for key in ("preview", "description", "summary"):
+        value = event.data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _extract_usage(event: _SseEvent) -> dict[str, Any]:

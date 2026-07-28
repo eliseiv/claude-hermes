@@ -1,9 +1,10 @@
-"""Background hibernation reaper for idle Hermes instances (ADR-046 §5, Phase 4).
+"""Background reaper: idle Hermes hibernation (ADR-046 §5) + snapshot retention (ADR-066 §7).
 
-A periodic ``lifespan`` task that calls ``HermesInstanceManager.stop_idle`` on the configured
-interval. State lives in ``hermes_instances`` (not process memory), so the reaper resumes cleanly
-after an ``api`` restart. Each tick uses its own DB session and never raises into the loop — a tick
-failure is logged and the next tick proceeds.
+A periodic ``lifespan`` task that, on every tick, calls ``HermesInstanceManager.stop_idle`` and then
+sweeps expired agent-run snapshots. State lives in the DB (``hermes_instances`` /
+``agent_run_snapshots``), not process memory, so the reaper resumes cleanly after an ``api``
+restart. Each tick uses its own DB session and never raises into the loop — a tick failure is logged
+and the next tick proceeds.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository
 from app.config import Settings
 from app.db import session_scope
 from app.deps import get_hermes_backend
@@ -21,7 +23,7 @@ logger = logging.getLogger("app.hermes_runtime.reaper")
 
 
 async def _run_one_tick(settings: Settings) -> None:
-    """Run a single stop_idle pass in its own committed transaction."""
+    """Run a single stop_idle pass + snapshot retention sweep in one committed transaction."""
     from app.byok.kms import get_kms_client
 
     async for session in session_scope():
@@ -33,6 +35,15 @@ async def _run_one_tick(settings: Settings) -> None:
             settings=settings,
         )
         await manager.stop_idle(settings.hermes_idle_timeout_seconds)
+        # ADR-066 §7: clear user content (result_text/pending_approval) of TERMINAL agent runs
+        # older than the TTL. The rows survive — /state keeps returning status/usage/updatedAt —
+        # and the statement is idempotent (an already-cleared row matches nothing), so a steady
+        # state costs 0 rows per tick instead of rewriting the whole history forever.
+        cleared = await AgentRunSnapshotsRepository(session).sweep_expired(
+            settings.agent_run_snapshot_ttl_days
+        )
+        if cleared:
+            logger.info("agent run snapshots swept rows=%d", cleared)
 
 
 async def run_reaper(settings: Settings) -> None:

@@ -8,6 +8,7 @@ and the approval body are modelled here as strict Pydantic v2 schemas.
 
 from __future__ import annotations
 
+import datetime
 from typing import Literal
 
 from pydantic import Field
@@ -77,6 +78,96 @@ class AgentResumeRequest(StrictModel):
     message: str | None = Field(
         default=None,
         description="Опциональный дополнительный ход пользователя при возобновлении.",
+    )
+
+
+class AgentPendingApproval(StrictModel):
+    """Запрос подтверждения, которого ждёт прогон (ADR-066). `null` в ответе = не ждёт."""
+
+    tool: str | None = Field(
+        default=None,
+        description="Имя инструмента, для которого запрошено подтверждение (или null).",
+    )
+    preview: str | None = Field(
+        default=None,
+        description="Краткое описание действия для показа пользователю (или null).",
+    )
+
+
+class AgentRunStateUsage(StrictModel):
+    """Накопленный расход токенов прогона (ADR-066). Монотонен, не уменьшается."""
+
+    inputTokens: int = Field(description="Накопленные входные токены прогона.")
+    outputTokens: int = Field(description="Накопленные выходные токены прогона.")
+
+
+class AgentRunStateResponse(StrictModel):
+    """Ответ `GET /v1/agent/runs/{runId}/state` — снапшот состояния прогона из БД (ADR-066).
+
+    Назначение — восстановление UI после kill приложения / смены сети / гибернации Hermes: поток
+    `/events` события не персистит, поэтому переподключение к закрытому стриму отдаёт 200 без
+    событий. Эндпоинт строго read-only: контейнер не будится, к Hermes обращения нет, списаний нет.
+    """
+
+    runId: str = Field(description="Идентификатор прогона (совпадает с путём запроса).")
+    sessionId: str = Field(
+        description=(
+            "Hermes-сессия прогона; стабильна на всю цепочку продолжений. Информационно — для "
+            "`resume` клиенту не нужна."
+        )
+    )
+    status: Literal[
+        "queued", "running", "waiting_approval", "paused", "completed", "failed", "stopped"
+    ] = Field(
+        description=(
+            "Клиентский статус, производный от статуса прогона и наличия запроса подтверждения: "
+            "`running` (в работе) | `waiting_approval` (ждёт ответа на `approval.request`) | "
+            "`paused` (пауза по кредитам, см. `blockReason`) | `completed` | `failed` | `stopped` "
+            "(остановлен через `POST …/stop`). `queued` в v1 не эмитится (forward-compat)."
+        )
+    )
+    resultText: str = Field(
+        description=(
+            'Накопленный текст ответа агента (склейка `message.delta`); `""` если ничего не '
+            "накоплено. Обрезан с сохранением начала до `AGENT_STATE_RESULT_TEXT_MAX_CHARS`. "
+            "Может отставать: снапшот двигается, только пока кто-то подписан на `/events` — "
+            "свежесть видна по `updatedAt`."
+        )
+    )
+    lastTool: str | None = Field(
+        default=None,
+        description="Имя последнего инструмента (`tool.started`/`tool.completed`) или null.",
+    )
+    pendingApproval: AgentPendingApproval | None = Field(
+        default=None,
+        description=(
+            "`{tool, preview}` — прогон ждёт ответа на запрос подтверждения; null — не ждёт. "
+            "Снимается ответом на `POST …/approval`, следующим `tool.*` или терминальным событием."
+        ),
+    )
+    blockReason: str | None = Field(
+        default=None,
+        description=(
+            "Причина ПАУЗЫ прогона (в v1 единственное значение `credits_exhausted`); непусто "
+            "только при `status=paused`. ⚠️ Это НЕ policy-enum `blockReason` из ADR-004 "
+            "(`credits_empty`/`subscription_expired`/…): наборы значений не пересекаются, "
+            "валидировать policy-enum'ом нельзя (ADR-066 §5)."
+        ),
+    )
+    usage: AgentRunStateUsage = Field(description="Накопленный расход токенов прогона. Монотонен.")
+    updatedAt: datetime.datetime = Field(
+        description=(
+            "Время последней записи состояния (ISO8601, UTC) — детектор устаревания. При активном "
+            "прогоне без подписчика на `/events` не двигается; очистка контента по retention "
+            "`updatedAt` не сдвигает."
+        )
+    )
+    continuedFrom: str | None = Field(
+        default=None,
+        description=(
+            "`runId` родительского (приостановленного) прогона для продолжения, созданного через "
+            "`POST …/resume`; null у корневого прогона."
+        ),
     )
 
 

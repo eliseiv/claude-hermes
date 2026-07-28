@@ -39,6 +39,11 @@ def _key_only() -> dict[str, str]:
         ("GET", "/v1/agent/runs/run_1/events", None),
         ("POST", "/v1/agent/runs/run_1/approval", {"choice": "once"}),
         ("POST", "/v1/agent/runs/run_1/stop", None),
+        # ADR-064: resume. ADR-066: the read-only state snapshot. Both are part of the SAME auth
+        # matrix — a read-only route is not an auth exemption (the snapshot carries user-facing
+        # model text, agent-proxy/09-testing.md §Integration).
+        ("POST", "/v1/agent/runs/run_1/resume", {}),
+        ("GET", "/v1/agent/runs/run_1/state", None),
     ],
 )
 @pytest.mark.parametrize(

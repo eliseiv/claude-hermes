@@ -621,10 +621,12 @@ class HermesInstance(Base):
 class AgentRun(Base):
     """Agent-run lifecycle + resume-chain row (ADR-064 §6, migration 0018).
 
-    One row per Hermes run (``run_id`` TEXT PK — a Hermes string, NOT a UUID). Populated ONLY on
-    the incremental-billing path (``AGENT_INCREMENTAL_BILLING_ENABLED``); the post-hoc path
-    (ADR-047) never writes here. ``session_id`` is the STABLE continuation key (one Hermes session
-    per resume chain): resume resolves it from the paused ``run_id`` (client stores nothing).
+    One row per Hermes run (``run_id`` TEXT PK — a Hermes string, NOT a UUID). ADR-066 §3: the row
+    is written ALWAYS (an unconditional lifecycle record); ``AGENT_INCREMENTAL_BILLING_ENABLED``
+    now gates only the BILLING fields/operations (``cumulative_credits_spent``/``last_billed_step``,
+    per-step debits, pause-at-zero, finalization). ``session_id`` is the STABLE continuation key
+    (one session per resume chain): resume resolves it from the paused ``run_id`` (client stores
+    nothing).
     ``continued_from_run_id`` is a self-FK (``ON DELETE SET NULL``) forming the continuation chain
     (child → parent; root = NULL). ``cumulative_credits_spent``/``last_billed_step`` are a
     denormalised mirror of the ledger (source of truth is ``ledger_transactions``; on divergence the
@@ -672,4 +674,62 @@ class AgentRun(Base):
         Index("ix_agent_runs_session", "session_id"),
         # active_child(): find the child whose continued_from_run_id == parent.
         Index("ix_agent_runs_continued_from", "continued_from_run_id"),
+    )
+
+
+class AgentRunSnapshot(Base):
+    """UX state snapshot of an agent run (ADR-066 §2, migration 0019). 1:1 to ``agent_runs``.
+
+    Kept in its OWN table rather than as columns on ``agent_runs``: the two rows have a different
+    write profile (this one is upserted dozens of times per run, throttled by
+    ``AGENT_STATE_FLUSH_INTERVAL_SECONDS``, against a handful of writes for the lifecycle/money
+    row), a different retention (``AGENT_RUN_SNAPSHOT_TTL_DAYS`` clears the content here) and a
+    different sensitivity (``result_text``/``pending_approval`` carry user-facing model content).
+
+    Written as a SIDE EFFECT of the SSE relay ``GET /v1/agent/runs/{runId}/events``, independently
+    of ``AGENT_INCREMENTAL_BILLING_ENABLED``; read by ``GET /v1/agent/runs/{runId}/state``. The run
+    STATUS is deliberately NOT duplicated here — ``agent_runs.status`` stays the single source of
+    truth and the client-facing ``waiting_approval`` is derived on read (status ∈ {running,resumed}
+    AND ``pending_approval IS NOT NULL``).
+    """
+
+    __tablename__ = "agent_run_snapshots"
+
+    # PK and FK at once: the snapshot never outlives its lifecycle row (CASCADE).
+    run_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("agent_runs.run_id", ondelete="CASCADE"), primary_key=True
+    )
+    # Duplicated from agent_runs for a direct RBAC scope + CASCADE on user deletion.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # Concatenated message.delta text, head-preserving truncation to
+    # AGENT_STATE_RESULT_TEXT_MAX_CHARS. '' when nothing was accumulated (or after a TTL sweep).
+    result_text: Mapped[str] = mapped_column(Text, nullable=False, server_default=sa_text("''"))
+    last_tool: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # {"tool": ..., "preview": ...} while the run waits for an approval answer; NULL = not waiting.
+    pending_approval: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    input_tokens: Mapped[int] = mapped_column(BIGINT, nullable=False, server_default=sa_text("0"))
+    output_tokens: Mapped[int] = mapped_column(BIGINT, nullable=False, server_default=sa_text("0"))
+    # "Time of the last STATE write" — the client's staleness detector. The retention sweep does
+    # NOT move it (clearing content is not a state update, ADR-066 §7).
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+
+    __table_args__ = (
+        CheckConstraint("input_tokens >= 0", name="ck_agent_run_snapshots_input_nonneg"),
+        CheckConstraint("output_tokens >= 0", name="ck_agent_run_snapshots_output_nonneg"),
+        # Owner-scoped lookups.
+        Index("ix_agent_run_snapshots_user", "user_id"),
+        # Retention sweep — PARTIAL on the sweep predicate: in the steady state the sweep matches
+        # zero rows (the idempotency guard excludes what it already cleared), so the index holds
+        # only rows that still carry content and a clean history costs nothing per tick. A plain
+        # (updated_at) index would additionally amplify writes on a table upserted every few
+        # seconds per active run. The WHERE must stay identical to the sweep predicate.
+        Index(
+            "ix_agent_run_snapshots_sweep",
+            "updated_at",
+            postgresql_where=sa_text("result_text <> '' OR pending_approval IS NOT NULL"),
+        ),
     )

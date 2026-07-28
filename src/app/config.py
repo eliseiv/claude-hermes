@@ -427,6 +427,28 @@ class Settings(BaseSettings):
         default=False, alias="AGENT_INCREMENTAL_BILLING_ENABLED"
     )
 
+    # --- Agent run state snapshot (ADR-066, agent_run_snapshots) ---
+    # NOT gated by AGENT_INCREMENTAL_BILLING_ENABLED: the snapshot writer runs on every relay.
+    # Cap of agent_run_snapshots.result_text (the model text returned by
+    # GET /v1/agent/runs/{runId}/state). Truncation is HEAD-preserving (the beginning is kept):
+    # trimming the tail would break prefix stability, on which the upsert replay-guard relies
+    # (ADR-066 §6). The full text always remains available through /events. Not a secret.
+    agent_state_result_text_max_chars: int = Field(
+        default=65536, alias="AGENT_STATE_RESULT_TEXT_MAX_CHARS"
+    )
+    # Throttle for persisting result_text while message.delta streams: at most one upsert per
+    # interval. Terminal events (run.completed/run.failed/run.paused) and approval.request flush
+    # IMMEDIATELY, bypassing the throttle (a delayed approval would break the UX). Lower value =>
+    # fresher snapshot, higher write load. Not a secret.
+    agent_state_flush_interval_seconds: float = Field(
+        default=3.0, alias="AGENT_STATE_FLUSH_INTERVAL_SECONDS"
+    )
+    # Retention (ADR-066 §7): age after which the reaper clears result_text/pending_approval of
+    # TERMINAL runs (completed/failed/cancelled/paused). The row is NOT deleted — /state keeps
+    # returning status/usage/updatedAt; active runs are never touched. This is the only planned
+    # user-content cleanup of the agent contour. Not a secret.
+    agent_run_snapshot_ttl_days: int = Field(default=14, alias="AGENT_RUN_SNAPSHOT_TTL_DAYS")
+
     # --- Observability ---
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     otel_exporter_otlp_endpoint: str = Field(default="", alias="OTEL_EXPORTER_OTLP_ENDPOINT")

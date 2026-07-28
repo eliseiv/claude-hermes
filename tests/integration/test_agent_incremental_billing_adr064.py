@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agent_proxy.billing import usage_to_credits
 from app.agent_proxy.runs_repo import AgentRunsRepository
 from app.agent_proxy.service import AgentProxyService
+from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository
 from app.audit.service import AuditService
 from app.config import Settings
 from app.errors import InsufficientCreditsError, NotFoundError
@@ -71,6 +72,8 @@ def _proxy(session: AsyncSession, *, incremental: bool = True) -> AgentProxyServ
         audit=audit,
         settings=_settings(incremental=incremental),
         runs=AgentRunsRepository(session),
+        # ADR-066: relay-side snapshot writer (real repo — production wiring).
+        snapshots=AgentRunSnapshotsRepository(session),
     )
 
 

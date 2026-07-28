@@ -25,6 +25,7 @@ import pytest
 import respx
 
 from app.agent_proxy.service import AgentProxyService
+from app.agent_proxy.snapshots_repo import SnapshotUpsertResult
 from app.audit.service import EVENT_BILLING_DEBIT, EVENT_BILLING_DEBIT_INSUFFICIENT
 from app.config import Settings
 from app.errors import InsufficientCreditsError, UpstreamError
@@ -61,6 +62,19 @@ class FakeWallet:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        # ADR-066: the snapshot writer now also commits the shared session on every flush, so a bare
+        # `session.commit_calls == 1` no longer isolates the BILLING commit. `session` is wired by
+        # _make_service and the commit counter is snapshotted at consume() time, letting a test
+        # assert "a commit happened AFTER the debit" (the ADR-047 §6 streaming-context invariant)
+        # without counting the unrelated snapshot flushes.
+        self.session: FakeSession | None = None
+        self.commits_at_consume: list[int] = []
+        # ADR-066 §3: the terminal agent_runs status must be recorded BEFORE the debit (so a
+        # billing failure can never leave the run 'running' forever). Wired by _make_service; the
+        # runs-repo call log is snapshotted at consume() time so a test can assert the ORDERING
+        # rather than mere presence.
+        self.runs: FakeRunsRepo | None = None
+        self.marks_at_consume: list[list[tuple[str, str]]] = []
         self.raise_exc: Exception | None = None
         self._replay_keys: set[str] = set()
         # ADR-047 §6: on InsufficientCreditsError the relay records a billing_debit_insufficient
@@ -73,6 +87,9 @@ class FakeWallet:
         # debt; scriptable so a debt-gate test can drive a positive value.
         self.current_debt_value = 0
         self.current_debt_calls: list[uuid.UUID] = []
+        # ADR-064 §6: ledger seed read at the start of an incremental stream_events.
+        self.charged_for_run_value = 0
+        self.charged_for_run_calls: list[tuple[uuid.UUID, str]] = []
 
     async def current_balance(self, user_id: uuid.UUID) -> int:
         self.current_balance_calls.append(user_id)
@@ -81,6 +98,12 @@ class FakeWallet:
     async def current_debt(self, user_id: uuid.UUID) -> int:
         self.current_debt_calls.append(user_id)
         return self.current_debt_value
+
+    async def charged_for_run(self, user_id: uuid.UUID, run_id: str) -> int:
+        # ADR-064 §6: reconnect-safe seed read at the start of stream_events when the incremental
+        # flag is ON. Post-hoc streams never call it; a scriptable 0 keeps the seed neutral.
+        self.charged_for_run_calls.append((user_id, run_id))
+        return self.charged_for_run_value
 
     async def consume(
         self,
@@ -99,6 +122,8 @@ class FakeWallet:
                 "meta": meta,
             }
         )
+        self.commits_at_consume.append(self.session.commit_calls if self.session else 0)
+        self.marks_at_consume.append(list(self.runs.mark_status_calls) if self.runs else [])
         if self.raise_exc is not None:
             raise self.raise_exc
         replay = idempotency_key in self._replay_keys
@@ -130,6 +155,9 @@ class FakeRunsRepo:
         self.mark_paused_calls: list[tuple[str, str]] = []
         self.mark_status_calls: list[tuple[str, str]] = []
         self.create_running_calls: list[dict[str, Any]] = []
+        # ADR-066 §3: the CLIENT stop path only. Recorded so a test can assert the internal
+        # pause-at-zero interrupt never routes through it.
+        self.mark_stopped_calls: list[tuple[str, uuid.UUID]] = []
 
     async def create_running(
         self,
@@ -155,11 +183,98 @@ class FakeRunsRepo:
     async def record_step(self, run_id: str, step_index: int, credits: int) -> None:
         self.record_step_calls.append((run_id, step_index, credits))
 
-    async def mark_paused(self, run_id: str, reason: str) -> None:
+    async def mark_paused(self, run_id: str, reason: str) -> int:
         self.mark_paused_calls.append((run_id, reason))
+        return 1
 
-    async def mark_status(self, run_id: str, status: str) -> None:
+    async def mark_status(self, run_id: str, status: str) -> int:
         self.mark_status_calls.append((run_id, status))
+        return 1
+
+    async def mark_stopped(self, run_id: str, user_id: uuid.UUID) -> int:
+        self.mark_stopped_calls.append((run_id, user_id))
+        return 1
+
+
+class FakeSnapshotsRepo:
+    """Stand-in for AgentRunSnapshotsRepository (ADR-066 §6) — records the relay-side writes.
+
+    The real SQL (per-column prefix guard, tenancy guard, retention sweep) is exercised against a
+    real Postgres in ``tests/integration/test_agent_snapshot_writer_adr066.py``; here we need to
+    observe WHAT the relay decides to persist and WHEN (throttling, immediate flushes, the
+    ``assert_pending_approval`` flag) — and, since ``upsert`` now RETURNS an outcome the service
+    branches on, the double must REPRODUCE that outcome rather than hand back a stub.
+
+    So it keeps a tiny in-memory row per ``run_id`` and applies the same two rules the statement
+    does, which is what makes the latch tests (``_log_write_anomaly``) meaningful:
+
+    * tenancy — an upsert whose ``user_id`` differs from the stored row's is refused wholesale
+      (``applied=False``, nothing recorded as stored);
+    * prefix-continuation — ``result_text`` advances ONLY when the incoming text is at least as long
+      AND has the stored value as its exact prefix; otherwise the stored value is kept and the
+      returned ``stored_text_length`` stays behind what was submitted.
+
+    ``upserts`` records every ATTEMPT (including refused ones) so tests can assert on what the relay
+    tried to write; ``stored`` holds what actually landed.
+    """
+
+    def __init__(self) -> None:
+        self.upserts: list[dict[str, Any]] = []
+        self.clear_calls: list[tuple[str, uuid.UUID]] = []
+        self.get_calls: list[tuple[str, uuid.UUID]] = []
+        # run_id -> {"user_id", "result_text", ...} — the "row" as the DB would hold it.
+        self.stored: dict[str, dict[str, Any]] = {}
+        # Force every upsert to be refused by the tenancy guard (collision simulation, Q-066-2).
+        self.force_tenancy_skip = False
+
+    async def get(self, run_id: str, user_id: uuid.UUID) -> Any:
+        # ADR-066: the read is owner-scoped too (defense-in-depth vs a cross-tenant run_id).
+        self.get_calls.append((run_id, user_id))
+        row = self.stored.get(run_id)
+        if row is None or row["user_id"] != user_id:
+            return None
+        return row
+
+    async def upsert(
+        self,
+        *,
+        run_id: str,
+        user_id: uuid.UUID,
+        result_text: str,
+        last_tool: str | None,
+        pending_approval: dict[str, Any] | None,
+        input_tokens: int,
+        output_tokens: int,
+        assert_pending_approval: bool = True,
+    ) -> SnapshotUpsertResult:
+        self.upserts.append(
+            {
+                "run_id": run_id,
+                "user_id": user_id,
+                "result_text": result_text,
+                "last_tool": last_tool,
+                "pending_approval": pending_approval,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "assert_pending_approval": assert_pending_approval,
+            }
+        )
+        row = self.stored.get(run_id)
+        if self.force_tenancy_skip or (row is not None and row["user_id"] != user_id):
+            # The DO UPDATE was filtered out by `WHERE t.user_id = EXCLUDED.user_id`: no row back.
+            return SnapshotUpsertResult(applied=False, stored_text_length=0)
+        if row is None:
+            self.stored[run_id] = {"user_id": user_id, "result_text": result_text}
+            return SnapshotUpsertResult(applied=True, stored_text_length=len(result_text))
+        old = row["result_text"]
+        # Prefix-continuation: at least as long AND continues the stored value.
+        if len(result_text) >= len(old) and result_text.startswith(old):
+            row["result_text"] = result_text
+        return SnapshotUpsertResult(applied=True, stored_text_length=len(row["result_text"]))
+
+    async def clear_pending_approval(self, run_id: str, user_id: uuid.UUID) -> int:
+        self.clear_calls.append((run_id, user_id))
+        return 1
 
 
 class FakeSession:
@@ -193,19 +308,28 @@ def _make_service(
     audit: FakeAudit | None = None,
     session: FakeSession | None = None,
     runs: FakeRunsRepo | None = None,
+    snapshots: FakeSnapshotsRepo | None = None,
 ) -> tuple[AgentProxyService, FakeManager, FakeWallet, FakeAudit]:
     mgr = manager or FakeManager()
     wal = wallet or FakeWallet()
     aud = audit or FakeAudit()
+    sess = session or FakeSession()
+    runs_repo = runs or FakeRunsRepo()
+    # Let the wallet double snapshot the commit counter / status-write log at consume() time.
+    wal.session = sess
+    wal.runs = runs_repo
     svc = AgentProxyService(
-        session=session or FakeSession(),  # type: ignore[arg-type]  # commit/rollback are stubbed.
+        session=sess,  # type: ignore[arg-type]  # commit/rollback are stubbed.
         manager=mgr,  # type: ignore[arg-type]
         wallet=wal,  # type: ignore[arg-type]
         audit=aud,  # type: ignore[arg-type]
         settings=settings,
         # ADR-064: constructor requires the runs repo. The default post-hoc unit tests keep the
         # incremental flag OFF so it is never dereferenced; a scripted double keeps wiring valid.
-        runs=runs or FakeRunsRepo(),  # type: ignore[arg-type]
+        runs=runs_repo,  # type: ignore[arg-type]
+        # ADR-066: the relay-side snapshot writer is exercised on EVERY stream (independently of
+        # the billing flag), so the double is always wired.
+        snapshots=snapshots or FakeSnapshotsRepo(),  # type: ignore[arg-type]
     )
     return svc, mgr, wal, aud
 
@@ -498,8 +622,11 @@ async def test_sse_relays_events_verbatim_and_bills_on_completed(
         "total_tokens": 0,
     }
     # ADR-047 §6: _bill_completed persists the debit with its OWN streaming-context commit (it runs
-    # after the request session teardown), and never rolls it back on the success path.
-    assert sess.commit_calls == 1
+    # after the request session teardown), and never rolls it back on the success path. ADR-066: the
+    # snapshot writer commits on every flush too, so the billing commit is isolated by comparing the
+    # counter AFTER the stream with its value AT consume() time (a bare `== 1` would now be a
+    # count of unrelated flushes).
+    assert sess.commit_calls > wal.commits_at_consume[0]
     assert sess.rollback_calls == 0
 
 
@@ -543,7 +670,7 @@ async def test_sse_duplicate_completed_debits_once_in_stream(settings: Settings)
     await _collect(svc.stream_events(user_id=uuid.uuid4(), run_id="run_1"))
     assert len(wal.calls) == 1
     # Only the first run.completed bills AND commits; the `billed` flag suppresses the second.
-    assert sess.commit_calls == 1
+    assert sess.commit_calls > wal.commits_at_consume[0]
 
 
 @respx.mock
@@ -562,7 +689,7 @@ async def test_sse_restream_same_run_id_idempotent(settings: Settings) -> None:
     assert wal.calls[1]["amount"] == wal.calls[0]["amount"]
     # Each subscription commits its own streaming-context state; the second is a harmless no-op
     # commit on the ON-CONFLICT replay (ADR-047 §4) — never a rollback.
-    assert sess.commit_calls == 2
+    assert sess.commit_calls > wal.commits_at_consume[1] > wal.commits_at_consume[0]
     assert sess.rollback_calls == 0
 
 
@@ -611,7 +738,7 @@ async def test_sse_billing_failure_does_not_break_relay(settings: Settings) -> N
     assert _API_KEY not in str(payload)
     # ADR-047 §6: the insufficient branch persists the billing_debit_insufficient audit with its OWN
     # streaming-context commit (not a rollback) so the uncharged delta is not lost on teardown.
-    assert sess.commit_calls == 1
+    assert sess.commit_calls > wal.commits_at_consume[0]
     assert sess.rollback_calls == 0
 
 

@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent_proxy.runs_repo import AgentRunsRepository
 from app.agent_proxy.service import AgentProxyService, RunResumeResult
+from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository
 from app.audit.service import AuditService
 from app.config import Settings
 from app.errors import (
@@ -66,6 +67,8 @@ def _proxy(session: AsyncSession) -> AgentProxyService:
         audit=audit,
         settings=Settings(**{"AGENT_INCREMENTAL_BILLING_ENABLED": True}),  # type: ignore[arg-type]
         runs=AgentRunsRepository(session),
+        # ADR-066: relay-side snapshot writer (real repo — production wiring).
+        snapshots=AgentRunSnapshotsRepository(session),
     )
 
 
