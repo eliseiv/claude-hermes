@@ -1,0 +1,8 @@
+data: {"event": "message.delta", "run_id": "run_8d3b22ec83004ae5a4e344a375c92d6b", "timestamp": 1785322145.6881633, "delta": "1"}
+
+data: {"event": "message.delta", "run_id": "run_8d3b22ec83004ae5a4e344a375c92d6b", "timestamp": 1785322145.6960497, "delta": "\n"}
+
+data: {"event": "message.delta", "run_id": "run_8d3b22ec83004ae5a4e344a375c92d6b", "timestamp": 1785322145.696829, "delta": "2"}
+
+data: {"event": "usage.delta", "run_id": "run_8d3b22ec83004ae5a4e344a375c92d6b", "timestamp": 1785322145.7822638, "step_index": 1, "input_tokens": 6306, "output_tokens": 456, "cumulative_input_tokens": 6306, "cumulative_output_tokens": 456, "cumulative_total_tokens": 6762, "model": "gpt-5-mini"}
+

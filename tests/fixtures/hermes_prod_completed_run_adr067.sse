@@ -1,0 +1,12 @@
+data: {"event": "message.delta", "run_id": "run_3b3b1253e0974b24b594b7452bc7095d", "timestamp": 1785321308.809178, "delta": "DONE"}
+
+data: {"event": "message.delta", "run_id": "run_3b3b1253e0974b24b594b7452bc7095d", "timestamp": 1785321308.8285878, "delta": "."}
+
+data: {"event": "usage.delta", "run_id": "run_3b3b1253e0974b24b594b7452bc7095d", "timestamp": 1785321308.8612087, "step_index": 1, "input_tokens": 6302, "output_tokens": 586, "cumulative_input_tokens": 6302, "cumulative_output_tokens": 586, "cumulative_total_tokens": 6888, "model": "gpt-5-mini"}
+
+data: {"event": "reasoning.available", "run_id": "run_3b3b1253e0974b24b594b7452bc7095d", "timestamp": 1785321309.564393, "text": "DONE."}
+
+data: {"event": "run.completed", "run_id": "run_3b3b1253e0974b24b594b7452bc7095d", "timestamp": 1785321309.5727057, "output": "DONE.", "usage": {"input_tokens": 6302, "output_tokens": 586, "total_tokens": 6888}}
+
+: stream closed
+

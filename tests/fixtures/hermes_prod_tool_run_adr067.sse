@@ -1,0 +1,26 @@
+data: {"event": "usage.delta", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321538.1414895, "step_index": 1, "input_tokens": 6315, "output_tokens": 338, "cumulative_input_tokens": 6315, "cumulative_output_tokens": 338, "cumulative_total_tokens": 6653, "model": "gpt-5-mini"}
+
+data: {"event": "tool.started", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321538.1636972, "tool": "write_file", "preview": "probe_adr067.txt"}
+
+data: {"event": "tool.completed", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321538.2630055, "tool": "write_file", "duration": 0.099, "error": false}
+
+data: {"event": "usage.delta", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321539.1152148, "step_index": 2, "input_tokens": 269, "output_tokens": 22, "cumulative_input_tokens": 6584, "cumulative_output_tokens": 360, "cumulative_total_tokens": 13472, "model": "gpt-5-mini"}
+
+data: {"event": "tool.started", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321539.1209397, "tool": "read_file", "preview": "probe_adr067.txt"}
+
+data: {"event": "tool.completed", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321539.1952307, "tool": "read_file", "duration": 0.074, "error": false}
+
+data: {"event": "message.delta", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321542.2058756, "delta": "\n\nI"}
+
+data: {"event": "message.delta", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321542.219025, "delta": " created"}
+
+data: {"event": "message.delta", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321542.229592, "delta": " probe"}
+
+data: {"event": "usage.delta", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321542.7574403, "step_index": 3, "input_tokens": 84, "output_tokens": 21, "cumulative_input_tokens": 6668, "cumulative_output_tokens": 381, "cumulative_total_tokens": 20361, "model": "gpt-5-mini"}
+
+data: {"event": "reasoning.available", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321542.761634, "text": "I created probe_adr067.txt and read it back.\n\nFile contents:\nHELLO"}
+
+data: {"event": "run.completed", "run_id": "run_d4a043f5ed02449aa3bff100006f0814", "timestamp": 1785321542.7765226, "output": "I created probe_adr067.txt and read it back.\n\nFile contents:\nHELLO", "usage": {"input_tokens": 19980, "output_tokens": 381, "total_tokens": 20361}}
+
+: stream closed
+

@@ -1,0 +1,20 @@
+data: {"event": "usage.delta", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321467.653597, "step_index": 1, "input_tokens": 6318, "output_tokens": 936, "cumulative_input_tokens": 6318, "cumulative_output_tokens": 936, "cumulative_total_tokens": 7254, "model": "gpt-5-mini"}
+
+data: {"event": "tool.started", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321467.6774554, "tool": "search_files", "preview": "probe_adr067.txt"}
+
+data: {"event": "tool.completed", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321467.7496057, "tool": "search_files", "duration": 0.072, "error": false}
+
+data: {"event": "message.delta", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321468.5721023, "delta": "\n\nI"}
+
+data: {"event": "message.delta", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321468.5831962, "delta": " found"}
+
+data: {"event": "message.delta", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321468.594887, "delta": " one"}
+
+data: {"event": "usage.delta", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321470.2427654, "step_index": 2, "input_tokens": 119, "output_tokens": 141, "cumulative_input_tokens": 6437, "cumulative_output_tokens": 1077, "cumulative_total_tokens": 14682, "model": "gpt-5-mini"}
+
+data: {"event": "reasoning.available", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321470.255988, "text": "I found one match: ./probe_adr067.txt\n\nBefore I delete anything: please confirm you want me to permanently delete ./probe_adr067.txt. Also clarify what you mean by \"remove all temporary files\" \u2014 common choices:\n- delete files in the current tree matching patterns: *.tmp, *~, *.swp, .DS_Store\n- delete files in /tmp (system temp directory)\n- a custom glob or directory you specify\n\nTell me:\n1) Confirm deletion of ./probe_adr067.txt (yes/no).\n2) Which temporary-file patterns or directories should I "}
+
+data: {"event": "run.completed", "run_id": "run_9fb2f377180d43239a7aba63f63b80db", "timestamp": 1785321470.2657063, "output": "I found one match: ./probe_adr067.txt\n\nBefore I delete anything: please confirm you want me to permanently delete ./probe_adr067.txt. Also clarify what you mean by \"remove all temporary files\" \u2014 common choices:\n- delete files in the current tree matching patterns: *.tmp, *~, *.swp, .DS_Store\n- delete files in /tmp (system temp directory)\n- a custom glob or directory you specify\n\nTell me:\n1) Confirm deletion of ./probe_adr067.txt (yes/no).\n2) Which temporary-file patterns or directories should I remove (or say \"none\")?\n\nI will only proceed after your explicit confirmation.", "usage": {"input_tokens": 13605, "output_tokens": 1077, "total_tokens": 14682}}
+
+: stream closed
+
