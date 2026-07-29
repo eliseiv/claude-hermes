@@ -114,6 +114,15 @@ class DockerBackend:
         BEFORE the container starts guarantees the instance boots with the safe toolset. The port
         is exposed inside the network only (no ``ports=`` mapping ⇒ not published to the host).
         Raises :class:`UpstreamError` (→ 502 at the proxy) on any Docker failure.
+
+        NOT bounded by the caller's request budget — see TD-041. This call has no timeout, so a
+        wedged Docker daemon still hangs the request despite HERMES_LAUNCH_BUDGET_SECONDS. Fixing
+        it needs the two steps IN ORDER: (1) reconcile by container NAME before ``run`` (the
+        registry row is committed before this call and carries no ``container_id`` yet, so
+        ``_replay_stale_provisioning`` — which removes only ``if row.container_id`` — would leave an
+        orphan container holding the fixed name and every later provision would fail 409 forever);
+        (2) only then a client timeout, with the ``requests`` exceptions it raises mapped here.
+        A bare timeout without (1) makes the failure permanent instead of transient.
         """
         return await asyncio.to_thread(self._provision_sync, spec)
 
@@ -188,7 +197,14 @@ class DockerBackend:
         return all(marker in content for marker in required)
 
     async def start(self, container_ref: ContainerRef) -> None:
-        """Wake a hibernated container (``docker start``)."""
+        """Wake a hibernated container (``docker start``).
+
+        NOT bounded by the caller's request budget — see TD-041 (same untimed Docker call as
+        :meth:`provision`). On the wake path this runs while the row lock is HELD (ADR-062 §1
+        steps 1-3), so a wedged daemon blocks the user's other requests on the lock as well; the
+        ``lock_timeout`` in ``HermesInstanceRegistry.get_for_update`` bounds those waiters, not
+        this call.
+        """
         await asyncio.to_thread(self._start_sync, container_ref)
 
     def _start_sync(self, container_ref: ContainerRef) -> None:

@@ -54,7 +54,9 @@ class _FakeManager:
     def __init__(self) -> None:
         self.endpoint = InstanceEndpoint(base_url=_BASE_URL, api_key=_API_KEY)
 
-    async def ensure_running(self, user_id: uuid.UUID) -> InstanceEndpoint:
+    async def ensure_running(
+        self, user_id: uuid.UUID, *, deadline: float | None = None
+    ) -> InstanceEndpoint:
         return self.endpoint
 
 

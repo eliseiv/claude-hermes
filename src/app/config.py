@@ -382,9 +382,40 @@ class Settings(BaseSettings):
     # uses a bounded timeout; the SSE relay (GET .../events) disables the READ timeout (long-lived
     # stream) but keeps connect/write bounded so a dead instance still fails fast.
     hermes_proxy_timeout_seconds: float = Field(default=30.0, alias="HERMES_PROXY_TIMEOUT_SECONDS")
+    # CONNECT-phase cap for a non-streaming call to an instance, kept SEPARATE from the read/write
+    # cap above. An instance lives on the docker network and is addressed by container DNS, so a
+    # healthy connect is sub-second; giving connect the same 30s as read is what made the ADR-062
+    # connect-only retry cost 3 × 30s + backoffs (~94s) — the very hang TD-040 measured, since a
+    # retry is by construction only ever spent on the connect phase. Bounding connect separately is
+    # what makes the CONNECT-RETRY CYCLE affordable — ≈ 34s (3 × 10 + 2 × 2) — without weakening the
+    # read budget a slow-but-alive instance legitimately needs. That 34s bounds the retry cycle, NOT
+    # the whole call: a connect that SUCCEEDS is followed by a read phase bounded separately by
+    # HERMES_PROXY_TIMEOUT_SECONDS, so the mixed case (two refused connects, then a connect that
+    # succeeds and goes silent) costs ≈ 10 + 2 + 10 + 2 + 30 ≈ 54s. All modes stay under the budget.
+    hermes_connect_timeout_seconds: float = Field(
+        default=10.0, alias="HERMES_CONNECT_TIMEOUT_SECONDS"
+    )
     hermes_sse_connect_timeout_seconds: float = Field(
         default=10.0, alias="HERMES_SSE_CONNECT_TIMEOUT_SECONDS"
     )
+    # END-TO-END budget of one proxied request to an instance: the row-lock wait, `ensure_running`
+    # (provision / wake + the ADR-056/ADR-062 readiness poll), the HTTP call and every ADR-062
+    # connect-retry share it. HERMES_PROXY_TIMEOUT_SECONDS bounds ONE attempt only, so the phases
+    # used to stack: a ~90s readiness gate followed by a ~94s launch retry cycle (3 × 30s connect +
+    # backoffs) = the ≥90s of silence measured in prod (TD-040). The deadline is taken once at the
+    # entry point and threaded down, so it caps the SUM, not each phase. On exhaustion → 502
+    # upstream_timeout. This is a SAFETY CAP, not the expected latency: with connect bounded
+    # separately (HERMES_CONNECT_TIMEOUT_SECONDS) a wedged `running` instance answers in ≈34s (never
+    # accepts TCP) / ≈30s (accepts, then silent) / ≈54s (mixed), far below this ceiling. It bounds
+    # waiting on the INSTANCE — post-deadline cleanup and the untimed Docker calls (TD-041) are
+    # outside it.
+    # Invariant (validated below, fail-fast): >= readiness budget + TWO proxy timeouts — a LOWER
+    # BOUND that keeps an ordinary cold start from being clipped, NOT a promise that every path fits
+    # (07-deployment.md states the same): the /resume worst case is ready + 2 × (connect + proxy) =
+    # 170 > 150, i.e. a cold start plus two maximally slow upstream calls IS clipped. Accepted
+    # deliberately: that combination is a wedged instance, not a slow one. Lower this ONLY together
+    # with HERMES_PROVISION_READY_TIMEOUT_SECONDS.
+    hermes_launch_budget_seconds: float = Field(default=150.0, alias="HERMES_LAUNCH_BUDGET_SECONDS")
 
     # --- Agent usage-based billing (ADR-047, agent-proxy) ---
     # Credits charged per 1000 tokens for an agent run (/v1/agent/*). Conversion:
@@ -470,6 +501,36 @@ class Settings(BaseSettings):
                 f"({self.hermes_provisioning_stale_seconds}) must be greater than "
                 "HERMES_PROVISION_READY_TIMEOUT_SECONDS "
                 f"({self.hermes_provision_ready_timeout_seconds}) — ADR-056 §3"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_hermes_launch_budget_invariant(self) -> Settings:
+        """Fail-fast: the end-to-end launch budget must cover a cold start plus one full attempt.
+
+        A LOWER BOUND, not a guarantee that nothing is ever clipped. What it does guarantee: an
+        ordinary cold start (~30-40s, ADR-056) plus the READ phase of both ``/resume`` upstream
+        calls fits, so a merely slow instance is never failed with ``upstream_timeout`` while it was
+        still booting. The factor TWO is the ``/resume`` path (ADR-064 §5): hydrate the session
+        transcript, then launch the continuation, both under one deadline.
+
+        What it does NOT cover: the connect phases of those two calls. The true ``/resume`` worst
+        case is ``ready + 2 × (connect + proxy)`` = 170s at defaults, above the 150s default budget,
+        so that combination IS clipped — accepted deliberately and stated the same way in
+        07-deployment.md. Reaching it means a cold start followed by two maximally slow upstream
+        calls, which describes a wedged instance rather than a slow one; failing it at the budget is
+        the correct outcome. Rejecting a too-small budget at startup is the only place these knobs
+        are visible together; at request time the truncation is indistinguishable from a dead
+        instance.
+        """
+        minimum = self.hermes_provision_ready_timeout_seconds + (
+            2 * self.hermes_proxy_timeout_seconds
+        )
+        if self.hermes_launch_budget_seconds < minimum:
+            raise ValueError(
+                f"HERMES_LAUNCH_BUDGET_SECONDS ({self.hermes_launch_budget_seconds}) must be >= "
+                "HERMES_PROVISION_READY_TIMEOUT_SECONDS + 2 × HERMES_PROXY_TIMEOUT_SECONDS "
+                f"({minimum}) so a cold start plus the two /resume upstream calls always fit"
             )
         return self
 

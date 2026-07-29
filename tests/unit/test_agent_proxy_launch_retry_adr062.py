@@ -92,7 +92,7 @@ async def test_connect_error_first_then_success_returns_run_no_502(no_sleep: lis
     route = respx.post(_RUNS_URL).mock(
         side_effect=[httpx.ConnectError("conn refused"), _ok_response()]
     )
-    run_id, status = await svc._launch_run(_endpoint(), _BODY)
+    run_id, status = await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert (run_id, status) == ("run_abc", "running")  # succeeded on the retry, NOT a 502
     assert route.call_count == 2  # one failed connect + one successful retry
     assert no_sleep == [2.0]  # exactly one backoff between the two attempts
@@ -110,7 +110,7 @@ async def test_connect_timeout_retried_even_though_not_a_connect_error_subclass(
     route = respx.post(_RUNS_URL).mock(
         side_effect=[httpx.ConnectTimeout("connect timed out"), _ok_response()]
     )
-    run_id, _status = await svc._launch_run(_endpoint(), _BODY)
+    run_id, _status = await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert run_id == "run_abc"
     assert route.call_count == 2  # retried the connect timeout → succeeded
     assert no_sleep == [2.0]
@@ -124,7 +124,7 @@ async def test_pool_timeout_retried(no_sleep: list[float]) -> None:
     route = respx.post(_RUNS_URL).mock(
         side_effect=[httpx.PoolTimeout("pool exhausted"), _ok_response()]
     )
-    run_id, _status = await svc._launch_run(_endpoint(), _BODY)
+    run_id, _status = await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert run_id == "run_abc"
     assert route.call_count == 2
 
@@ -150,7 +150,7 @@ async def test_post_send_error_is_not_retried_single_post_then_502(
     svc = _service(_settings())
     route = respx.post(_RUNS_URL).mock(side_effect=exc)
     with pytest.raises(UpstreamError):
-        await svc._launch_run(_endpoint(), _BODY)
+        await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert route.call_count == 1  # NO second POST → no risk of a duplicate run
     assert no_sleep == []  # backoff never fired (no retry attempted)
 
@@ -165,7 +165,7 @@ async def test_all_attempts_connect_error_raises_502_call_count_equals_attempts(
     svc = _service(_settings(HERMES_LAUNCH_RETRY_ATTEMPTS=3))
     route = respx.post(_RUNS_URL).mock(side_effect=httpx.ConnectError("still down"))
     with pytest.raises(UpstreamError):
-        await svc._launch_run(_endpoint(), _BODY)
+        await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert route.call_count == 3  # all three attempts made
     assert no_sleep == [2.0, 2.0]  # a backoff between each pair of attempts (attempts-1)
 
@@ -178,7 +178,7 @@ async def test_non_2xx_response_no_retry_single_post_then_502(no_sleep: list[flo
     svc = _service(_settings(HERMES_LAUNCH_RETRY_ATTEMPTS=3))
     route = respx.post(_RUNS_URL).mock(return_value=httpx.Response(500, json={"e": "boom"}))
     with pytest.raises(UpstreamError):
-        await svc._launch_run(_endpoint(), _BODY)
+        await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert route.call_count == 1  # a server response is deterministic → not retried
     assert no_sleep == []
 
@@ -191,7 +191,7 @@ async def test_attempts_one_disables_retry_no_backoff(no_sleep: list[float]) -> 
     svc = _service(_settings(HERMES_LAUNCH_RETRY_ATTEMPTS=1))
     route = respx.post(_RUNS_URL).mock(side_effect=httpx.ConnectError("down"))
     with pytest.raises(UpstreamError):
-        await svc._launch_run(_endpoint(), _BODY)
+        await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert route.call_count == 1  # single attempt, no retry
     assert no_sleep == []  # backoff not called when attempts == 1
 
@@ -205,7 +205,7 @@ async def test_successful_retry_sends_bearer_and_body_on_each_attempt(
     # server).
     svc = _service(_settings())
     route = respx.post(_RUNS_URL).mock(side_effect=[httpx.ConnectError("x"), _ok_response()])
-    await svc._launch_run(_endpoint(), _BODY)
+    await svc._launch_run(_endpoint(), _BODY, deadline=svc._budget_deadline())
     assert route.call_count == 2
     last = route.calls.last.request
     assert last.headers["authorization"] == f"Bearer {_API_KEY}"

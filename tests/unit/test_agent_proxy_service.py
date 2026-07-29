@@ -52,7 +52,9 @@ class FakeManager:
         self.endpoint = endpoint or InstanceEndpoint(base_url=_BASE_URL, api_key=_API_KEY)
         self.ensure_running_calls: list[uuid.UUID] = []
 
-    async def ensure_running(self, user_id: uuid.UUID) -> InstanceEndpoint:
+    async def ensure_running(
+        self, user_id: uuid.UUID, *, deadline: float | None = None
+    ) -> InstanceEndpoint:
         self.ensure_running_calls.append(user_id)
         return self.endpoint
 

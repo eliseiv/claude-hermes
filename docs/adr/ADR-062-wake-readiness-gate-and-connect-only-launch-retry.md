@@ -1,6 +1,7 @@
 # ADR-062 — Readiness-gate на wake-пути и connect-only retry запуска run
 
-- Статус: Accepted
+- Статус: Accepted (**ревизия 2026-07-30** — оценка worst-case §Consequences была неверна, см. §Ревизия в конце)
+- ⚠️ **Ревизия 2026-07-30 ([TD-040](../100-known-tech-debt.md)):** оценка «connect-retry увеличивает worst-case латентность на `(attempts−1)·backoff` (≤ 4 с)» **верна только при дешёвом connect**, а ничто этого не обеспечивало: connect получал общий `HERMES_PROXY_TIMEOUT_SECONDS` (30 с), и три попытки давали **≈94 с**. Условие оценки теперь выполнено — введён отдельный `HERMES_CONNECT_TIMEOUT_SECONDS` (10 с). Подробности — §Ревизия.
 - Дата: 2026-07-15
 - Расширяет / уточняет: [ADR-056](ADR-056-provision-readiness-gate-and-volume-ownership.md) §1/§2 (readiness-gate провижининга; распространяется на wake-путь), [ADR-045](ADR-045-hermes-as-agent-proxy.md) §2/§6 (`_launch_run` `POST /v1/runs`, `502` при недоступности инстанса). Тела ADR-056 и ADR-045 не переписаны (immutability) — контракт wake-readiness и launch-retry уточняется здесь.
 - Связан с: [ADR-046](ADR-046-per-user-hermes-runtime.md) §1/§5 (lifecycle wake/hibernate), [ADR-054](ADR-054-trial-claim-reconcile.md) (транзакционный инвариант: commit освобождает xact-scoped state — нельзя держать row-lock через длинную операцию), [ADR-003](ADR-003-byok-envelope-encryption.md) (envelope-decrypt `API_SERVER_KEY` для health Bearer), [TD-031](../100-known-tech-debt.md) (stale `provisioning`), [modules/hermes-runtime/](../modules/hermes-runtime/README.md), [modules/agent-proxy/](../modules/agent-proxy/README.md)
@@ -96,7 +97,7 @@ Retry — defense-in-depth: покрывает остаточную гонку (
 - Первый запрос после гибернации блокируется до `health=200` (ожидаемая wake-латентность, ограничена бюджетом) — «медленный успех» вместо «быстрого `502`».
 - Wake-`provisioning` добавляет коротко-транзакционный commit-цикл в ветку wake (было: один commit) — приемлемо, паттерн уже используется в `_provision_locked`.
 - Требуется миграция `0017` (add-column `provisioning_started_at`, expand-only) — цена варианта B за семантическую чистоту `created_at` (см. Alternatives 6).
-- Connect-retry увеличивает worst-case латентность неуспешного запуска на `(attempts-1)·backoff` (дефолт ≤ 4с) перед `502`.
+- ~~Connect-retry увеличивает worst-case латентность неуспешного запуска на `(attempts-1)·backoff` (дефолт ≤ 4с) перед `502`.~~ ⚠️ **Неверно — исправлено ревизией 2026-07-30 (см. ниже).** Оценка учитывала только backoff и **молча предполагала дешёвый connect**; фактическая латентность складывалась из **времени самих попыток**, каждая из которых упиралась в 30-секундный proxy-таймаут: `3 × 30 + 2 × 2 = 94 с`.
 - Остаётся допущение «`/health=200` ⟺ `/v1/runs` готов», валидное для текущего образа Hermes (единый listener, маршруты до `TCPSite.start()`). При смене контракта образа (пере-регистрация маршрутов после старта listener) потребуется более точный ready-signal — [Q-062-1](../99-open-questions.md).
 
 ## Alternatives
@@ -108,3 +109,23 @@ Retry — defense-in-depth: покрывает остаточную гонку (
 5. **Docker `HEALTHCHECK`/`docker wait` на healthy.** Отложено (как в ADR-056 Alt-2): образ — публичный pinned, его `HEALTHCHECK` мы не контролируем.
 6. **Reuse `created_at` как stale-якоря на wake (вариант A, без миграции).** Отклонено в пользу выделенной колонки `provisioning_started_at` (§1a): сдвиг `created_at` на каждый wake ломает его семантику «инстанс создан» (латентная ловушка для будущих admin-view/метрик/отладки) и делает ложным собственный инвариант докстринга `_is_stale_provisioning` («`created_at` никогда не двигается»). Хотя внешних потребителей `hermes_instances.created_at` сейчас нет (единственный — сам `_is_stale_provisioning`), перегрузка смысла хрупка; выделенная колонка самодокументируема и делает stale-инвариант истинным. Цена — дешёвая expand-only миграция `0017`.
 7. **Безусловный `mark_stopped` на wake-таймауте.** Отклонено (MAJOR): при гонке (конкурентный replay/provision поднял новый `running`) перезатирает свежий `running → stopped` → здоровый контейнер `running`-в-docker при `stopped`-в-registry (ресурс-лик + лишний wake). Принят условный `mark_stopped_if_provisioning(user_id, T)` с guard'ом по идентичности попытки (§1b).
+
+## Ревизия 2026-07-30 — оценка worst-case была неверна ([TD-040](../100-known-tech-debt.md))
+
+**Что было записано:** «connect-retry увеличивает worst-case латентность неуспешного запуска на `(attempts−1)·backoff` (дефолт ≤ 4 с)».
+
+**Почему неверно.** Формула считает только паузы **между** попытками и опускает время **самих попыток**. Это корректно ровно тогда, когда connect дёшев — то есть отваливается за доли секунды. Но отдельного connect-таймаута не существовало: фаза установки соединения получала общий `HERMES_PROXY_TIMEOUT_SECONDS` (**30 с**). Итог при дефолтах `attempts=3`, `backoff=2 с`:
+
+```
+3 × 30 (попытки)  +  2 × 2 (backoff)  =  94 с
+```
+
+**Это не теоретическая оценка — ровно она измерена на проде:** `POST /v1/agent/run` на заклиненном инстансе висел ≥90 с без ответа ([TD-040](../100-known-tech-debt.md), [TD-039](../100-known-tech-debt.md)). Механизм, введённый этим ADR как защита от транзиентных сбоев, при недешёвом connect **умножал** время отказа втрое.
+
+**Что исправлено.** Введён отдельный **`HERMES_CONNECT_TIMEOUT_SECONDS`** (дефолт `10 с`), разведённый с `HERMES_PROXY_TIMEOUT_SECONDS`; сверху добавлен сквозной **`HERMES_LAUNCH_BUDGET_SECONDS`** (`150 с`) на весь launch-путь ([07-deployment.md](../07-deployment.md)). Исходная оценка §Consequences становится верной: рост латентности при дешёвом connect действительно определяется backoff'ом.
+
+**Урок, применимый шире:** оценка стоимости ретрая обязана включать **стоимость попытки**, а не только паузу между попытками; если попытка не ограничена собственным таймаутом, ретрай не смягчает отказ, а умножает его.
+
+**Поведенческий сдвиг (осознанный).** Честно медленный connect дольше `10 с` больше **не ретраится**, а сразу даёт `502 upstream_timeout`. Внутри `hermes-net` установка соединения до `hermes-user-<id>:8642` — это DNS-хоп в docker-сети, где 10 с заведомо избыточны, поэтому регрессией это не считается. ⚠️ Оговорка на будущее: при смене сетевой топологии (инстансы за внешним хопом, оверлей-сеть, cross-host) значение обязано пересматриваться вместе с `HERMES_LAUNCH_BUDGET_SECONDS` — иначе разведение фаз превратится из фикса в новый источник ложных `502`.
+
+**Что НЕ менялось:** сам инвариант connect-only retry (§Decision) — явный кортеж `(httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)`, запрет ретрая post-send и на non-2xx — остаётся в силе дословно. Ревизия касается только **стоимости** попыток, а не их допустимости.

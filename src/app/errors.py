@@ -145,6 +145,20 @@ class UpstreamError(AppError):
     code = "upstream_error"
 
 
+class UpstreamTimeoutError(UpstreamError):
+    """The launch-path budget was exhausted before the instance answered (ADR-062 rev).
+
+    502 with code=upstream_timeout — a SUBCLASS of :class:`UpstreamError`, so every existing
+    ``except UpstreamError`` / 502-mapping keeps working and only the wire ``code`` narrows. It
+    says something the generic 502 cannot: the control plane gave up on a deadline rather than
+    observing a transport failure, i.e. the instance was SILENT (a stuck Hermes answers neither a
+    request nor a health probe — the prod symptom this exists for). Distinguishable by the client
+    and by alerting: `upstream_error` = the instance said no, `upstream_timeout` = it said nothing.
+    """
+
+    code = "upstream_timeout"
+
+
 class ServiceUnavailableError(AppError):
     """A required dependency/feature is not configured (e.g. auth issuer has no private key).
 

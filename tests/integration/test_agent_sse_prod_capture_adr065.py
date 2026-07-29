@@ -49,7 +49,7 @@ class _FakeManager:
 
         self.endpoint = InstanceEndpoint(base_url=_BASE_URL, api_key=_API_KEY)
 
-    async def ensure_running(self, user_id: uuid.UUID) -> Any:
+    async def ensure_running(self, user_id: uuid.UUID, *, deadline: float | None = None) -> Any:
         return self.endpoint
 
 
@@ -615,3 +615,69 @@ async def test_usage_delta_flush_does_not_resurrect_an_answered_approval(
     row = await _snapshot(db_sessionmaker, run_id)
     assert row is not None
     assert (row.input_tokens, row.output_tokens) == (6313, 658)
+
+
+# ==================================================================================================
+# The ADR-067 completion capture, end to end against a real database.
+#
+# Provenance and the shortening rule: see the module docstring of
+# tests/unit/test_agent_sse_delta_contract_adr065.py and the registry in
+# docs/06-testing-strategy.md.
+# This capture is the one that settles the money path — a run that actually reaches run.completed.
+# ==================================================================================================
+_COMPLETED_FIXTURE = _FIXTURE.parent / "hermes_prod_completed_run_adr067.sse"
+_COMPLETED_STATE = _FIXTURE.parent / "hermes_prod_completed_run_adr067.state.json"
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_completed_capture_agrees_with_the_ledger_and_the_state_endpoint(
+    db_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """(b) One real run, three records that must agree: capture, ledger, /state.
+
+    The production /state body of this very run was captured alongside the stream, so the assertion
+    is not "what our code computes" but "what production actually answered".
+    """
+    run_id = "run_3b3b1253e0974b24b594b7452bc7095d"
+    uid = await _seed_run(db_sessionmaker, run_id, balance=10_000)
+    respx.get(f"{_BASE_URL}/v1/runs/{run_id}/events").mock(
+        return_value=httpx.Response(200, content=_COMPLETED_FIXTURE.read_bytes())
+    )
+    with _capture_service_logs() as logs:
+        async with db_sessionmaker() as s:
+            await _collect(_proxy(s).stream_events(user_id=uid, run_id=run_id))
+
+    expected = json.loads(_COMPLETED_STATE.read_text())
+
+    # 1. Lifecycle status recorded from the terminal event.
+    async with db_sessionmaker() as s:
+        status = (
+            await s.execute(text("SELECT status FROM agent_runs WHERE run_id=:r"), {"r": run_id})
+        ).scalar_one()
+    assert str(status) == expected["status"] == "completed"
+
+    # 2. The snapshot behind GET …/state — text present exactly once, usage from the terminal block.
+    row = await _snapshot(db_sessionmaker, run_id)
+    assert row is not None
+    assert row.result_text == expected["resultText"] == "DONE."
+    assert (
+        (row.input_tokens, row.output_tokens)
+        == (
+            expected["usage"]["inputTokens"],
+            expected["usage"]["outputTokens"],
+        )
+        == (6302, 586)
+    )
+
+    # 3. The ledger: 6302 in + 586 out at 1.0 / 5.0 per 1k = 6.302 + 2.93 → 10 credits, once.
+    assert await _debits(db_sessionmaker, uid) == [(run_id, 10)]
+
+    # 4. The client view derived from all of it.
+    async with db_sessionmaker() as s:
+        view = await _proxy(s).get_state(user_id=uid, run_id=run_id)
+    assert view.status == "completed"
+    assert view.result_text == "DONE."
+
+    # 5. Nine iterations of alarms, silent on a healthy production run.
+    assert [m for m in logs.messages if "usage" in m or "no text" in m] == []

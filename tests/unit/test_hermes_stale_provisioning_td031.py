@@ -84,7 +84,9 @@ class FakeRegistry:
     async def get(self, user_id: uuid.UUID) -> _Row | None:
         return self.rows.get(user_id)
 
-    async def get_for_update(self, user_id: uuid.UUID) -> _Row | None:
+    async def get_for_update(
+        self, user_id: uuid.UUID, *, lock_timeout_ms: int | None = None
+    ) -> _Row | None:
         return self.rows.get(user_id)
 
     async def create_provisioning(

@@ -46,6 +46,7 @@ from app.errors import (
     RunNotResumableError,
     SessionExpiredError,
     UpstreamError,
+    UpstreamTimeoutError,
 )
 from app.hermes_runtime.manager import HermesInstanceManager, InstanceEndpoint
 from app.policy.engine import Decision, Mode, evaluate
@@ -145,6 +146,13 @@ _AGENT_BLOCK_REASONS = frozenset(
 )
 # Block reason for an unsettled agent-run debt (ADR-051 §4).
 _DEBT_OUTSTANDING = "debt_outstanding"
+
+# Smallest slice of the end-to-end budget worth spending on one more HTTP attempt. Below it the
+# attempt cannot plausibly complete a connect + response, so starting it only delays a 502 that is
+# already inevitable — the whole point of the budget is that the client gets its answer AT the
+# deadline, not a second past it. Also the retry gate: a retry is only started when the backoff
+# plus this window still fit.
+_MIN_ATTEMPT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -345,6 +353,94 @@ class AgentProxyService:
         self._runs_repo = runs
         self._snapshots_repo = snapshots
 
+    # --- end-to-end request budget ------------------------------------------------------------
+
+    def _budget_deadline(self) -> float:
+        """``time.monotonic()`` instant by which a proxied request must have an answer.
+
+        Taken ONCE at an entry point and threaded through every phase — instance resolution
+        (``ensure_running``: provision/wake + the ADR-056/ADR-062 readiness poll), the HTTP call
+        itself and every ADR-062 connect-retry — so the phases share ONE budget instead of stacking
+        their own. Before this, ``HERMES_PROXY_TIMEOUT_SECONDS`` bounded a single attempt only:
+        a ~90s readiness gate followed by 3 × 30s of launch attempts plus backoffs left the client
+        with no response at all for minutes (TD-040, measured in prod against a wedged instance,
+        which answers neither the request nor a health probe — silence, not a transport error, so
+        nothing else in the path could have ended the wait).
+
+        SCOPE, precisely — this bounds the time spent WAITING ON THE INSTANCE (lock wait, readiness
+        polls, HTTP attempts), with three documented gaps:
+
+        1. Post-deadline cleanup still runs (a final health probe, a best-effort container
+           stop/remove — ADR-056 §1, ADR-062 §1b). Bounded, but outside the budget.
+        2. The Docker calls of TD-041 are untimed and outside it entirely.
+        3. httpx timeouts are PER-OPERATION, not cumulative: ``read`` restarts on every chunk
+           received, so an upstream dripping one byte every 29s never trips a 30s read timeout and
+           would outlive any purely phase-based bound. That is why each non-streaming attempt is
+           ALSO wrapped in ``asyncio.timeout(remaining budget)`` (see :meth:`_launch_run`) — the
+           phase caps decide the normal cases quickly, the wrapper makes the budget a real ceiling
+           rather than a hopeful one.
+
+        (1) and (2) mean the client's observed latency can still exceed the budget by a bounded
+        amount; (3) is closed.
+        """
+        return time.monotonic() + self._settings.hermes_launch_budget_seconds
+
+    def _remaining(self, deadline: float, *, phase: str) -> float:
+        """Seconds left of the budget, or :class:`UpstreamTimeoutError` if an attempt cannot fit.
+
+        Refusing below ``_MIN_ATTEMPT_SECONDS`` is what turns an exhausted budget into an immediate
+        deterministic 502 instead of a token attempt nobody is waiting for any more.
+        """
+        left = deadline - time.monotonic()
+        if left < _MIN_ATTEMPT_SECONDS:
+            logger.warning("hermes %s budget exhausted before the attempt", phase)
+            raise UpstreamTimeoutError("hermes instance did not answer within the request budget")
+        return left
+
+    def _attempt_timeout(self, left: float) -> httpx.Timeout:
+        """Per-attempt httpx timeout, with connect bounded SEPARATELY from read/write.
+
+        The split is the fix, not decoration. A single float sets all four phases in httpx, so the
+        launch path did have a connect timeout — it had a 30s one. The ADR-062 retry is by
+        construction spent ONLY on the connect phase, so that 30s was multiplied by the attempt
+        count: 3 × 30 + 2 × 2 = 94s, which is precisely the ≥90s of silence TD-040 measured. ADR-062
+        §Последствия priced its own change at ``(attempts-1) × backoff ≤ 4s`` and missed this.
+        Connect gets ``HERMES_CONNECT_TIMEOUT_SECONDS`` (an instance is one DNS hop away on the
+        docker network: sub-second when healthy), read/write keep the full proxy timeout — a run
+        launch may legitimately take seconds to be accepted. ``pool`` follows connect: waiting for a
+        free connection is a local-resource wait, not the instance thinking.
+
+        The result is bounded under BOTH unobserved failure modes of a wedged instance (see
+        ``unverified_external_assumptions``), and under their mixture, which is the true worst case:
+        a connect-refusing mode costs ``attempts × connect + backoffs`` (~34s at defaults); a mode
+        that accepts TCP and then goes silent costs ONE proxy timeout (30s — the ReadTimeout is
+        post-send and is never retried, ADR-062: double-run risk); an instance that refuses the
+        first attempts and accepts the last costs both, ~54s. None of the three depends on which
+        mode is real, and all sit under the budget.
+
+        ``left`` is the remaining budget, already validated by :meth:`_remaining`; the caps are
+        clamped to it so the last attempt of a nearly-spent budget cannot overrun it.
+        """
+        connect = min(self._settings.hermes_connect_timeout_seconds, left)
+        read_write = min(self._settings.hermes_proxy_timeout_seconds, left)
+        return httpx.Timeout(connect=connect, read=read_write, write=read_write, pool=connect)
+
+    @staticmethod
+    def _transport_error(phase: str, exc: httpx.HTTPError) -> UpstreamError:
+        """Classify an httpx failure into the 502 the client sees. Single rule, every path.
+
+        ``upstream_timeout`` ⟺ the instance said NOTHING within the time it was given
+        (:class:`httpx.TimeoutException` — connect, read, write or pool). Everything else — refused,
+        reset, DNS, protocol — is the instance (or the network) answering in the negative and stays
+        the generic ``upstream_error``. The two are operationally different: silence means "still
+        booting / wedged, retry later", a refusal means "something is broken now".
+        """
+        if isinstance(exc, httpx.TimeoutException):
+            logger.warning("hermes %s timed out (no answer)", phase)
+            return UpstreamTimeoutError("hermes instance did not answer within the request budget")
+        logger.warning("hermes %s transport error", phase)
+        return UpstreamError("hermes instance unreachable")
+
     # --- run launch -------------------------------------------------------------------------
 
     async def run(
@@ -361,6 +457,10 @@ class AgentProxyService:
         waking the container or debiting (200 blocked, ADR-004); (2) ``ensure_running`` resolves
         the user's instance endpoint + bearer key; (3) proxy the launch with the mapped body.
         Any upstream/instance failure surfaces as 502 (UpstreamError), never as 200 blocked.
+
+        Steps (2) and (3) share ONE end-to-end deadline (``HERMES_LAUNCH_BUDGET_SECONDS``, see
+        :meth:`_budget_deadline`), so the launch path always terminates: 502 ``upstream_timeout``
+        at the budget instead of the unbounded silence a stuck instance used to produce.
         """
         # (1) Policy gate (credits branch; agent path has no byok mode on MVP, ADR-047 §3).
         state = await load_policy_state(self._session, user_id)
@@ -398,8 +498,11 @@ class AgentProxyService:
                 )
                 return RunLaunchResult(blocked=True, block_reason=_DEBT_OUTSTANDING)
 
-        # (2) Resolve (provision/wake) the user's Hermes instance.
-        endpoint = await self._manager.ensure_running(user_id)
+        # (2) Resolve (provision/wake) the user's Hermes instance. The budget starts HERE, after the
+        # DB-only gates above (they cannot hang on the instance) and covers everything that talks to
+        # it: the readiness gate and the launch share one deadline instead of stacking.
+        deadline = self._budget_deadline()
+        endpoint = await self._manager.ensure_running(user_id, deadline=deadline)
 
         # (3) Proxy the launch. Map iOS body → Hermes body (ADR-045 §4). ADR-064 §5: compute a
         # STABLE session_id (client-supplied or a fresh uuid4) and pass it to Hermes so the whole
@@ -410,7 +513,7 @@ class AgentProxyService:
         if model is not None:
             hermes_body["model"] = model
 
-        run_id, status = await self._launch_run(endpoint, hermes_body)
+        run_id, status = await self._launch_run(endpoint, hermes_body, deadline=deadline)
         # ADR-066 §3: the ROOT agent_runs row (continued_from NULL) is created ALWAYS — the row is
         # an unconditional LIFECYCLE record, no longer gated by agent_incremental_billing_enabled
         # (with the flag OFF the default configuration used to store no agent runs at all, so
@@ -430,7 +533,7 @@ class AgentProxyService:
         return RunLaunchResult(blocked=False, run_id=run_id, status=status)
 
     async def _launch_run(
-        self, endpoint: InstanceEndpoint, body: dict[str, Any]
+        self, endpoint: InstanceEndpoint, body: dict[str, Any], *, deadline: float
     ) -> tuple[str, str]:
         """POST {base}/v1/runs with the instance bearer; return (run_id, status). 502 on failure.
 
@@ -440,6 +543,21 @@ class AgentProxyService:
         backoff. POST /v1/runs is NOT idempotent (no client key), so ONLY the connect phase is safe
         to retry; any post-send error (write/read/protocol) may have created a run and is re-raised
         immediately as 502 (double-run risk). A fresh ``httpx.AsyncClient`` is used per attempt.
+
+        TWO things bound the cycle, and the FIRST is what fixed TD-040: each attempt's connect phase
+        is capped at ``HERMES_CONNECT_TIMEOUT_SECONDS`` rather than at the proxy timeout (see
+        :meth:`_attempt_timeout`), so the worst case is ``attempts × connect + backoffs`` ≈ 34s
+        instead of ``attempts × 30s`` ≈ 94s. The second is ``deadline`` — the budget SHARED with
+        ``ensure_running`` — which stops the cycle from stacking on top of a readiness gate; it is
+        the outer safety net, not the mechanism (at defaults it is never the binding constraint on
+        this path). A retry is skipped when the backoff plus a usable attempt window no longer fit.
+
+        ADR-062 is intact to the letter: the connect set is unchanged, the connect phase is still
+        the ONLY retryable one, a post-send error is still re-raised immediately (double-run risk),
+        and the attempt count still caps the retries. What changed is the price of an attempt, not
+        which attempts happen. ADR-062 §Последствия priced its own worst case at
+        ``(attempts-1) × backoff ≤ 4s`` — true only if connect were cheap, which nothing enforced
+        until now; that missing premise is the defect.
         """
         url = f"{endpoint.base_url}/v1/runs"
         # ADR-062 §2: EXPLICIT tuple, NOT a base class. In httpx 0.28.1 ConnectTimeout is NOT a
@@ -449,28 +567,57 @@ class AgentProxyService:
         # (post-send) → double-run risk. Match strictly the connect set.
         connect_errors = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
         attempts = max(self._settings.hermes_launch_retry_attempts, 1)
+        backoff = self._settings.hermes_launch_retry_backoff_seconds
         response: httpx.Response | None = None
         for attempt in range(1, attempts + 1):
+            left = self._remaining(deadline, phase="run launch")
             try:
-                async with httpx.AsyncClient(
-                    timeout=self._settings.hermes_proxy_timeout_seconds
-                ) as client:
+                # asyncio.timeout is the CEILING; the httpx phase caps are what normally fires.
+                # Both are needed: httpx timeouts are per-operation and restart on every chunk, so
+                # a drip-feeding upstream satisfies them forever (see _budget_deadline SCOPE §3).
+                # Cancelling here is safe in a way it is NOT inside ensure_running: no DB row, lock
+                # or container state is in flight, so no cleanup path is skipped. The worst outcome
+                # is a run created upstream whose id we never learn — the exact orphan class a
+                # ReadTimeout already produces, which ADR-062 handles by never retrying (below).
+                async with (
+                    asyncio.timeout(left),
+                    httpx.AsyncClient(timeout=self._attempt_timeout(left)) as client,
+                ):
                     response = await client.post(
                         url, json=body, headers=self._bearer_headers(endpoint.api_key)
                     )
                 break
+            except TimeoutError as exc:
+                # The budget ceiling, not a phase cap. Never retried: the request was in flight, so
+                # this is post-send by construction (double-run risk, ADR-062 §2).
+                logger.warning("hermes run launch exceeded the request budget attempt=%d", attempt)
+                raise UpstreamTimeoutError(
+                    "hermes instance did not answer within the request budget"
+                ) from exc
             except httpx.HTTPError as exc:
-                # Retry ONLY on a connect-phase error with attempts remaining; otherwise 502.
-                if isinstance(exc, connect_errors) and attempt < attempts:
+                # Retry ONLY on a connect-phase error with attempts AND budget remaining; else 502.
+                budget_left = deadline - time.monotonic()
+                retryable = isinstance(exc, connect_errors) and attempt < attempts
+                if retryable and budget_left - backoff >= _MIN_ATTEMPT_SECONDS:
                     logger.warning(
                         "hermes run launch connect error, retrying attempt=%d/%d",
                         attempt,
                         attempts,
                     )
-                    await asyncio.sleep(self._settings.hermes_launch_retry_backoff_seconds)
+                    await asyncio.sleep(backoff)
                     continue
-                logger.warning("hermes run launch transport error")
-                raise UpstreamError("hermes instance unreachable") from exc
+                if retryable:
+                    logger.warning(
+                        "hermes run launch connect error, budget exhausted attempt=%d/%d",
+                        attempt,
+                        attempts,
+                    )
+                # The code follows what the LAST error actually was, never why we stopped retrying.
+                # A ConnectError is the instance REFUSING (connection refused / reset) — reporting
+                # that as `upstream_timeout` just because the budget also happened to run out would
+                # invert the distinction errors.py:UpstreamTimeoutError promises. Only a genuine
+                # timeout (connect or read) means "it said nothing".
+                raise self._transport_error("run launch", exc) from exc
         if response is None:  # pragma: no cover - loop always breaks on success or raises
             # Defensive: the loop breaks on success or raises on the final failed attempt.
             raise UpstreamError("hermes instance unreachable")
@@ -519,9 +666,14 @@ class AgentProxyService:
         consumer is deferred, ADR-066 §8).
         """
         incremental = self._settings.agent_incremental_billing_enabled
-        endpoint = await self._manager.ensure_running(user_id)
+        # The SETUP phase gets the same end-to-end budget as every other proxied path: waking a
+        # stuck instance must not leave the subscriber hanging before a single byte is due. The
+        # STREAM itself is deliberately unbounded in read (below) — that is the long-lived part.
+        endpoint = await self._manager.ensure_running(user_id, deadline=self._budget_deadline())
         url = f"{endpoint.base_url}/v1/runs/{run_id}/events"
-        # Long-lived stream: bound connect/write, disable read timeout so a slow run is not killed.
+        # Long-lived stream: bound connect/write/pool, disable ONLY the read timeout — a run may
+        # legitimately think for minutes between events, but a dead instance must still fail fast
+        # at connect, and a blocked pool must not wait forever for a free connection.
         timeout = httpx.Timeout(
             connect=self._settings.hermes_sse_connect_timeout_seconds,
             read=None,
@@ -710,9 +862,10 @@ class AgentProxyService:
         except httpx.HTTPError as exc:
             # A mid-stream transport drop: the client connection ends. Billing idempotency by
             # run_id (and per-step run_id:step) lets a re-subscription complete billing later
-            # (ADR-045 §6, ADR-064 §6, Q-047-2).
-            logger.warning("hermes events transport error (stream ended)")
-            raise UpstreamError("hermes events stream error") from exc
+            # (ADR-045 §6, ADR-064 §6, Q-047-2). Classified by the same rule as every other path so
+            # the code means one thing everywhere — reachable here only for connect/write/pool
+            # (read is disabled by design: this stream times out silence, not death).
+            raise self._transport_error("events stream", exc) from exc
 
     async def _bill_step(
         self, *, user_id: uuid.UUID, run_id: str, event: _SseEvent, charged: int
@@ -1433,19 +1586,32 @@ class AgentProxyService:
     async def _passthrough_post(
         self, user_id: uuid.UUID, path: str, body: dict[str, Any] | None
     ) -> dict[str, Any]:
-        """POST to the user's instance; relay the JSON body. 502 on transport/non-2xx failure."""
-        endpoint = await self._manager.ensure_running(user_id)
+        """POST to the user's instance; relay the JSON body. 502 on transport/non-2xx failure.
+
+        Shares the launch path's end-to-end budget (``ensure_running`` + the call), so ``/stop``,
+        ``/approval`` and the internal pause interrupt cannot hang the way the launch did: waking a
+        stuck instance is exactly as slow here, and ``/stop`` in particular is what a user reaches
+        for WHEN a run is already misbehaving — the one request that must never hang.
+        """
+        deadline = self._budget_deadline()
+        endpoint = await self._manager.ensure_running(user_id, deadline=deadline)
         url = f"{endpoint.base_url}{path}"
+        left = self._remaining(deadline, phase=f"passthrough {path}")
         try:
-            async with httpx.AsyncClient(
-                timeout=self._settings.hermes_proxy_timeout_seconds
-            ) as client:
+            async with (
+                asyncio.timeout(left),  # budget ceiling (see _budget_deadline SCOPE §3)
+                httpx.AsyncClient(timeout=self._attempt_timeout(left)) as client,
+            ):
                 response = await client.post(
                     url, json=body, headers=self._bearer_headers(endpoint.api_key)
                 )
+        except TimeoutError as exc:
+            logger.warning("hermes passthrough exceeded the request budget path=%s", path)
+            raise UpstreamTimeoutError(
+                "hermes instance did not answer within the request budget"
+            ) from exc
         except httpx.HTTPError as exc:
-            logger.warning("hermes passthrough transport error path=%s", path)
-            raise UpstreamError("hermes instance unreachable") from exc
+            raise self._transport_error(f"passthrough {path}", exc) from exc
         if not 200 <= response.status_code < 300:
             logger.warning(
                 "hermes passthrough non-2xx path=%s status=%s", path, response.status_code
@@ -1556,8 +1722,12 @@ class AgentProxyService:
         # error (502 for upstream, 409 for an expired session). A launched-but-unchained run is an
         # orphan handled by the idle-reaper (Q-064-1).
         try:
-            endpoint = await self._manager.ensure_running(user_id)
-            history = await self._fetch_session_transcript(endpoint, session_id)
+            # One budget for wake + hydrate + launch (see :meth:`_budget_deadline`). On exhaustion
+            # the UpstreamTimeoutError travels the SAME path as any other failure here, so the CAS
+            # revert below still runs and the run stays resumable.
+            deadline = self._budget_deadline()
+            endpoint = await self._manager.ensure_running(user_id, deadline=deadline)
+            history = await self._fetch_session_transcript(endpoint, session_id, deadline=deadline)
             hermes_body: dict[str, Any] = {"session_id": session_id}
             if message is not None:
                 hermes_body["input"] = message
@@ -1565,7 +1735,7 @@ class AgentProxyService:
                 hermes_body["model"] = model
             if history:
                 hermes_body["conversation_history"] = history
-            new_run_id, status = await self._launch_run(endpoint, hermes_body)
+            new_run_id, status = await self._launch_run(endpoint, hermes_body, deadline=deadline)
         except Exception:
             await self._runs_repo.revert_cas(run_id)
             await self._session.commit()
@@ -1633,7 +1803,7 @@ class AgentProxyService:
         return None
 
     async def _fetch_session_transcript(
-        self, endpoint: InstanceEndpoint, session_id: str
+        self, endpoint: InstanceEndpoint, session_id: str, *, deadline: float
     ) -> list[dict[str, Any]]:
         """Hydrate the Hermes session transcript into ``conversation_history`` (ADR-064 §7).
 
@@ -1644,14 +1814,20 @@ class AgentProxyService:
         ``session_expired`` (caller reverts the CAS). Transport failure → 502.
         """
         url = f"{endpoint.base_url}/api/sessions/{session_id}/messages"
+        left = self._remaining(deadline, phase="session transcript")
         try:
-            async with httpx.AsyncClient(
-                timeout=self._settings.hermes_proxy_timeout_seconds
-            ) as client:
+            async with (
+                asyncio.timeout(left),  # budget ceiling (see _budget_deadline SCOPE §3)
+                httpx.AsyncClient(timeout=self._attempt_timeout(left)) as client,
+            ):
                 response = await client.get(url, headers=self._bearer_headers(endpoint.api_key))
+        except TimeoutError as exc:
+            logger.warning("hermes session transcript exceeded the request budget")
+            raise UpstreamTimeoutError(
+                "hermes instance did not answer within the request budget"
+            ) from exc
         except httpx.HTTPError as exc:
-            logger.warning("hermes session transcript transport error")
-            raise UpstreamError("hermes session transcript unreachable") from exc
+            raise self._transport_error("session transcript", exc) from exc
         if response.status_code == 404:
             raise SessionExpiredError("session transcript not found")
         if not 200 <= response.status_code < 300:

@@ -86,6 +86,7 @@ class _Row:
 class FakeRegistry:
     def __init__(self) -> None:
         self.rows: dict[uuid.UUID, _Row] = {}
+        self.lock_timeout_ms: int | None = None
         self.create_calls = 0
         self.touch_calls = 0
         self.mark_running_calls = 0
@@ -96,7 +97,12 @@ class FakeRegistry:
     async def get(self, user_id: uuid.UUID) -> _Row | None:
         return self.rows.get(user_id)
 
-    async def get_for_update(self, user_id: uuid.UUID) -> _Row | None:
+    async def get_for_update(
+        self, user_id: uuid.UUID, *, lock_timeout_ms: int | None = None
+    ) -> _Row | None:
+        # The real registry issues SET LOCAL lock_timeout here (bounded lock wait); the in-memory
+        # fake has no locks, so the value is only recorded for assertions.
+        self.lock_timeout_ms = lock_timeout_ms
         return self.rows.get(user_id)
 
     async def create_provisioning(

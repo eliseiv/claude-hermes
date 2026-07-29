@@ -25,7 +25,7 @@
 - **202** (allowed): `{"runId": "string", "status": "queued|running"}` (proxy Hermes `run_id`→`runId`, `status`).
 - **200** (blocked, [ADR-004](../../adr/ADR-004-blocked-http-200.md)): `{"status": "blocked", "blockReason": "credits_empty|subscription_expired|trial_used|debt_outstanding"}`.
 - **401** — нет/неверный `X-API-Key` или нет/невалидный `X-User-Id`.
-- **502** — инстанс недоступен / `ensure_running` не поднял контейнер / Hermes 5xx. Транзиентная connect-ошибка запуска (`POST /v1/runs`) ретраится ([ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md), connect-only) перед `502`; wake после гибернации теперь ждёт готовности `api_server` (readiness-gate wake, [ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md)) → устранён `502` «каждый 3–4-й запрос».
+- **502** `upstream_timeout` | `upstream_error` (различение — [§Коды 502](#коды-502-upstream_timeout-vs-upstream_error-td-040)) — инстанс недоступен / `ensure_running` не поднял контейнер / Hermes 5xx. Транзиентная connect-ошибка запуска (`POST /v1/runs`) ретраится ([ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md), connect-only) перед `502`; wake после гибернации теперь ждёт готовности `api_server` (readiness-gate wake, [ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md)) → устранён `502` «каждый 3–4-й запрос».
 
 #### Достижимый набор `blockReason` (credits-ветка)
 Источник истины по полному перечню `blockReason` — Policy Engine ([ADR-002](../../adr/ADR-002-access-policy-state-machine.md)). Агентный путь вызывает `evaluate(state, mode=credits)` **только** в `credits`-ветке ([ADR-047 §3](../../adr/ADR-047-usage-based-billing-for-agent.md)), поэтому фактически достижим строго следующий набор:
@@ -52,6 +52,26 @@
 - Поток: auth → policy-gate (`PolicyEngine.evaluate`, BR-2/3/5) → `HermesInstanceManager.ensure_running(userId)` → прокси `POST {base}/v1/runs` c `Authorization: Bearer <api_key>` ([ADR-045 §2](../../adr/ADR-045-hermes-as-agent-proxy.md)).
 - Policy blocked → прогон **не** запускается (контейнер не будится напрасно), `200 blocked`.
 - `mode=byok` агентного пути на старте не вводится ([Q-047-3](../../99-open-questions.md)); policy работает в `credits`-ветке.
+
+## Коды `502`: `upstream_timeout` vs `upstream_error` ([TD-040](../../100-known-tech-debt.md))
+
+Применяется к **`POST /v1/agent/run`**, **`POST …/resume`**, **`POST …/stop`**, **`POST …/approval`** — то есть ко всем путям, синхронно обращающимся к инстансу Hermes.
+
+Тело: `502 {"error": {"code": "upstream_timeout" | "upstream_error", "message": "…"}}`.
+
+| Код | Смысл | Когда |
+|---|---|---|
+| **`upstream_timeout`** | инстанс **промолчал** — истёк дедлайн | таймаут фаз HTTP (`connect`/`read`/`write`/`pool`); readiness-gate cold-start/wake не дождался `health=200` ([ADR-056](../../adr/ADR-056-provision-readiness-gate-and-volume-ownership.md)/[ADR-062](../../adr/ADR-062-wake-readiness-gate-and-connect-only-launch-retry.md)); истёк сквозной бюджет launch-пути `HERMES_LAUNCH_BUDGET_SECONDS`; ожидание row-lock не уложилось в бюджет |
+| **`upstream_error`** | инстанс **отказал** или исход **определён** | connection refused, connection reset, ошибка резолва DNS, протокольная ошибка; Hermes ответил `5xx`; детерминированные исходы вроде «конкурент уже прибрал за собой» |
+
+**Правило различения одной фразой:** *промолчал* → `upstream_timeout`; *ответил отказом либо исход известен* → `upstream_error`.
+
+**Что это меняет для клиента.** Раньше при зависшем инстансе запрос **висел без ответа** ≥90 с и не имел кода ([TD-040](../../100-known-tech-debt.md)) — отличить «медленно» от «сломано» было нельзя. Теперь ответ приходит в пределах бюджета с явным кодом:
+
+- **`upstream_timeout`** — инстанс, вероятно, ещё поднимается либо занят; **повтор осмыслен** (обычно через несколько секунд), пользователю показывать «сервис отвечает медленно, пробуем ещё раз»;
+- **`upstream_error`** — отказ или определённый исход; **немедленный повтор бесполезен**, показывать ошибку.
+
+⚠️ **Клиентски-видимое изменение** — согласовать с iOS вместе с [ADR-067 §3.4](../../adr/ADR-067-agent-run-background-consumer.md).
 
 ## GET /v1/agent/runs/{runId}/events  (SSE)
 Ретрансляция событий прогона.
@@ -170,6 +190,8 @@
 ## POST /v1/agent/runs/{runId}/approval
 Passthrough approval-ответа.
 
+- **502** `upstream_timeout` | `upstream_error` — [§Коды 502](#коды-502-upstream_timeout-vs-upstream_error-td-040).
+
 ### Request
 ```json
 { "choice": "once|session|always|deny" }
@@ -178,6 +200,8 @@ Passthrough approval-ответа.
 
 ## POST /v1/agent/runs/{runId}/stop
 Passthrough остановки прогона → `POST {base}/v1/runs/{runId}/stop`.
+
+- **502** `upstream_timeout` | `upstream_error` — [§Коды 502](#коды-502-upstream_timeout-vs-upstream_error-td-040).
 
 - **После 2xx passthrough** ([ADR-066 §3](../../adr/ADR-066-agent-run-state-snapshot.md)) — условная запись статуса: `runs_repo.mark_stopped(run_id, user_id)` = `UPDATE agent_runs SET status='cancelled' WHERE run_id=:id AND user_id=:uid AND status IN ('running','resumed')` (**owner-scoped**: RBAC — свойство самого запроса). Условие обязательно: остановка уже завершённого/`paused`-прогона **не должна** затирать терминальный статус. Симметрично условны и `completed`/`failed` — иначе долетевшее после `/stop` терминальное событие затёрло бы `cancelled` (Hermes продолжает дофлашивать события в открытый relay). До [ADR-066](../../adr/ADR-066-agent-run-state-snapshot.md) `cancelled` не записывался никогда. В `/state` отображается как `stopped` (eventual consistency).
 - **`mark_stopped(run_id, user_id)` — только этот, клиентский, путь.** Внутренний Hermes-interrupt при pause-at-zero ([ADR-064 §3](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) использует тот же `stop()`, но статус `cancelled` **не выставляет**: иначе пауза по кредитам транзиентно выглядела бы как `stopped` в `/state`, а `POST /resume` в этом окне вернул бы `409 run_not_resumable`.
@@ -202,7 +226,7 @@ Passthrough остановки прогона → `POST {base}/v1/runs/{runId}/s
 - **409** `resume_in_progress` — конкурентный resume выиграл CAS и ещё не зафиксировал child (узкое окно); клиент ретраит → получит `202` с child. **Второй child НЕ создаётся.**
 - **409** `session_expired` ([ADR-064 §7](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md), [Q-064-3](../../99-open-questions.md)) — hydrate `GET {base}/api/sessions/{sessionId}/messages` вернул `404` **или пустую историю**: Hermes-сессия истекла/недоступна, continuation невозможен → CAS откатывается `resumed→paused` (прогон остаётся paused), клиент начинает новый прогон через `POST /v1/agent/run`. **Отличие от 502:** `session_expired` (409) — сессии *нет* (детерминированный отказ); 502 — сессия/инстанс временно *недоступны* (транзиентно).
 - **401** — нет/неверный `X-API-Key`/`X-User-Id`.
-- **502** — инстанс недоступен / `ensure_running` не поднял контейнер / Hermes 5xx / hydrate transport-ошибка или non-2xx (кроме `404` → `session_expired`) / сбой `_launch_run`. После любого сбоя **до** создания child CAS откатывается `resumed→paused` — прогон остаётся возобновляемым.
+- **502** `upstream_timeout` | `upstream_error` ([§Коды 502](#коды-502-upstream_timeout-vs-upstream_error-td-040)) — инстанс недоступен / `ensure_running` не поднял контейнер / Hermes 5xx / hydrate transport-ошибка или non-2xx (кроме `404` → `session_expired`) / сбой `_launch_run`. ⚠️ На этом пути **два** upstream-вызова (hydrate + launch), поэтому сквозной бюджет `HERMES_LAUNCH_BUDGET_SECONDS` обязан покрывать оба ([07-deployment.md](../../07-deployment.md)). После любого сбоя **до** создания child CAS откатывается `resumed→paused` — прогон остаётся возобновляемым.
 
 ### Правила
 - Поток ([ADR-064 §5](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)): auth → RBAC-404 → пред-гвард `status∈{paused,resumed}` (иначе 409 `run_not_resumable`) → **policy-gate** (read-only, blocked 200 если баланс 0/долг, **до** флипа статуса) → **атомарный CAS `paused→resumed`** (арбитр гонки, отдельная короткая транзакция: `UPDATE agent_runs SET status='resumed' WHERE run_id=:id AND status='paused' RETURNING session_id, model`) → **ветвление:**

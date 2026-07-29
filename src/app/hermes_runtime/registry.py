@@ -11,7 +11,7 @@ import datetime
 import uuid
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, delete, func, select, update
+from sqlalchemy import CursorResult, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,16 +31,43 @@ class HermesInstanceRegistry:
         )
         return row
 
-    async def get_for_update(self, user_id: uuid.UUID) -> HermesInstance | None:
+    async def get_for_update(
+        self, user_id: uuid.UUID, *, lock_timeout_ms: int | None = None
+    ) -> HermesInstance | None:
         """Row-locked read (``SELECT ... FOR UPDATE``) for race-safe ensure_running.
 
         Concurrent ``ensure_running`` calls for the same ``user_id`` serialize on the locked row
         so a second caller observes the first's state instead of double-provisioning.
         ``skip_locked`` is intentionally NOT used — the second caller must wait and re-read.
+
+        ``lock_timeout_ms`` bounds THAT wait. Without it the wait is unbounded (Postgres defaults
+        ``lock_timeout`` to 0 = forever, and this project sets no global one), so a caller queued
+        behind a slow lock holder hangs no matter what timeout its own HTTP client has — the wait
+        happens before a single byte is sent. ``SET LOCAL`` scopes it to the current transaction
+        (reverted on commit/rollback, never leaking to the next user of the pooled connection) and
+        must be issued on this same session, which is why it lives here next to the ``FOR UPDATE``
+        it guards rather than in the caller. Exhaustion surfaces as a ``55P03`` DBAPI error.
+
+        The setting is restored to ``DEFAULT`` immediately after the lock is taken, narrowing it to
+        the ONE statement it is meant for. Left in place it would outlive its handler: every later
+        statement of the same transaction — notably the ``ON CONFLICT`` insert of
+        ``create_provisioning``, which can wait on a concurrent speculative insert — could also
+        raise ``55P03``, far from the caller's ``except`` and therefore surface as a 500 instead of
+        a 502. Restoring is done only on the success path: if the lock DID time out, the transaction
+        is already aborted (no further statement would run) and the caller's rollback clears the
+        setting anyway.
         """
+        if lock_timeout_ms is not None:
+            # Integer-formatted into the statement, NOT a bind parameter: SET LOCAL takes a literal
+            # (Postgres rejects a placeholder here). The value is an int by construction — coerced
+            # here, never a caller-supplied string — so no injection surface exists.
+            await self._session.execute(text(f"SET LOCAL lock_timeout = {int(lock_timeout_ms)}"))
         row: HermesInstance | None = await self._session.scalar(
             select(HermesInstance).where(HermesInstance.user_id == user_id).with_for_update()
         )
+        if lock_timeout_ms is not None:
+            # SET LOCAL … DEFAULT, not RESET: RESET would persist past this transaction's commit.
+            await self._session.execute(text("SET LOCAL lock_timeout = DEFAULT"))
         return row
 
     async def create_provisioning(

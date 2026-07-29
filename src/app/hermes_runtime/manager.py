@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.byok.kms import KmsClient
@@ -32,7 +33,7 @@ from app.config import (
     Settings,
     hermes_provider_key_env,
 )
-from app.errors import UpstreamError
+from app.errors import UpstreamError, UpstreamTimeoutError
 from app.hermes_runtime.config_yaml import render_instance_config
 from app.hermes_runtime.docker_backend import (
     HERMES_API_PORT,
@@ -52,6 +53,29 @@ _NONCE_LEN = 12
 _MIN_API_KEY_BYTES = 16
 # Bound a single reaper batch so one tick cannot stall on a huge idle backlog.
 _REAPER_BATCH_LIMIT = 100
+# Postgres SQLSTATE for `lock_timeout` expiry (lock_not_available). Matched on the sqlstate rather
+# than on an exception class: the asyncpg driver's error is wrapped by SQLAlchemy's DBAPI adapter,
+# so the concrete class depends on the adapter's internals while the SQLSTATE is the contract.
+_PG_LOCK_NOT_AVAILABLE = "55P03"
+
+
+def _is_lock_timeout(exc: DBAPIError) -> bool:
+    """True when a DBAPI error is Postgres' ``lock_timeout`` expiry (SQLSTATE 55P03).
+
+    Walks the ``__cause__`` chain: SQLAlchemy's asyncpg adapter re-raises the driver error inside
+    its own DBAPI exception, so the asyncpg object carrying ``sqlstate`` may sit one or two links
+    down. Any other DB failure returns False and is re-raised untouched — a genuine DB error must
+    never be laundered into a 502.
+    """
+    seen: BaseException | None = exc.orig or exc
+    for _ in range(4):  # bounded walk: adapter wrapper → driver error is at most a couple of links
+        if seen is None:
+            return False
+        state = getattr(seen, "sqlstate", None) or getattr(seen, "pgcode", None)
+        if state == _PG_LOCK_NOT_AVAILABLE:
+            return True
+        seen = seen.__cause__
+    return False
 
 
 @dataclass(frozen=True)
@@ -88,17 +112,46 @@ class HermesInstanceManager:
         self._kms = kms
         self._settings = settings
 
-    async def ensure_running(self, user_id: uuid.UUID) -> InstanceEndpoint:
+    async def ensure_running(
+        self, user_id: uuid.UUID, *, deadline: float | None = None
+    ) -> InstanceEndpoint:
         """Return a ready endpoint for the user, provisioning or waking the container as needed.
 
         Flow (ADR-046 §1): row-lock the user's instance; missing → provision; stopped → start +
         ``status=running``; always bump ``last_active_at``; decrypt the key into an
         :class:`InstanceEndpoint`. Race-safe via the PK + ``FOR UPDATE`` (a concurrent caller waits
         for the lock, then observes the freshly provisioned/woken row).
+
+        ``deadline`` (a ``time.monotonic()`` instant) is the CALLER's end-to-end budget — the proxy
+        passes the same instant it will later use for the HTTP call itself, so instance resolution
+        and the request no longer stack into an unbounded total (the prod worst case: a ~90s wake
+        readiness gate followed by a ~94s launch retry cycle). It bounds THREE things here: the wait
+        for the row lock (``lock_timeout``, see below), the readiness polls, and — via the caller —
+        the HTTP call. It only ever SHORTENS the configured readiness budget, never extends it, and
+        the polls honour it by RETURNING rather than by being cancelled, so every ADR-056/ADR-062
+        cleanup path (container removal, conditional re-hibernate) still runs and no half-owned
+        ``provisioning`` row is left behind. ``None`` keeps the pre-existing behaviour.
+
+        The lock wait is bounded because it happens BEFORE any HTTP client exists: a caller queued
+        behind the row lock cannot be rescued by any request timeout, and Postgres waits forever by
+        default. Exhausting it is reported as ``upstream_timeout`` — the instance is busy serving
+        someone else's call and this request got no answer in its budget, which is exactly what the
+        code means.
         """
-        row = await self._registry.get_for_update(user_id)
+        try:
+            row = await self._registry.get_for_update(
+                user_id, lock_timeout_ms=self._lock_timeout_ms(deadline)
+            )
+        except DBAPIError as exc:
+            if not _is_lock_timeout(exc):
+                raise
+            # The statement aborted the transaction — roll back before the caller's teardown so the
+            # session is reusable (the audit/agent_runs writes of a later request share it).
+            await self._session.rollback()
+            logger.warning("hermes instance row lock wait timed out user_id=%s", user_id)
+            raise UpstreamTimeoutError("hermes instance is busy with another request") from exc
         if row is None:
-            return await self._provision_locked(user_id)
+            return await self._provision_locked(user_id, deadline=deadline)
 
         if row.status == "provisioning" and self._is_stale_provisioning(row):
             # TD-031: a `provisioning` row older than the stale threshold is the residue of a crash
@@ -114,7 +167,7 @@ class HermesInstanceManager:
                 row.container_id,
             )
             await self._replay_stale_provisioning(row)
-            return await self._provision_locked(user_id)
+            return await self._provision_locked(user_id, deadline=deadline)
 
         if row.status == "provisioning":
             # ADR-056 §2: a FRESH `provisioning` row (younger than stale) is a concurrent
@@ -122,30 +175,55 @@ class HermesInstanceManager:
             # instance nor re-provision — release this row-lock (else the owner's mark_running
             # UPDATE would deadlock against our FOR UPDATE) and wait for the row to reach `running`.
             await self._session.rollback()
-            return await self._await_concurrent_ready(user_id)
+            return await self._await_concurrent_ready(user_id, deadline=deadline)
 
         if row.status == "stopped":
             # ADR-062 §1: wake behind a readiness-gate (short-transaction, own commit/poll cycle).
-            return await self._wake_locked(row)
+            return await self._wake_locked(row, deadline=deadline)
 
-        # running: just refresh the activity stamp.
+        # running (the FAST PATH, and the one a wedged instance takes — its container is up, so the
+        # row says `running` and nothing above fires): refresh the activity stamp and COMMIT.
+        #
+        # The commit is load-bearing, not tidiness. This branch used to `flush` only, so the
+        # `FOR UPDATE` lock taken above was held until the request session's teardown — i.e. across
+        # the caller's entire HTTP call to the instance. On a wedged instance that is the full
+        # launch budget, and every OTHER request from the same user then queued on the lock and hung
+        # too, with no timeout able to help (see the docstring). Waking and provisioning already
+        # release the lock before their long phase (ADR-062 §1 step 4, ADR-056 §1); this path is now
+        # consistent with them.
+        #
+        # Nothing is lost by committing here: this branch's only write is `touch_active` (an
+        # activity stamp, independently useful and never rolled back for correctness), and the
+        # callers reach it with no uncommitted work of their own — the policy gate only READS, the
+        # blocked branches return before ensure_running, /resume commits its CAS first, and every
+        # write that follows (audit, agent_runs, snapshots) happens after this returns.
         await self._registry.touch_active(user_id)
         await self._session.flush()
-        return self._endpoint_from_row(await self._reload(user_id))
+        row = await self._reload(user_id)
+        # Decrypt BEFORE the commit while the row is guaranteed loaded (expire_on_commit=False makes
+        # this safe either way, but the order removes the dependency on that setting).
+        endpoint = self._endpoint_from_row(row)
+        await self._session.commit()
+        return endpoint
 
-    async def provision(self, user_id: uuid.UUID) -> InstanceEndpoint:
+    async def provision(
+        self, user_id: uuid.UUID, *, deadline: float | None = None
+    ) -> InstanceEndpoint:
         """Provision a brand-new instance for the user (no existing row expected).
 
         Public entry point; ``ensure_running`` is the normal path. Delegates to the locked
-        provisioning routine so the ``ON CONFLICT`` race guard applies here too.
+        provisioning routine so the ``ON CONFLICT`` race guard applies here too. ``deadline``
+        has the same meaning as in :meth:`ensure_running` (caller's end-to-end budget).
         """
         existing = await self._registry.get_for_update(user_id)
         if existing is not None:
             # Idempotent: an instance already exists — return its endpoint instead of duplicating.
             return self._endpoint_from_row(existing)
-        return await self._provision_locked(user_id)
+        return await self._provision_locked(user_id, deadline=deadline)
 
-    async def _provision_locked(self, user_id: uuid.UUID) -> InstanceEndpoint:
+    async def _provision_locked(
+        self, user_id: uuid.UUID, *, deadline: float | None = None
+    ) -> InstanceEndpoint:
         """Insert the provisioning row (race-safe), start the container, gate on readiness.
 
         Flow (ADR-056 §1): insert the ``provisioning`` row (encrypted key first, so it is never
@@ -170,7 +248,7 @@ class HermesInstanceManager:
             # re-provision or return a possibly-unready endpoint — wait for that row to become
             # `running` (ADR-056 §2), then return its endpoint.
             await self._session.rollback()
-            return await self._await_concurrent_ready(user_id)
+            return await self._await_concurrent_ready(user_id, deadline=deadline)
 
         # ADR-056 §1: commit the `provisioning` row BEFORE docker run so it is the visible race
         # arbiter while this caller proceeds (a concurrent ensure_running observes it and waits).
@@ -201,9 +279,12 @@ class HermesInstanceManager:
         # NOT holding a DB transaction during the poll (health is an HTTP call; the provisioning row
         # is already committed). Only after 200 do we mark_running. On timeout: remove the container
         # and drop the row (cleanup → no inconsistent state), then raise → 502 at the proxy.
-        if not await self._wait_for_ready(container_ref.endpoint, api_key):
+        if not await self._wait_for_ready(container_ref.endpoint, api_key, deadline=deadline):
             await self._cleanup_failed_provision(user_id, container_ref)
-            raise UpstreamError("hermes instance failed to become ready")
+            # A readiness budget that runs out means the instance never answered a probe — the
+            # `upstream_timeout` case by definition, whichever budget (own or caller's) expired
+            # first. Reported as such so the code keeps its meaning on the cold-start path too.
+            raise UpstreamTimeoutError("hermes instance did not become ready in time")
 
         await self._registry.mark_running(
             user_id,
@@ -219,7 +300,9 @@ class HermesInstanceManager:
         )
         return InstanceEndpoint(base_url=container_ref.endpoint, api_key=api_key)
 
-    async def _wake_locked(self, row: HermesInstance) -> InstanceEndpoint:
+    async def _wake_locked(
+        self, row: HermesInstance, *, deadline: float | None = None
+    ) -> InstanceEndpoint:
         """Wake a ``stopped`` instance behind the readiness-gate (ADR-062 §1). Short-transaction.
 
         Flow (mirrors ``_provision_locked``'s gate on the wake path, ADR-062 §1):
@@ -239,6 +322,11 @@ class HermesInstanceManager:
              took the row, maybe a NEW ``running`` container) → leave row+container untouched +
              ``rollback``. Either way raise ``UpstreamError`` → 502. The container is NOT removed
              (a valid hibernated instance; volume/memory preserved) — the next request re-wakes.
+
+        ``deadline`` (the caller's end-to-end budget) only shortens step 5-6; step 7 is unchanged
+        and still runs, so a deadline-shortened wake leaves exactly the state an ordinary readiness
+        timeout does. The config invariant ``launch budget >= ready + proxy`` keeps that shortening
+        to the docker-start time, never to a slice of the cold start itself.
         """
         user_id = row.user_id
         container_ref = self._container_ref_from_row(row)
@@ -253,7 +341,7 @@ class HermesInstanceManager:
         # ADR-062 §1 step 4: commit the provisioning arbiter, releasing the row-lock BEFORE polling.
         await self._session.commit()
 
-        if await self._wait_for_ready(endpoint, api_key):
+        if await self._wait_for_ready(endpoint, api_key, deadline=deadline):
             await self._registry.mark_running(
                 user_id,
                 container_id=container_ref.container_id,
@@ -289,7 +377,8 @@ class HermesInstanceManager:
                 "hermes instance wake timed out, row taken by concurrent actor user_id=%s",
                 user_id,
             )
-        raise UpstreamError("hermes instance failed to become ready")
+        # Same rule as the cold-start gate: the wake ended on a deadline with the instance silent.
+        raise UpstreamTimeoutError("hermes instance did not become ready in time")
 
     async def stop_idle(self, threshold_seconds: int) -> int:
         """Stop running instances idle longer than the threshold (reaper). Returns the count.
@@ -369,7 +458,40 @@ class HermesInstanceManager:
         await self._registry.delete(row.user_id)
         await self._session.flush()
 
-    async def _wait_for_ready(self, endpoint: str, api_key: str) -> bool:
+    def _lock_timeout_ms(self, caller_deadline: float | None) -> int | None:
+        """Postgres ``lock_timeout`` for the ``FOR UPDATE``, in ms: what is left of the budget.
+
+        ``None`` (no caller budget) keeps the pre-existing unbounded wait. A budget already spent
+        floors at 1ms rather than 0 — 0 means "wait forever" in Postgres, so rounding an exhausted
+        budget down to it would turn the tightest deadline into no deadline at all, the one
+        direction this must never fail in.
+        """
+        if caller_deadline is None:
+            return None
+        return max(int((caller_deadline - time.monotonic()) * 1000), 1)
+
+    def _poll_deadline(self, caller_deadline: float | None) -> float:
+        """The instant a readiness poll must stop: own budget, shortened by the caller's deadline.
+
+        The caller's end-to-end budget can only ever make the wait SHORTER — a caller may not buy
+        the gate more time than ADR-056 grants it (that budget is a property of the cold start, not
+        of the request). ``None`` ⇒ the configured budget alone.
+
+        In a VALID configuration this clamp is insurance, not the working mechanism: the config
+        invariant guarantees ``budget - ready >= 2 × proxy``, so the caller's deadline is still in
+        the future when the poll starts and only an unbounded phase BEFORE the poll (a slow
+        ``docker run``/``start`` — TD-041) can make it bite. The mechanism that actually fixed the
+        stacking is that the caller's HTTP call shares this same deadline. Note also that the two
+        poll loops are ALTERNATIVE branches (own provision/wake vs. waiting on a concurrent one),
+        so they never sum: the real prod worst case was one readiness gate (~90s) followed by the
+        launch retry cycle (~94s), not two gates.
+        """
+        own = time.monotonic() + self._settings.hermes_provision_ready_timeout_seconds
+        return own if caller_deadline is None else min(own, caller_deadline)
+
+    async def _wait_for_ready(
+        self, endpoint: str, api_key: str, *, deadline: float | None = None
+    ) -> bool:
         """Poll ``health`` until 200 within the readiness budget (ADR-056 §1). No DB held.
 
         Each iteration is one ``backend.health(endpoint, api_key)`` (its own bounded HTTP timeout);
@@ -377,10 +499,16 @@ class HermesInstanceManager:
         on the first 200, False if the budget is exhausted. Pure HTTP — no DB transaction is held
         during the wait (the provisioning row was already committed). A non-positive budget disables
         the gate (single probe → backward-compatible immediate behaviour).
+
+        ``deadline`` (the caller's end-to-end budget) can only shorten the wait. Exhausting it is
+        reported as a plain not-ready (False), NOT as a cancellation: the caller's cleanup — remove
+        on cold start, conditional re-hibernate on wake (ADR-062 §1b) — must still run, and both are
+        correct here (an instance that did not answer a probe within the budget is not usable for
+        this request either way). At least ONE probe always happens, so a caller arriving with an
+        already-spent budget still gets an answer instead of a guess.
         """
-        budget = self._settings.hermes_provision_ready_timeout_seconds
+        stop_at = self._poll_deadline(deadline)
         interval = max(self._settings.hermes_provision_ready_interval_seconds, 1)
-        deadline = time.monotonic() + budget
         while True:
             try:
                 if await self._backend.health(endpoint, api_key):
@@ -388,7 +516,7 @@ class HermesInstanceManager:
             except UpstreamError:
                 # health probe transport failure — treat as not-ready and keep polling.
                 pass
-            if time.monotonic() + interval > deadline:
+            if time.monotonic() + interval > stop_at:
                 return False
             await asyncio.sleep(interval)
 
@@ -417,7 +545,9 @@ class HermesInstanceManager:
             container_ref.container_id,
         )
 
-    async def _await_concurrent_ready(self, user_id: uuid.UUID) -> InstanceEndpoint:
+    async def _await_concurrent_ready(
+        self, user_id: uuid.UUID, *, deadline: float | None = None
+    ) -> InstanceEndpoint:
         """Wait for a concurrent provisioner's row to reach ``running`` (ADR-056 §2). No DB held.
 
         Re-reads the registry row (a short read each poll, then commit to release the connection)
@@ -431,10 +561,12 @@ class HermesInstanceManager:
         ``provisioning → running`` transition and the loser would block the whole budget → a false
         502 (real production race found by qa). Expiring first forces every poll to re-SELECT the
         committed row from the DB.
+
+        ``deadline`` (the caller's end-to-end budget) can only shorten the wait — a loser must not
+        be able to burn the whole readiness budget on top of what the caller has already spent.
         """
-        budget = self._settings.hermes_provision_ready_timeout_seconds
+        stop_at = self._poll_deadline(deadline)
         interval = max(self._settings.hermes_provision_ready_interval_seconds, 1)
-        deadline = time.monotonic() + budget
         while True:
             # Drop cached identity-map state so this poll re-reads the committed row (docstring).
             self._session.expire_all()
@@ -442,11 +574,13 @@ class HermesInstanceManager:
             await self._session.commit()  # release the connection between polls (no DB held)
             if row is None:
                 # The concurrent provisioner cleaned up after its own timeout → nothing to wait on.
+                # A DEFINITE outcome, not a deadline: the generic 502 is the honest code here.
                 raise UpstreamError("hermes instance failed to become ready")
             if row.status == "running":
                 return self._endpoint_from_row(row)
-            if time.monotonic() + interval > deadline:
-                raise UpstreamError("hermes instance failed to become ready")
+            if time.monotonic() + interval > stop_at:
+                # We stopped because time ran out, not because anything answered → upstream_timeout.
+                raise UpstreamTimeoutError("hermes instance did not become ready in time")
             await asyncio.sleep(interval)
 
     def _require_provision_config(self) -> None:

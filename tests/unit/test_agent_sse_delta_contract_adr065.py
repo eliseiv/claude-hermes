@@ -52,6 +52,7 @@ from app.agent_proxy.service import (
     _delta_shape_looks_unknown,
     _event_name,
     _extract_delta_text,
+    _extract_tool_name,
     _extract_usage_counts,
     _has_token_like_field,
     _is_provably_usage_free,
@@ -1809,3 +1810,231 @@ async def test_anchors_reach_the_snapshot_even_under_an_active_throttle() -> Non
         658,
     ), "the anchors were swallowed by the throttle; no terminal event will ever flush them"
     assert last["result_text"] == "ответ", "the text accumulated so far rides along with the write"
+
+
+# ==================================================================================================
+# T. The ADR-067 captures — a run that actually REACHES run.completed.
+#
+# Provenance (2026-07-30, patched Hermes image of ADR-065, model gpt-5-mini). Every capture below is
+# byte-verbatim from a live production run; the ONLY edit is DELETION of whole message.delta blocks
+# to shorten the answer text. No value, key, escape or separator was rewritten, and the retained
+# blocks keep their original order and trailing bytes (asserted in
+# ``test_adr067_fixtures_are_wire_faithful``). Registry: docs/06-testing-strategy.md.
+#
+#   hermes_prod_completed_run_adr067.sse          run_3b3b1253e0974b24b594b7452bc7095d — normal
+#     (+ .state.json)                             completion, 6/6 blocks VERBATIM (nothing to
+#                                                 shorten: the whole answer is "DONE.")
+#   hermes_prod_tool_run_adr067.sse               2×tool.started/tool.completed (write_file,
+#                                                 read_file), 13/27 blocks
+#   hermes_prod_no_approval_run_adr067.sse        a deliberate attempt to provoke approval.request:
+#                                                 the agent asked for confirmation in PROSE instead,
+#                                                 10/144 blocks — evidence of ABSENCE
+#   hermes_prod_no_terminal_event_adr067.sse      a jammed instance: the stream stops after
+#     (+ _2nd_sample)                             usage.delta with no terminal event, 4/120 blocks
+#
+# WHAT THIS CLOSES. The shape of ``run.completed`` was the last unverified external assumption of
+# this whole effort — nine iterations of detectors were built around a payload nobody had ever seen.
+# The capture settles it: usage IS nested, under the per-step names. The tests below pin that to the
+# first source rather than to the assumption the code was written from.
+# ==================================================================================================
+_COMPLETED_FIXTURE = _FIXTURE.parent / "hermes_prod_completed_run_adr067.sse"
+_COMPLETED_STATE = _FIXTURE.parent / "hermes_prod_completed_run_adr067.state.json"
+_TOOL_FIXTURE = _FIXTURE.parent / "hermes_prod_tool_run_adr067.sse"
+_NO_APPROVAL_FIXTURE = _FIXTURE.parent / "hermes_prod_no_approval_run_adr067.sse"
+_NO_TERMINAL_FIXTURE = _FIXTURE.parent / "hermes_prod_no_terminal_event_adr067.sse"
+_NO_TERMINAL_FIXTURE_2 = _FIXTURE.parent / "hermes_prod_no_terminal_event_2nd_sample_adr067.sse"
+_STREAM_CLOSED_MARKER = b": stream closed"
+
+
+def _events_of(path: Path) -> list[_SseEvent]:
+    return [_parse_sse_block(b) for b in path.read_bytes().split(b"\n\n") if b.strip()]
+
+
+def _only(path: Path, event_name: str) -> _SseEvent:
+    (found,) = (e for e in _events_of(path) if _event_name(e) == event_name)
+    return found
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        _COMPLETED_FIXTURE,
+        _TOOL_FIXTURE,
+        _NO_APPROVAL_FIXTURE,
+        _NO_TERMINAL_FIXTURE,
+        _NO_TERMINAL_FIXTURE_2,
+    ],
+    ids=lambda p: p.name,
+)
+def test_adr067_fixtures_are_wire_faithful(path: Path) -> None:
+    """The shortening rule, enforced: whole blocks may go, nothing may be rewritten."""
+    body = path.read_bytes()
+    assert b"\r" not in body, "LF separators only — a CRLF fixture would be a rewrite"
+    assert body.endswith(b"\n\n"), "trailing separator must match the capture"
+    for block in (b for b in body.split(b"\n\n") if b.strip()):
+        # Every block is either a `data:` line or the server's own comment/keepalive line.
+        assert block.startswith(b"data: ") or block.startswith(b":"), block
+    # Dispatch never depends on an SSE header line: the image does not emit one.
+    assert b"\nevent:" not in body and not body.startswith(b"event:")
+    for event in _events_of(path):
+        assert event.name is None
+
+
+def test_captured_run_completed_carries_usage_nested_under_per_step_names() -> None:
+    """(a) THE assumption, finally measured: ``{"usage": {"input_tokens", "output_tokens", ...}}``.
+
+    Every guard on the money path was designed for a payload that had never been observed. This is
+    the observation — and it agrees with the guess, which is worth stating explicitly: the union
+    fold reads it from a single carrier, with no divergence and no order breach to report.
+    """
+    completed = _only(_COMPLETED_FIXTURE, "run.completed")
+    assert isinstance(completed.data["usage"], dict), "usage is nested, not flat"
+    assert set(completed.data["usage"]) == {"input_tokens", "output_tokens", "total_tokens"}
+
+    counts = _extract_usage_counts(completed)
+    assert (counts.input_tokens, counts.output_tokens, counts.total_tokens) == (6302, 586, 6888)
+    assert counts.sources == ("usage.per_step",)
+    assert counts.recognised and not counts.partial
+    assert not counts.divergent and not counts.non_monotonic
+    # The gate must therefore stay silent on a real terminal block.
+    assert not _is_provably_usage_free(completed)
+
+
+def test_captured_run_completed_agrees_with_the_state_endpoint() -> None:
+    """The capture and the /state body of the SAME run must tell the same story."""
+    state = json.loads(_COMPLETED_STATE.read_text())
+    completed = _only(_COMPLETED_FIXTURE, "run.completed")
+    assert state["runId"] == completed.data["run_id"] == "run_3b3b1253e0974b24b594b7452bc7095d"
+    assert state["status"] == "completed"
+    assert state["resultText"] == completed.data["output"] == "DONE."
+    assert state["usage"] == {"inputTokens": 6302, "outputTokens": 586}
+
+
+def test_reasoning_available_is_not_a_text_delta() -> None:
+    """(d) The duplication trap, pinned before anyone falls into it.
+
+    ``reasoning.available`` carries the finished answer AGAIN under a top-level ``text`` key — the
+    very first carrier ``_extract_delta_text`` probes. Nothing routes it there today, because
+    dispatch is by event NAME. But a future "any block with a text field is a delta" shortcut would
+    look reasonable and would silently double every answer, and /state is where it would show.
+    """
+    reasoning = _only(_COMPLETED_FIXTURE, "reasoning.available")
+    completed = _only(_COMPLETED_FIXTURE, "run.completed")
+    # The hazard is real: the field exists, it is a string, and it duplicates the final output.
+    assert reasoning.data["text"] == completed.data["output"] == "DONE."
+    assert (
+        _extract_delta_text(reasoning) == "DONE."
+    ), "the trap is live if this block is ever routed"
+    # The deltas alone already spell the answer, so appending the reasoning text would double it.
+    deltas = [e for e in _events_of(_COMPLETED_FIXTURE) if _event_name(e) == "message.delta"]
+    assert "".join(_extract_delta_text(e) for e in deltas) == "DONE."
+
+
+@respx.mock
+async def test_relay_over_the_completed_capture_keeps_the_answer_undoubled() -> None:
+    """(d) End to end: the snapshot holds the answer ONCE, and the terminal status is recorded."""
+    uid = uuid.uuid4()
+    w = _wire(_settings(AGENT_STATE_FLUSH_INTERVAL_SECONDS=0.0))
+    _events_route(_COMPLETED_FIXTURE.read_bytes(), "run_1")
+    with _capture_service_logs() as logs:
+        out = await _collect(w.svc.stream_events(user_id=uid, run_id="run_1"))
+
+    assert out == _COMPLETED_FIXTURE.read_bytes(), "relay mutated the captured bytes"
+    assert w.snapshots.upserts[-1]["result_text"] == "DONE."
+    assert w.runs.mark_status_calls == [("run_1", "completed")]
+    assert (
+        w.snapshots.upserts[-1]["input_tokens"],
+        w.snapshots.upserts[-1]["output_tokens"],
+    ) == (6302, 586)
+    # 6302 in + 586 out at the default 1.0 / 5.0 per 1k = 6.302 + 2.93 → 10 credits.
+    assert [(c["amount"], c["idempotency_key"]) for c in w.wallet.calls] == [(10, "run_1")]
+    # A healthy real run must not trip a single one of the nine iterations of alarms.
+    for marker in (
+        "usage shape unknown",
+        "no carrier recognised",
+        "half-read",
+        "disagree",
+        "exceeds",
+        "yielded no text",
+        "billed zero",
+        "anchors have not advanced",
+    ):
+        assert [m for m in logs.messages if marker in m] == [], f"false positive: {marker}"
+
+
+@respx.mock
+async def test_relay_over_the_tool_capture_records_the_last_tool() -> None:
+    """(c) ``tool.started``/``tool.completed`` — the shape is now measured, not assumed.
+
+    Both carry ``{tool: "<name>"}`` at the top level, which is what ``_extract_tool_name`` reads;
+    ``tool.started`` also carries a ``preview`` and ``tool.completed`` a ``duration``/``error``.
+    """
+    for event_name in ("tool.started", "tool.completed"):
+        events = [e for e in _events_of(_TOOL_FIXTURE) if _event_name(e) == event_name]
+        assert len(events) == 2
+        assert [_extract_tool_name(e) for e in events] == ["write_file", "read_file"]
+
+    uid = uuid.uuid4()
+    w = _wire(_settings(AGENT_STATE_FLUSH_INTERVAL_SECONDS=0.0))
+    _events_route(_TOOL_FIXTURE.read_bytes(), "run_1")
+    await _collect(w.svc.stream_events(user_id=uid, run_id="run_1"))
+    assert w.snapshots.upserts[-1]["last_tool"] == "read_file"
+    assert w.snapshots.upserts[-1]["pending_approval"] is None
+
+
+def test_the_current_toolset_never_emitted_an_approval_request() -> None:
+    """Evidence of ABSENCE, which is why the capture is worth keeping.
+
+    A deliberate attempt to provoke ``approval.request`` (asking the agent to delete files) produced
+    no such event: the agent asked for confirmation in PROSE and completed the run. So the payload
+    shape of ``approval.request`` remains unmeasured — the relay's handling of it is still written
+    against an assumption, and this fixture is the record of why.
+    """
+    names = {_event_name(e) for e in _events_of(_NO_APPROVAL_FIXTURE)}
+    assert "approval.request" not in names
+    assert "run.completed" in names
+    completed = _only(_NO_APPROVAL_FIXTURE, "run.completed")
+    assert "confirm" in completed.data["output"].lower()
+
+
+@pytest.mark.parametrize(
+    ("path", "closed_normally"),
+    [
+        (_COMPLETED_FIXTURE, True),
+        (_TOOL_FIXTURE, True),
+        (_NO_APPROVAL_FIXTURE, True),
+        (_NO_TERMINAL_FIXTURE, False),
+        (_NO_TERMINAL_FIXTURE_2, False),
+    ],
+    ids=lambda v: getattr(v, "name", v),
+)
+def test_stream_closed_marker_discriminates_a_normal_close(
+    path: Path, closed_normally: bool
+) -> None:
+    """(e) ``: stream closed`` is present exactly when a terminal event was delivered.
+
+    NOTE ON THE PAIR USED. The task named ``q6b_1`` vs ``q6b_2`` as the positive/negative pair, but
+    on disk those two files are the SAME case — two independent runs of a jammed instance, both
+    ending at ``usage.delta``, NEITHER carrying ``run.paused`` nor the marker. Asserting a
+    difference between them would have meant inventing one. The real discriminator runs between the
+    completion captures and the jammed ones, which is what is asserted here; the second jammed
+    sample is kept precisely because it shows the phenomenon reproduced twice.
+    """
+    body = path.read_bytes()
+    assert (_STREAM_CLOSED_MARKER in body) is closed_normally
+    names = {_event_name(e) for e in _events_of(path)}
+    assert ("run.completed" in names) is closed_normally
+    # The marker is an SSE COMMENT line, so it must never parse as an event.
+    if closed_normally:
+        assert None in {_event_name(e) for e in _events_of(path)}
+
+
+def test_the_jammed_samples_are_two_runs_of_the_same_phenomenon() -> None:
+    """The negative case, reproduced: different runs, identical failure mode."""
+    a, b = _events_of(_NO_TERMINAL_FIXTURE), _events_of(_NO_TERMINAL_FIXTURE_2)
+    assert a[0].data["run_id"] != b[0].data["run_id"], "two independent runs"
+    for events in (a, b):
+        assert _event_name(events[-1]) == "usage.delta", "the stream stops on the usage anchor"
+        assert {"run.completed", "run.failed", "run.paused"}.isdisjoint(
+            {_event_name(e) for e in events}
+        )
