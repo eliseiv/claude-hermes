@@ -92,7 +92,14 @@ def _sse(name: str, data: dict[str, Any]) -> bytes:
 
 
 def _delta(text_piece: str) -> bytes:
-    return _sse("message.delta", {"text": text_piece})
+    """A ``message.delta`` in the shape the PRODUCTION image actually emits (ADR-065).
+
+    Bare-string ``delta``, no SSE ``event:`` header line — verified against the raw prod capture in
+    ``tests/fixtures/hermes_prod_run_adr065.sse``. Replaces the invented ``{"text": …}`` helper that
+    let every writer test below pass while prod ``resultText`` was identically empty (ADR-066).
+    """
+    payload = {"event": "message.delta", "run_id": "run_1", "delta": text_piece}
+    return f"data: {json.dumps(payload)}\n\n".encode()
 
 
 def _completed(input_tokens: int, output_tokens: int) -> bytes:

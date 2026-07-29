@@ -19,7 +19,7 @@
 | SQLAlchemy | **2.0.x** | async ORM (`AsyncSession`) |
 | asyncpg | **0.29.x** | async драйвер PostgreSQL |
 | Alembic | **1.13.x** | миграции |
-| Redis | **7.x** | rate limiting, idempotency-метки, policy cache |
+| Redis | **7.x** | rate limiting, idempotency-метки, policy cache, **фан-аут SSE agent-прогонов** (ring + pub/sub + lease владения подпиской, [ADR-067 §3](adr/ADR-067-agent-run-background-consumer.md) — эфемерно, источник истины остаётся Postgres) |
 | redis-py | **5.x** | async client (`redis.asyncio`) |
 
 ## Внешние SDK / интеграции

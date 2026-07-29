@@ -10,6 +10,7 @@
 - [Wallet / Ledger](../wallet-ledger/README.md) — `consume(idempotency_key=runId)` на `run.completed` ([ADR-047](../../adr/ADR-047-usage-based-billing-for-agent.md)).
 - [Audit](../audit/README.md) — события прогона/списания.
 - **Hermes-инстанс** (`POST /v1/runs`, SSE `/events`, `/approval`, `/stop`) — через `httpx.AsyncClient`.
+- **Redis** — эфемерный транспорт событий прогона ([ADR-067 §3](../../adr/ADR-067-agent-run-background-consumer.md)): ring `agent:run:{runId}:events` (replay), канал `…:pub` (live), lease `…:lease` (владение upstream-подпиской при нескольких воркерах). **Не источник истины** — потеря ключей стоит только живого стрима; биллинг, статус и `/state` живут в PostgreSQL. Клиент `redis.asyncio` уже в стеке (rate limiting).
 - **PostgreSQL** — `agent_runs` (lifecycle прогона, [ADR-064](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)) и `agent_run_snapshots` (снапшот состояния, [ADR-066](../../adr/ADR-066-agent-run-state-snapshot.md), [03-data-model.md §24–§25](../../03-data-model.md)).
 
 ## Границы

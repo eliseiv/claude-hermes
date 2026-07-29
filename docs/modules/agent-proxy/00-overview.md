@@ -5,12 +5,13 @@
 
 ## In scope
 - `POST /v1/agent/run` — запуск прогона (policy-gate → ensure_running → прокси `POST /v1/runs`).
-- `GET /v1/agent/runs/{runId}/events` — SSE-ретрансляция + биллинг на `run.completed`.
+- `GET /v1/agent/runs/{runId}/events` — поток событий прогона клиенту. С [ADR-067](../../adr/ADR-067-agent-run-background-consumer.md) — **читающий downstream** из broker'а (Redis ring + pub/sub), к Hermes не подключается; контракт для клиента не изменился.
+- **Фоновый consumer прогона** ([ADR-067](../../adr/ADR-067-agent-run-background-consumer.md)) — единственный upstream-подписчик Hermes; исполняет биллинг, снапшот и терминальный статус **независимо от наличия клиента**. Страховка — orphan-reaper.
 - `POST /v1/agent/runs/{runId}/approval` — passthrough approval.
 - `POST /v1/agent/runs/{runId}/stop` — passthrough stop (+ пометка прогона `cancelled`, [ADR-066 §3](../../adr/ADR-066-agent-run-state-snapshot.md)).
 - `POST /v1/agent/runs/{runId}/resume` — возобновление после паузы по кредитам ([ADR-064](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md)).
 - `GET /v1/agent/runs/{runId}/state` — снапшот состояния прогона из БД для восстановления UI после kill приложения ([ADR-066](../../adr/ADR-066-agent-run-state-snapshot.md)); read-only, инстанс не будит.
-- Персистенция lifecycle прогона (`agent_runs`) и снапшота (`agent_run_snapshots`) как побочный эффект SSE-relay.
+- Персистенция lifecycle прогона (`agent_runs`) и снапшота (`agent_run_snapshots`) — **побочный эффект consumer'а** ([ADR-067 §2](../../adr/ADR-067-agent-run-background-consumer.md); до 2026-07-29 — клиентского SSE-relay, что и давало нетарифицируемые прогоны, [TD-037](../../100-known-tech-debt.md)).
 - Маппинг iOS-контракта на контракт Hermes API-сервера.
 
 ## Out of scope
@@ -25,11 +26,17 @@
 - [ADR-002](../../adr/ADR-002-access-policy-state-machine.md) / [ADR-004](../../adr/ADR-004-blocked-http-200.md) — policy + blocked HTTP 200.
 - [ADR-064](../../adr/ADR-064-incremental-agent-run-billing-and-pause-resume.md) — incremental-биллинг, pause-at-zero, resume; таблица `agent_runs`.
 - [ADR-066](../../adr/ADR-066-agent-run-state-snapshot.md) — снапшот состояния прогона (`agent_run_snapshots`, read-only `/state`, retention 14 дней); `agent_runs` — безусловная lifecycle-запись.
+- [ADR-067](../../adr/ADR-067-agent-run-background-consumer.md) — фоновый consumer + broker-модель `/events`: единственная upstream-подписка наша, клиент читает downstream; закрывает утечку выручки на прогонах без подписчика ([TD-037](../../100-known-tech-debt.md), [Q-047-2](../../99-open-questions.md)). Миграции нет; форма событий не меняется, **семантика подключения — меняется** (каждое соединение начинается с реплея), требует согласования с iOS.
 
 ## Открытые вопросы
-- [Q-066-1](../../99-open-questions.md) — семантика replay Hermes при re-subscribe (буфер с начала vs только новые события); подтвердить при патче образа / E2E.
-- [Q-066-2](../../99-open-questions.md) — допущение о глобальной уникальности Hermes `run_id` при глобальном `TEXT PK` (tenancy-гвард как defense-in-depth).
+- [Q-067-1](../../99-open-questions.md) — доедут ли свежей подписке события, произведённые после дренажа буфера (от этого зависит подхват прогона после рестарта `api`).
+- [Q-067-2](../../99-open-questions.md) — лимит одновременных активных прогонов на пользователя (consumer держит ресурс и не даёт инстансу заснуть).
+- [Q-067-3](../../99-open-questions.md) — нужен ли клиенту маркер усечения replay-буфера в `/events`.
+- [Q-066-1](../../99-open-questions.md) — **Partially Closed 2026-07-29:** закрыто сырое наблюдение (вторая последовательная подписка получила 0 байт); интерпретация «дренаж буфера» — **гипотеза H1**, живость прогона в момент замера не зафиксирована → обязателен перемер с критерием живости.
+- [Q-067-4](../../99-open-questions.md) — несёт ли hydrate `GET /api/sessions/{id}/messages` usage/токены (**проверить ДО Phase 9**: меняет объём orphan-reaper'а).
+- [Q-067-5](../../99-open-questions.md) — поддерживает ли образ одновременных подписчиков на один `runId` (не измерялось).
+- ~~[Q-066-2](../../99-open-questions.md)~~ — **Closed 2026-07-29:** `run_id` = `run_` + 32 hex (~128 бит) ⇒ глобальная уникальность валидна; tenancy-гвард остаётся как defense-in-depth.
 - [Q-066-3](../../99-open-questions.md) — обратная ссылка `continuedTo` (parent→child) в `/state`; кандидат следующей ревизии контракта.
 - [Q-047-1](../../99-open-questions.md) — коэффициенты конвертации usage→кредиты / округление.
-- [Q-047-2](../../99-open-questions.md) — разрыв SSL до `run.completed`, usage больше остатка (hold/reconcile).
+- ~~[Q-047-2](../../99-open-questions.md)~~ — **Closed 2026-07-29 ([ADR-067](../../adr/ADR-067-agent-run-background-consumer.md)):** прогон без подписчика тарифицирует фоновый consumer; прежняя митигация «повторная подписка довыполнит debit» была неверной.
 - [Q-047-3](../../99-open-questions.md) — BYOK для агентного пути.

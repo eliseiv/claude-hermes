@@ -152,7 +152,17 @@ def _events_route(body: bytes, run_id: str = "run_1", status: int = 200) -> Any:
 
 
 def _delta(text: str) -> bytes:
-    return _sse("message.delta", json.dumps({"text": text}))
+    """A ``message.delta`` in the shape the PRODUCTION image actually emits (ADR-065).
+
+    Bare-string ``delta``, no SSE ``event:`` header line — verified against the raw prod capture in
+    ``tests/fixtures/hermes_prod_run_adr065.sse`` (see
+    ``tests/unit/test_agent_sse_delta_contract_adr065.py``). It deliberately replaces the previous
+    ``{"text": …}`` helper, which was invented alongside the parser: with that shape every writer
+    test below stayed green while ``resultText`` was identically empty on prod (ADR-066 defect).
+    The nested ``{"delta": {"text": …}}`` build is covered by the contract module's shape matrix.
+    """
+    payload = {"event": "message.delta", "run_id": "run_1", "delta": text}
+    return f"data: {json.dumps(payload)}\n\n".encode()
 
 
 def _completed(input_tokens: int, output_tokens: int) -> bytes:
