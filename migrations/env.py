@@ -15,7 +15,20 @@ from app.models import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # ⚠️ disable_existing_loggers=False is LOAD-BEARING, not tidiness (TD-049). The default is
+    # True, i.e. fileConfig DISABLES every logger that already exists — and `tests/conftest.py`
+    # runs `command.upgrade(cfg, "head")` IN THE SAME PROCESS as the suite. With the default, every
+    # application logger imported before that point ended up with `disabled = True`, and
+    # `Logger.handle()` short-circuits BEFORE any handler including the root one. Measured:
+    # `disabled=True`, 0 records reaching a root handler; with this argument, `disabled=False` and
+    # the record arrives. The consequence was not "one test misses a log line" but a property of the
+    # ENVIRONMENT: any in-process assertion on application logs was UNABLE TO FAIL, which reads as
+    # coverage while proving nothing (06-testing-strategy.md §Методические выводы, вывод 4).
+    # Prod was not affected — `main.py`/`deps.py` never run migrations — but the defect was silent
+    # by construction: were migrations ever run at application startup, every previously imported
+    # logger would fall silent in the prod process, and "there are no logs" has no observable
+    # signature. The Alembic log FORMAT this call exists for is unaffected.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
