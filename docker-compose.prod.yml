@@ -65,9 +65,74 @@ services:
   redis:
     image: redis:7.4-bookworm
     restart: unless-stopped
-    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
-    volumes:
-      - redisdata:/data
+    # ADR-067 §3.5 / 05-security.md §"User content в Redis". Every flag below is REQUIRED before the
+    # agent-run broker contour (AGENT_RUN_CONSUMER_ENABLED) may be switched on: the ring
+    # `agent:run:{runId}:events` holds RAW SSE BLOCKS, i.e. USER CONTENT — the model's text, tool
+    # call ARGUMENTS and RESULTS, approval previews. That class is WIDER than ADR-066's
+    # `agent_run_snapshots.result_text` (answer text only).
+    #
+    # (1) --save "" --appendonly no  -> NO PERSISTENCE AT ALL.
+    #     Previously `--save 60 1` + the `redisdata` volume, i.e. RDB was ON. A key that lands in
+    #     dump.rdb lives in the file until the snapshot is overwritten, and copies of the volume in
+    #     backups outlive even that — so the ring's 1h TTL is a bound IN MEMORY, never on disk.
+    #     ⚠️ Durability of Redis is not required by ANY contour of this app — verified in code, not
+    #     assumed: the ONLY writers are (a) rate_limit.py sliding windows (sorted sets with
+    #     EXPIRE == rate_limit_window_seconds, 60s by default) and (b) agent_proxy/transport.py
+    #     ring/channel/lease/seq/epoch (ephemeral by construction, TTL 1h). Idempotency is NOT in
+    #     Redis at all — it is enforced by UNIQUE INDEXES in PostgreSQL (ADR-005). Billing, run
+    #     status and GET /state likewise live in PostgreSQL (ADR-066).
+    #     PRICE OF THIS CHOICE, accepted: a Redis restart resets rate-limit counters, so each
+    #     bucket starts from zero for at most one 60s window. Nothing else is lost.
+    #     The `redisdata` volume mount is REMOVED on purpose: with saving off it can never be
+    #     refreshed, so a stale dump.rdb would just be RELOADED at every start and kept forever —
+    #     exactly the disk exposure this fix exists to remove. (The top-level `redisdata:`
+    #     declaration is kept so the avorelio overlay's inheritance note stays true; delete the
+    #     leftover volume once, per docs/07-deployment.md §Redis.)
+    #
+    # (2) --maxmemory (explicit) + --maxmemory-policy noeviction.
+    #     An EVICTING policy is inadmissible: under ring pressure Redis would evict RATE-LIMIT and
+    #     (were they here) protective keys — a streaming degradation would knock out a security
+    #     contour. With `noeviction` an overflow only makes the RING WRITE fail; that write is
+    #     best-effort (logged, consumer never interrupted), so only the LIVE stream degrades.
+    #     Budget arithmetic and how to resize: docs/07-deployment.md §Redis.
+    #
+    # (3) --client-output-buffer-limit pubsub 8mb 2mb 60  (Q-067-19, was an UNPINNED server default).
+    #     Bounds the per-SUBSCRIBER output buffer. One Redis subscriber == one open client /events
+    #     stream (AgentRunBroker.stream() subscribes per stream), and a client that stops draining
+    #     fills its asyncio queue (AGENT_RUN_SUBSCRIBER_QUEUE_MAX) until the reader stops reading
+    #     from Redis — at which point this limit decides the OBSERVABLE outcome: DISCONNECT of that
+    #     subscriber (chosen) instead of an unbounded buffer. Hard limit == 8mb == one run's whole
+    #     ring (AGENT_RUN_EVENT_BUFFER_MAX_BYTES): buffering more than the entire replay window is
+    #     useless, because a subscriber further behind than the ring holds cannot be served
+    #     losslessly either way. ⚠️ A FINITE limit is what protects (2): unbounded pubsub buffers
+    #     would eat the maxmemory budget and, under `noeviction`, make ring writes fail for ALL
+    #     runs — turning one slow client into a global stream outage.
+    #     SOFT WINDOW 180s, NOT the 60s default, and the number is reconciled with our own budget:
+    #     while the reader waits for queue room the channel is NOT drained, and that wait is
+    #     bounded by AGENT_RUN_SUBSCRIBER_DRAIN_SECONDS (120s, progress-based). A 60s soft window
+    #     would make REDIS the deciding authority in the designed path — every client backlogged
+    #     over the 2mb soft mark would be killed at 60s and our documented 120s budget would be
+    #     unreachable. 180s keeps OUR progress-based timeout deciding and leaves Redis as the OUTER
+    #     backstop; per-subscriber memory stays bounded by the 8mb HARD limit either way.
+    #     Rationale, budget arithmetic and the Q-067-19 verdict: docs/07-deployment.md §Redis.
+    command:
+      - "redis-server"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+      - "--maxmemory"
+      - "${REDIS_MAXMEMORY:-512mb}"
+      - "--maxmemory-policy"
+      - "noeviction"
+      # Four separate argv elements, matching the `--save` convention above. MEASURED on the real
+      # image (redis:7.4.10), not assumed: this whole command yields `pubsub 8388608 2097152 180`
+      # in CONFIG GET. (The single-string form `"pubsub 8mb 2mb 180"` is accepted too — equivalent.)
+      - "--client-output-buffer-limit"
+      - "pubsub"
+      - "8mb"
+      - "2mb"
+      - "180"
     # No host port published and NOT on `web`: redis is reachable only on the internal
     # `default` network by service name (ADR-017 req. 4).
     networks:
@@ -129,6 +194,20 @@ services:
     # drops AppleRootCA-G3.cer into /opt/avelyra/certs/appstore, flips to real JWS verification.
     environment:
       APPSTORE_ROOT_CERT_DIR: /etc/appstore-certs
+      # --- ADR-067 kill-switch, PINNED FAIL-CLOSED AT THE DEPLOY LAYER (Phase 9 rollout) ---------
+      # The CODE default is `true` (config.py: agent_run_consumer_enabled), `.env.prod.example` has
+      # the line COMMENTED OUT, and no compose/workflow/script used to set it. Net effect of a
+      # deploy "as is" was therefore to TURN THE WHOLE CONTOUR ON — background consumer, downstream
+      # broker and orphan sweep — while the Redis preconditions of ADR-067 §3.5 were still unmet.
+      # A kill-switch whose effective value depends on whether a hand-provisioned server `.env`
+      # happens to carry a line is not a switch; it is a coin flip. Hence:
+      #   * default here is `false` — an UNSET variable now yields the contour OFF, not ON;
+      #   * a value in the server `.env` still wins (compose interpolates ${...} from --env-file),
+      #     so enabling it stays a one-line `.env` change + recreate;
+      #   * the effective value becomes READ-ONLY OBSERVABLE without shell access to the container:
+      #     `docker compose ... config | grep AGENT_RUN_CONSUMER_ENABLED`.
+      # Flip procedure and current rollout target: docs/07-deployment.md §Phase 9.
+      AGENT_RUN_CONSUMER_ENABLED: ${AGENT_RUN_CONSUMER_ENABLED:-false}
     # Embedded auth-issuer (ADR-018 §7) signs/verifies RS256 JWTs and reads its key PEMs
     # from FILE PATHS (prod-recommended over `\n`-escaped env strings):
     #   JWT_PRIVATE_KEY_PATH=/app/.secrets/jwt_private.pem  (SECRET — never in the image)
