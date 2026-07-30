@@ -45,12 +45,14 @@ def redis_url() -> Iterator[str]:
 
 
 @pytest.fixture
-async def broker_factory(redis_url: str) -> AsyncIterator[Any]:
+async def broker_factory(
+    redis_url: str, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> AsyncIterator[Any]:
     """A broker on a fresh logical DB, wired to the real runs repository."""
     clients: list[redis_asyncio.Redis] = []
     counter = {"n": 2}
 
-    def _make(session: AsyncSession, **overrides: Any) -> tuple[Any, AgentRunEventBus]:
+    def _make(_session: AsyncSession, **overrides: Any) -> tuple[Any, AgentRunEventBus]:
         db = counter["n"]
         counter["n"] += 1
         base: dict[str, Any] = {
@@ -59,6 +61,9 @@ async def broker_factory(redis_url: str) -> AsyncIterator[Any]:
             "AGENT_RUN_EVENT_BUFFER_TTL_SECONDS": 60,
             # Small so the closing rules are reachable inside a test.
             "AGENT_RUN_DOWNSTREAM_IDLE_TIMEOUT_SECONDS": 1,
+            # The supervisor's period, split out of the lease TTL. Short so a tick lands
+            # inside the scenes that need one; at the 10s default they would get none.
+            "AGENT_RUN_SUBSCRIBER_PROBE_SECONDS": 0.5,
             "AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS": 2,
             "AGENT_RUN_CONSUMER_LEASE_RENEW_SECONDS": 1,
             "AGENT_RUN_ORPHAN_REDIS_GRACE_SECONDS": 2,
@@ -71,14 +76,24 @@ async def broker_factory(redis_url: str) -> AsyncIterator[Any]:
         clients.append(client)
         bus = AgentRunEventBus(client, settings)
 
-        # ⚠️ A FACTORY of short-lived repositories, never one bound to this session. The broker
-        # probes `agent_runs` for the whole life of an SSE stream (up to two hours), so a
-        # request-scoped session here would hold a pooled connection — and an ACCESS SHARE lock —
-        # for that entire time. About fifteen concurrent streams exhausted a worker's pool, after
-        # which EVERY endpoint of that worker failed, not just this feature.
+        # ⚠️ A REAL new session per probe — opened here, closed here. The broker probes
+        # `agent_runs` for the whole life of an SSE stream (up to two hours), so a session bound to
+        # the request would hold a pooled connection, and an ACCESS SHARE lock, for that entire
+        # time: about fifteen concurrent streams exhausted a worker's pool, after which EVERY
+        # endpoint of that worker failed and not just this feature.
+        #
+        # ⛔ It must NOT close over the test's own `_session`. An earlier version of this fixture
+        # did exactly that while its comment claimed the opposite, so every supervisor probe ran on
+        # the connection the test itself was using — and asyncpg answers a second concurrent
+        # operation on one connection with `InterfaceError: another operation is in progress`.
+        # It stayed hidden
+        # while the probe period was borrowed from the 30s lease TTL; at 0.5s the overlap became
+        # ordinary. The knob made it observable, it did not create it. A fixture whose comment and
+        # code disagree is the same defect class this contour keeps finding in production code.
         @asynccontextmanager
         async def _runs() -> AsyncIterator[AgentRunsRepository]:
-            yield AgentRunsRepository(session)
+            async with db_sessionmaker() as probe_session:
+                yield AgentRunsRepository(probe_session)
 
         broker = AgentRunBroker(bus=bus, runs=_runs, settings=settings)
         return broker, bus

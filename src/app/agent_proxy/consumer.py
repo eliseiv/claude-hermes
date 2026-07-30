@@ -10,16 +10,23 @@ the domain rules — snapshot, terminal status, billing — through
 
 Two properties of the Hermes image shape everything here, both measured, neither negotiable:
 
-* **The stream is ONE-SHOT.** A second subscription to the same ``runId`` returns nothing at all —
-  no replay, no live events — 35s / 0 events
-  (``tests/fixtures/hermes_prod_resubscribe_empty_adr067.curl.txt``).
-  So exactly one subscriber may exist, it must be us, and it must be established BEFORE the client
-  is told the run started.
+* **The stream is ONE-SHOT.** A second subscription to the same ``runId`` receives nothing at all —
+  no replay, no live events. The artifact says so in one line, and that line's whole content is:
+  a curl timeout after 35005 ms **with 0 bytes received**
+  (``tests/fixtures/hermes_prod_resubscribe_empty_adr067.curl.txt``). So exactly one subscriber may
+  exist, it must be us, and it must be established BEFORE the client is told the run started.
 * **A subscription that fails is spent anyway.** A connection dropped BEFORE the response headers
-  (at 0.25s, with ``time_starttransfer`` 0.17-0.18s) still consumed the stream. There is therefore
-  no safe window for a retry, and retrying is forbidden UNCONDITIONALLY (§6.4.1) — not "usually",
-  and not to be confused with the connect-only retry of ``POST /v1/runs``, which ADR-062 keeps
-  because that endpoint is a different, non-consuming operation.
+  still consumed the stream, so there is no safe window for a retry: retrying is forbidden
+  UNCONDITIONALLY (§6.4.1) — not "usually", and not to be confused with the connect-only retry of
+  ``POST /v1/runs``, which ADR-062 keeps because that endpoint is a different, non-consuming
+  operation.
+
+  ⚠️ **Provenance, kept apart from the artifact above ON PURPOSE.** The timings behind this bullet —
+  an abort at 0.25 s against a ``time_starttransfer`` of 0.17-0.18 s — come from the Q-067-13
+  measurement write-up, NOT from that curl file: the file holds a single timeout line and no timings
+  whatsoever. They were once written as though the file contained them, which is exactly how a
+  description outlives the thing it described. Cite the question for the numbers and the file only
+  for what it actually says.
 
 The supervisor half (lease renewal, heartbeat, ``MAX_DURATION``, stall detection) is a separate
 task in the same ``TaskGroup``; this module owns the beacon it reads but never renews a lease or

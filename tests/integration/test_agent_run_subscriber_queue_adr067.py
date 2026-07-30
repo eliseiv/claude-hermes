@@ -55,9 +55,13 @@ _EPOCH = "gen-queue01"
 _QUEUE_MAX = 10
 _RING_MAX = 100
 _DRAIN_SECONDS = 3.0
-# The supervisor ticks on this knob, so a drain that must outlive a tick needs it short. It cannot
-# be 1: the config invariant requires LEASE_RENEW < LEASE_TTL, and renew has its own floor of 1.
-_SUPERVISOR_TICK = 2
+# The supervisor's own period (AGENT_RUN_SUBSCRIBER_PROBE_SECONDS since the knob was split out of
+# the lease TTL). ⚠️ Short ON PURPOSE, and not only to keep tests fast: several scenes here need a
+# supervisor tick to land INSIDE a hand-over, and at the 10s default they would get no tick at all
+# and pass while exercising nothing.
+_SUPERVISOR_TICK = 0.5
+# The broker's own bound on a single periodic probe (_PERIODIC_PROBE_TIMEOUT_SECONDS).
+_PROBE_DEADLINE = 5.0
 
 
 @pytest.fixture(scope="module")
@@ -103,11 +107,13 @@ class CountingPubSub:
 
 
 @pytest.fixture
-async def broker_factory(redis_url: str) -> AsyncIterator[Any]:
+async def broker_factory(
+    redis_url: str, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> AsyncIterator[Any]:
     clients: list[redis_asyncio.Redis] = []
     counter = {"n": 2}
 
-    def _make(session: AsyncSession, **overrides: Any) -> tuple[Any, AgentRunEventBus, Settings]:
+    def _make(_session: AsyncSession, **overrides: Any) -> tuple[Any, AgentRunEventBus, Settings]:
         db = counter["n"]
         counter["n"] += 1
         base: dict[str, Any] = {
@@ -118,7 +124,8 @@ async def broker_factory(redis_url: str) -> AsyncIterator[Any]:
             "AGENT_RUN_SUBSCRIBER_QUEUE_MAX": _QUEUE_MAX,
             "AGENT_RUN_SUBSCRIBER_DRAIN_SECONDS": _DRAIN_SECONDS,
             "AGENT_RUN_DOWNSTREAM_IDLE_TIMEOUT_SECONDS": 1,
-            "AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS": _SUPERVISOR_TICK,
+            "AGENT_RUN_SUBSCRIBER_PROBE_SECONDS": _SUPERVISOR_TICK,
+            "AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS": 2,
             "AGENT_RUN_CONSUMER_LEASE_RENEW_SECONDS": 1,
             "AGENT_RUN_ORPHAN_REDIS_GRACE_SECONDS": 2,
         }
@@ -130,14 +137,24 @@ async def broker_factory(redis_url: str) -> AsyncIterator[Any]:
         clients.append(client)
         bus = AgentRunEventBus(client, settings)
 
-        # ⚠️ A FACTORY of short-lived repositories, never one bound to this session. The broker
-        # probes `agent_runs` for the whole life of an SSE stream (up to two hours), so a
-        # request-scoped session here would hold a pooled connection — and an ACCESS SHARE lock —
-        # for that entire time. About fifteen concurrent streams exhausted a worker's pool, after
-        # which EVERY endpoint of that worker failed, not just this feature.
+        # ⚠️ A REAL new session per probe — opened here, closed here. The broker probes
+        # `agent_runs` for the whole life of an SSE stream (up to two hours), so a session bound to
+        # the request would hold a pooled connection, and an ACCESS SHARE lock, for that entire
+        # time: about fifteen concurrent streams exhausted a worker's pool, after which EVERY
+        # endpoint of that worker failed and not just this feature.
+        #
+        # ⛔ It must NOT close over the test's own `_session`. An earlier version of this fixture
+        # did exactly that while its comment claimed the opposite, so every supervisor probe ran on
+        # the connection the test itself was using — and asyncpg answers a second concurrent
+        # operation on one connection with `InterfaceError: another operation is in progress`.
+        # It stayed hidden
+        # while the probe period was borrowed from the 30s lease TTL; at 0.5s the overlap became
+        # ordinary. The knob made it observable, it did not create it. A fixture whose comment and
+        # code disagree is the same defect class this contour keeps finding in production code.
         @asynccontextmanager
         async def _runs() -> AsyncIterator[AgentRunsRepository]:
-            yield AgentRunsRepository(session)
+            async with db_sessionmaker() as probe_session:
+                yield AgentRunsRepository(probe_session)
 
         broker = AgentRunBroker(bus=bus, runs=_runs, settings=settings)
         return broker, bus, settings
@@ -1534,15 +1551,12 @@ async def test_an_unparseable_channel_message_is_logged_and_announced_on_the_nex
             await asyncio.sleep(0.05)
 
         channel = AgentRunEventBus.channel(run_id)
-        # ⚠️ THE LOGGER MUST BE RE-ENABLED FIRST, and the reason is worth knowing (Q-067-21).
-        # ``migrations/env.py`` calls ``fileConfig(...)``, whose default is
-        # ``disable_existing_loggers=True``, and ``tests/conftest.py`` runs alembic IN-PROCESS at
-        # session setup — so every app logger imported before that point comes out with
-        # ``disabled = True``. A disabled logger short-circuits inside ``Logger.handle``, so NO
-        # handler anywhere sees the record: not ``caplog``, not one attached to this logger, not one
-        # on the root. That is why two earlier attempts captured nothing while the code path was
-        # demonstrably running, and it applies to every in-process log assertion in this suite.
-        # Production is unaffected: nothing runs migrations in the API process.
+        # ⚠️ NO re-enable of the logger any more. Until TD-049 (``migrations/env.py`` calling
+        # ``fileConfig`` with the default ``disable_existing_loggers=True``, run in-process by
+        # ``conftest``) every app logger came out with ``disabled = True``, which short-circuits
+        # inside ``Logger.handle`` — so NO handler anywhere saw a record and this assertion could
+        # not fail. It is now a real assertion; the probe that proves it is deleting the logging
+        # line in ``broker.py`` and watching this test go red.
         broker_logger = logging.getLogger("app.agent_proxy.broker")
         captured: list[str] = []
 
@@ -1551,10 +1565,6 @@ async def test_an_unparseable_channel_message_is_logged_and_announced_on_the_nex
                 captured.append(record.getMessage())
 
         handler = _Collect(level=logging.NOTSET)
-        was_disabled = broker_logger.disabled
-        previous_level = broker_logger.level
-        broker_logger.disabled = False
-        broker_logger.setLevel(logging.WARNING)
         broker_logger.addHandler(handler)
         try:
             # A message that cannot be parsed — its seq is unknowable, so no marker can name it.
@@ -1570,8 +1580,6 @@ async def test_an_unparseable_channel_message_is_logged_and_announced_on_the_nex
                 await asyncio.sleep(0.05)
         finally:
             broker_logger.removeHandler(handler)
-            broker_logger.setLevel(previous_level)
-            broker_logger.disabled = was_disabled
         blocks = list(reading.blocks)
         await reading.stop()
 
@@ -1771,13 +1779,19 @@ async def test_open_streams_do_not_accumulate_pool_connections(
     async with db_sessionmaker() as session:
         broker, bus, _settings = broker_factory(session)
 
-        # Override the fixture's factory with the production one: a real session per probe.
-        @asynccontextmanager
-        async def _short_lived() -> AsyncIterator[AgentRunsRepository]:
-            async with sessions.track(), db_sessionmaker() as fresh:
-                yield AgentRunsRepository(fresh)
+        # ⚠️ The FIXTURE's own factory is measured, not a local one. Until the fixture was fixed it
+        # closed over the test's session, so this test had to install its own production-shaped
+        # factory to measure anything at all — and that meant it measured a factory no other test
+        # used. Now the fixture opens a real session per probe, so wrapping it is enough and what is
+        # measured is the path every test in this module exercises.
+        original_runs = broker._runs
 
-        broker._runs = _short_lived  # type: ignore[assignment]
+        @asynccontextmanager
+        async def _timed() -> AsyncIterator[AgentRunsRepository]:
+            async with sessions.track(), original_runs() as repo:
+                yield repo
+
+        broker._runs = _timed  # type: ignore[assignment]
 
         try:
             for run_id in run_ids:
@@ -1816,4 +1830,65 @@ async def test_open_streams_do_not_accumulate_pool_connections(
         "which EVERY endpoint "
         "on that worker fails — and an ACCESS SHARE lock on agent_runs is held for the whole two "
         "hours a stream may last."
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_probe_that_hangs_is_abandoned_on_its_deadline_and_retried(
+    db_sessionmaker: async_sessionmaker[AsyncSession], broker_factory: Any
+) -> None:
+    """The deadline on ONE probe, measured — the reason the probe period became its own knob.
+
+    ⚠️ This test was impossible to write cleanly until ``AGENT_RUN_SUBSCRIBER_PROBE_SECONDS``
+    existed. While the period was borrowed from ``AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS`` the
+    smallest usable tick was 2s (the config invariant needs ``LEASE_RENEW < LEASE_TTL``
+    and renew has a floor of 1),
+    which put the two outcomes at 7s and 10s — too close to separate without inviting a flake.
+
+    The observable is CLOSE LATENCY, because that is the only thing the deadline changes:
+
+    * with it — the wedged probe is abandoned at ``_PERIODIC_PROBE_TIMEOUT_SECONDS`` (5s), the next
+      tick comes 0.5s later, sees the terminal status and closes: ~5.5s;
+    * without it — the supervisor waits out the whole 8s block before it can act: ~8.5s.
+
+    The bound sits between them, so it discriminates without pinning a duration.
+    """
+    run_id = f"run_{uuid.uuid4().hex[:8]}"
+    await _seed_run(db_sessionmaker, run_id, status="running")
+
+    async with db_sessionmaker() as session:
+        broker, bus, _settings = broker_factory(session)
+        await _hold_lease(bus, run_id)
+        await _publish_burst(bus, run_id, 3)
+
+        calls = {"n": 0}
+        inner = broker._is_terminal
+
+        async def _wedging_terminal(rid: str) -> bool:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # The reader's own check at open: the run is genuinely not terminal yet.
+                return await inner(rid)
+            if calls["n"] == 2:
+                # ONE wedged probe, longer than its deadline. Whether the supervisor waits it out or
+                # abandons it is the entire question.
+                await asyncio.sleep(8.0)
+            return True
+
+        broker._is_terminal = _wedging_terminal  # type: ignore[method-assign]
+
+        started = time.monotonic()
+        reading = Reading(broker.stream(run_id=run_id, cursor=Cursor()), delay=0.0).start()
+        ended = await reading.wait_until_ended(budget=20.0)
+        elapsed = time.monotonic() - started
+        await reading.stop()
+
+    assert calls["n"] >= 2, "the supervisor never reached a probe; nothing was exercised"
+    assert ended, "the stream never closed at all"
+    assert len(reading.blocks) == 3, f"expected the 3 queued blocks, got {len(reading.blocks)}"
+    assert elapsed < 7.0, (
+        f"the stream closed after {elapsed:.1f}s. A probe hanging for 8s must be abandoned on its "
+        f"{_PROBE_DEADLINE}s deadline and retried on the next tick (~5.5s total); waiting it out "
+        "means one unresponsive query to Postgres or Redis sets the closing latency of the stream, "
+        "and neither has a statement timeout in this deployment."
     )

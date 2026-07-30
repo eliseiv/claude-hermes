@@ -674,6 +674,28 @@ class Settings(BaseSettings):
     agent_run_subscriber_drain_seconds: float = Field(
         default=120.0, alias="AGENT_RUN_SUBSCRIBER_DRAIN_SECONDS"
     )
+    # How often the /events supervisor probes the close rules 4 and 5 (ADR-067 §3.2.2, TD-050).
+    #
+    # ⛔ Its OWN knob, and the reason is the defect this whole section was cleaning up: the period
+    # used to be read from ``AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS`` — a property substituted by a
+    # number that happened to be nearby. The two are unrelated: the lease TTL says how long a
+    # consumer's claim on an upstream subscription survives without renewal, this says how quickly a
+    # CLIENT stream notices that its run has ended. Tuning the former silently moved the latter, and
+    # nobody adjusting a lease expects to have changed downstream closing latency.
+    #
+    # Default 10 s, chosen on two counts. It is the worst-case delay before a client is told the run
+    # is over when no terminal event ever reaches Redis (the consumer died, the ring expired, Redis
+    # was flushed) — the old effective value was 30 s, and a third of that is a plainly better
+    # answer to "why is my stream still open". And it is cheap: one status query per open stream per
+    # period, so at the ~15 concurrent streams a worker's pool allows it is ~1.5 queries/s per
+    # worker, each on its own short session.
+    #
+    # ⚠️ It also sits comfortably above the probe's own 5 s deadline
+    # (``broker._PERIODIC_PROBE_TIMEOUT_SECONDS``), so a wedged probe cannot turn the loop into
+    # back-to-back probes — see the note in the validator for why that relation is NOT fail-fast.
+    agent_run_subscriber_probe_seconds: float = Field(
+        default=10.0, alias="AGENT_RUN_SUBSCRIBER_PROBE_SECONDS"
+    )
 
     # --- Observability ---
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -791,6 +813,18 @@ class Settings(BaseSettings):
                 "AGENT_RUN_SHUTDOWN_DRAIN_SECONDS must be > 0 "
                 f"(got {self.agent_run_shutdown_drain_seconds}) — a zero budget closes the DB pool "
                 "under the §6.4 shutdown procedures of live consumers (ADR-067 §6.1.1)"
+            )
+        # ⚠️ Only ``> 0`` is enforced, deliberately. The relation "probe deadline < period" holds for
+        # the DEFAULT (5 s against 10 s) and is the right shape for production, but making it
+        # fail-fast would forbid the cheap test scene this knob exists for — a 0.5 s period against
+        # the 5 s deadline, which makes the deadline observable as 5.5 s versus 8.5 s instead
+        # of as a 7-versus-10 s flake. Enforcing it would also mean enforcing a relation to a value
+        # that is a module constant rather than a setting, which the validator cannot see.
+        if self.agent_run_subscriber_probe_seconds <= 0:
+            raise ValueError(
+                "AGENT_RUN_SUBSCRIBER_PROBE_SECONDS must be > 0 "
+                f"(got {self.agent_run_subscriber_probe_seconds}) — a zero period would spin the "
+                "supervisor's probes into a hot loop against Postgres and Redis (ADR-067 §3.2.2)"
             )
         if self.agent_run_subscriber_drain_seconds <= 0:
             raise ValueError(

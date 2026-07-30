@@ -524,14 +524,17 @@ class AgentRunBroker:
         if ended_normally:
             # ⛔ ORDER: the flag first, the sentinel second — and keep it, though NOT for the reason
             # first written here. The old argument ("a writer waking in between decides with no
-            # observable sign") does not apply: the writer decides on the FLAG, and while it is
-            # unset it simply keeps draining and waiting, which is what it would do anyway. The real
-            # value of this order is defence in depth for the reserved slot. If that reserve were
-            # ever broken, this order degrades the failure from "the terminal event is thrown away
-            # with the queue" into "the stream closes a little later than it could": the flag is
-            # set, so the writer drains and only its own deadline ends it. Reversed, a lost sentinel
-            # would leave the writer with no flag either — the abnormal path, abandoning what is
-            # already owed.
+            # observable sign") was withdrawn by the ADR, and is wrong twice over: there is no
+            # ``await`` between these two statements, so no writer can run in between at all, and
+            # even if one could, it decides on the FLAG — while that is unset it simply keeps
+            # draining and waiting, which is what it would do anyway.
+            #
+            # The real value of this order is defence in depth for the reserved slot. If the
+            # reserve were ever broken, this order degrades the failure from "the terminal event
+            # is thrown away with the queue" into "the stream closes later than it could": the
+            # flag is set, so the writer drains and only its own deadline ends it. Reversed, a
+            # lost sentinel would leave the writer with no flag either — the abnormal path,
+            # abandoning what is already owed.
             normal_end.set()
             # Always fits: ordinary blocks are admitted only below the ceiling, so the last slot of
             # the ``ceiling + 1`` capacity is free by rule.
@@ -803,7 +806,11 @@ class AgentRunBroker:
         the stream: the deadline is what keeps this task from wedging, and its cost is a late
         closure, not a lost delivery.
         """
-        interval = self._settings.agent_run_consumer_lease_ttl_seconds
+        # ⛔ Its OWN setting, not the lease TTL it used to borrow (TD-050): how long a consumer's
+        # claim survives without renewal and how quickly a CLIENT stream notices its run ended are
+        # unrelated quantities, and while they shared a knob, tuning the lease silently changed
+        # downstream closing latency.
+        interval = self._settings.agent_run_subscriber_probe_seconds
         idle_limit = self._settings.agent_run_downstream_idle_timeout_seconds
         while True:
             await asyncio.sleep(interval)
