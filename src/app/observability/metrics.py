@@ -88,6 +88,54 @@ llm_upstream_errors_total = Counter(
     "Count of LLM upstream errors by provider, status_code and error_type.",
     ["provider", "status_code", "error_type"],
 )
+# Agent-run launch-path upstream timeouts (ADR-067 §5.1 tripwire, Q-067-17). ADR-067 §5.1 (forcibly
+# unwedging a user's Hermes instance) was withdrawn from v1 because its premise was disproved — and
+# withdrawn AGAINST THIS SAFETY NET: if instance muteness is ever real, it surfaces here as
+# 502 upstream_timeout, and this counter is the only thing that can say so. Nothing observed it
+# before (anthropic_upstream_errors_total is a different contour).
+#
+# ⚠️ phase ∈ {connect, readiness, launch, hydrate, budget} — a BOUNDED enum, and deliberately NOT
+# labelled by userId even though clustering by user is exactly what the tripwire is looking for:
+# a user id in a label is unbounded cardinality plus user content in a metric, against this file's
+# standing convention. Signal and diagnosis are therefore split — the counter says WHETHER anything
+# is wrong, the `agent_run_launch_upstream_timeout` log event (userId, runId, duration) says WHO and
+# WHICH RUN. Read the counter first, then the logs.
+agent_run_launch_upstream_timeout_total = Counter(
+    "agent_run_launch_upstream_timeout_total",
+    "Count of agent-run launch-path upstream timeouts by phase.",
+    ["phase"],
+)
+# Orphan runs finalized by the ADR-067 §5 sweep, by the BASIS of their billing (§5.2):
+# snapshot (a non-zero cumulative was observed) | zero_usage (a row exists, usage was zero) |
+# no_snapshot (no row at all — usage was never observed). Bounded enum labels only; the runId and
+# userId of each finalization live in the agent_run_orphan_finalized audit record, not here.
+#
+# The three are NOT interchangeable: a non-zero rate of `no_snapshot` means consumers are failing to
+# start at all, which is a revenue incident to be read on its own and never averaged into the
+# healthy `snapshot` case.
+agent_run_orphan_finalized_total = Counter(
+    "agent_run_orphan_finalized_total",
+    "Count of orphan agent runs finalized by the sweep, by billing basis.",
+    ["basis"],
+)
+
+
+# Concurrency of the agent-run contour (ADR-067, Q-067-2 PRECONDITION). Three ceilings are shared by
+# every simultaneous run and stream — DB pool connections, Redis subscriptions and ring memory — and
+# until these two gauges existed NONE of them was observable before it was hit: `/events` streams
+# were not counted anywhere, and the live-consumer count existed as a property nothing ever read.
+#
+# ⚠️ They are the precondition of Q-067-2, not its answer: choosing a cap is meaningless while the
+# quantity it would cap is unmeasured. No labels at all — a run or user id here would be unbounded
+# cardinality and user content in a metric, against this file's standing convention.
+agent_run_consumers_active = Gauge(
+    "agent_run_consumers_active",
+    "Background agent-run consumers currently running in this worker.",
+)
+agent_run_event_streams_active = Gauge(
+    "agent_run_event_streams_active",
+    "Client /events streams currently open in this worker.",
+)
 
 
 def render_metrics() -> tuple[bytes, str]:

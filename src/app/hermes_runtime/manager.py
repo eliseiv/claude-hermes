@@ -380,6 +380,19 @@ class HermesInstanceManager:
         # Same rule as the cold-start gate: the wake ended on a deadline with the instance silent.
         raise UpstreamTimeoutError("hermes instance did not become ready in time")
 
+    async def touch_active(self, user_id: uuid.UUID) -> None:
+        """Bump the instance's ``last_active_at`` without resolving or waking anything.
+
+        For the background consumer's heartbeat (ADR-067 §6.1): a run being consumed keeps its
+        instance out of the idle reaper's window even when the client is long gone. Deliberately
+        NOT ``ensure_running`` — that would provision or wake a container as a side effect of a
+        liveness stamp, which is the opposite of what a heartbeat may do. A missing row updates
+        zero rows and is not an error (the instance was deprovisioned while a run was in flight).
+        Commits: the caller is a background task with no request-scoped teardown.
+        """
+        await self._registry.touch_active(user_id)
+        await self._session.commit()
+
     async def stop_idle(self, threshold_seconds: int) -> int:
         """Stop running instances idle longer than the threshold (reaper). Returns the count.
 

@@ -175,6 +175,55 @@ class AgentRunSnapshotsRepository:
             return SnapshotUpsertResult(applied=False, stored_text_length=0)
         return SnapshotUpsertResult(applied=True, stored_text_length=int(row[0]))
 
+    async def touch_consumer_heartbeat(self, run_id: str) -> int:
+        """Stamp ``consumer_heartbeat_at = now()`` — ONE column, nothing else (ADR-067 §4).
+
+        ⚠️ The snapshot upsert MUST NOT be used for this, without exception. That statement writes
+        ``updated_at = EXCLUDED.updated_at`` unconditionally, and a heartbeat is written precisely
+        when the run state did NOT change (a long tool call, a run with no ``usage.delta``). Using
+        it would move the client's staleness detector (``/state.updatedAt``, ADR-066 §5) on a write
+        that carries no new state — telling the client the run just progressed when it did not.
+        The symmetric invariant of the retention sweep ("the sweep does not touch ``updated_at``")
+        exists for the same reason.
+
+        Not owner-scoped: this writes NO user content and reveals none — the caller is the consumer
+        that already owns the run's lease, and adding a ``user_id`` predicate would only make a
+        heartbeat depend on data the supervisor has no other reason to carry. Never INSERTs; the row
+        is created when the consumer starts (see :meth:`ensure_row`), so a 0 rowcount means the run
+        has no snapshot row at all and is reported by the caller rather than silently ignored.
+        """
+        result = cast(
+            "CursorResult[Any]",
+            await self._session.execute(
+                text(
+                    "UPDATE agent_run_snapshots SET consumer_heartbeat_at = now() "
+                    "WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            ),
+        )
+        return result.rowcount or 0
+
+    async def ensure_row(self, run_id: str, user_id: uuid.UUID) -> None:
+        """Create the snapshot row at consumer start if absent. No-op when it already exists.
+
+        Created EAGERLY rather than on the first flush (ADR-067 §6.1): the heartbeat is a bare
+        ``UPDATE`` that matches nothing until a row exists, so a run whose first event is minutes
+        away — or never arrives — would have no heartbeat to go stale, and the orphan sweep would
+        judge it by ``agent_runs.created_at`` instead. That still works, but it means a run cannot
+        be distinguished from one whose consumer never started, which is exactly the distinction
+        §5 needs. ``ON CONFLICT DO NOTHING`` keeps a takeover by another worker harmless, and every
+        content column keeps its schema default (empty text, no approval, zero tokens), so this can
+        never overwrite state a previous consumer already wrote.
+        """
+        await self._session.execute(
+            text(
+                "INSERT INTO agent_run_snapshots (run_id, user_id) VALUES (:run_id, :uid) "
+                "ON CONFLICT (run_id) DO NOTHING"
+            ),
+            {"run_id": run_id, "uid": str(user_id)},
+        )
+
     async def clear_pending_approval(self, run_id: str, user_id: uuid.UUID) -> int:
         """Drop ``pending_approval`` after a successful ``POST …/approval`` passthrough (§6).
 

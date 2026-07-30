@@ -130,6 +130,20 @@ class PayloadTooLargeError(AppError):
     code = "payload_too_large"
 
 
+class BadRequestError(AppError):
+    """400 for a malformed REQUEST PARAMETER, as opposed to a body that fails schema validation.
+
+    Introduced for ``?afterSeq=`` on the agent events stream (ADR-067 §3.2), whose contract names
+    400 explicitly. It is deliberately distinct from ``validation_error`` (422, a body FastAPI
+    rejected): the client's fix differs — a bad cursor means "drop it and reconnect", which the
+    ADR pairs with the rule that a bad ``Last-Event-ID`` HEADER is NOT an error at all (the header
+    is set by the SSE library, so failing a reconnect over it would strand the client).
+    """
+
+    status_code = 400
+    code = "bad_request"
+
+
 class ValidationFailedError(AppError):
     status_code = 422
     code = "validation_error"

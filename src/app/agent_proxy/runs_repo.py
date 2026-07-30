@@ -130,6 +130,58 @@ class AgentRunsRepository:
         )
         return result.rowcount or 0
 
+    async def list_orphan_candidates(self, *, timeout_seconds: int, limit: int) -> list[Any]:
+        """Active runs whose consumer heartbeat has gone stale (ADR-067 §5, condition 2 of three).
+
+        Starts from ``agent_runs`` under the partial index ``ix_agent_runs_active``
+        (``(created_at) WHERE status IN ('running','resumed')``) and joins the snapshot by PK: the
+        working set is defined by STATUS, and that predicate self-cleans as runs finish.
+
+        Age is ``COALESCE(snapshot.consumer_heartbeat_at, agent_runs.created_at)``. The fallback to
+        ``created_at`` is what covers a run whose consumer never started at all — it has no
+        heartbeat to go stale, and without the fallback it would never become a candidate.
+        ``updated_at`` deliberately does NOT participate (03-data-model.md §25): it moves on billing
+        and status writes, which are not evidence that anyone is still CONSUMING the run.
+
+        ``snapshot_present`` (``s.run_id IS NOT NULL``) is returned ALONGSIDE the coalesced token
+        counts and is not redundant with them (ADR-067 §5.2): ``COALESCE(...,0)`` renders "no
+        snapshot row at all" and "a row that observed zero usage" as the same zero, and the two are
+        entirely different events. The first means the consumer never reached its first DB call, so
+        the run was never observed and the zero is the ABSENCE of a measurement — a revenue incident
+        to investigate. The second is a measurement: a run that ended before its first
+        ``usage.delta``. Only this flag can tell them apart afterwards, and the sweep reports which
+        one it acted on (``billingBasis``).
+
+        ``heartbeat_age_seconds`` is the very quantity the ``WHERE`` clause tests, returned so the
+        finalization can record it (ADR-067 §5 step 3 requires the age in the audit trail). Computed
+        IN SQL from the same ``now()`` as the predicate rather than by handing the caller two
+        timestamps to subtract: the age would otherwise be measured against a different clock at a
+        later moment, and an audit trail that disagrees with the decision it documents is worse than
+        none. It is a float — Postgres ``EXTRACT(EPOCH …)`` is fractional.
+
+        Oldest-first under the same index, capped per tick. Returns candidates only — the caller
+        still applies conditions 1 (no live lease) and 3 (Redis uptime).
+        """
+        result = await self._session.execute(
+            text(
+                "SELECT r.run_id, r.user_id, "
+                "(s.run_id IS NOT NULL) AS snapshot_present, "
+                "EXTRACT(EPOCH FROM (now() - COALESCE(s.consumer_heartbeat_at, r.created_at))) "
+                "    AS heartbeat_age_seconds, "
+                "COALESCE(s.input_tokens, 0) AS input_tokens, "
+                "COALESCE(s.output_tokens, 0) AS output_tokens "
+                "FROM agent_runs r "
+                "LEFT JOIN agent_run_snapshots s ON s.run_id = r.run_id "
+                "WHERE r.status IN ('running', 'resumed') "
+                "AND COALESCE(s.consumer_heartbeat_at, r.created_at) "
+                "    < now() - make_interval(secs => :timeout) "
+                "ORDER BY r.created_at "
+                "LIMIT :limit"
+            ),
+            {"timeout": timeout_seconds, "limit": limit},
+        )
+        return list(result.mappings().all())
+
     async def mark_stopped(self, run_id: str, user_id: uuid.UUID) -> int:
         """Mark a run ``cancelled`` after a 2xx CLIENT ``POST …/stop`` (ADR-066 §3). Owner-scoped.
 

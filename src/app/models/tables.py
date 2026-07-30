@@ -674,6 +674,19 @@ class AgentRun(Base):
         Index("ix_agent_runs_session", "session_id"),
         # active_child(): find the child whose continued_from_run_id == parent.
         Index("ix_agent_runs_continued_from", "continued_from_run_id"),
+        # ADR-067 §5 (migration 0020) — working set of the orphan sweep: ACTIVE runs only. PARTIAL
+        # and SELF-CLEANING (a terminal run leaves the index forever), which is why the heartbeat
+        # lives on agent_run_snapshots while the index lives here: an index on the heartbeat column
+        # would never shed a row and would amplify writes on a column touched every 30s per run
+        # (03-data-model.md §25). Leading column created_at, not updated_at: candidate age is
+        # COALESCE(snapshot.consumer_heartbeat_at, agent_runs.created_at), and the ordering gives a
+        # stable oldest-first sweep under AGENT_RUN_ORPHAN_MAX_PER_TICK. The WHERE must stay
+        # identical to the sweep predicate.
+        Index(
+            "ix_agent_runs_active",
+            "created_at",
+            postgresql_where=sa_text("status IN ('running', 'resumed')"),
+        ),
     )
 
 
@@ -715,6 +728,15 @@ class AgentRunSnapshot(Base):
     # NOT move it (clearing content is not a state update, ADR-066 §7).
     updated_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=_now
+    )
+    # ADR-067 §4 (migration 0020): liveness of the BACKGROUND CONSUMER, never returned to the
+    # client. A separate column, not a reuse of updated_at: both this table's updated_at and
+    # agent_runs.updated_at are the client's staleness detector (/state.updatedAt, ADR-066 §5),
+    # while a heartbeat is written even when the run state did not change — moving them would
+    # report progress that never happened. NULL = no consumer has ever reported on this run, which
+    # the orphan sweep reads through COALESCE(consumer_heartbeat_at, agent_runs.created_at).
+    consumer_heartbeat_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     __table_args__ = (

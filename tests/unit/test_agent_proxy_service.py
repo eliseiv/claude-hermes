@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -147,6 +148,27 @@ class FakePolicyState:
     """Minimal PolicyState double; only the attributes evaluate() reads matter."""
 
 
+class _AnyOwner:
+    """A ``user_id`` that matches whoever is asking.
+
+    ``_assert_run_owner`` compares ``run.user_id != user_id``; the default double must not take a
+    position on ownership, or every pre-existing test would have to learn about a check it was not
+    written for. Tests that DO care set ``owner_user_id`` explicitly.
+    """
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+    def __hash__(self) -> int:
+        return 0
+
+
+_ANY_OWNER = _AnyOwner()
+
+
 class FakeRunsRepo:
     """Stand-in for AgentRunsRepository (ADR-064). The default post-hoc unit tests keep the
     incremental flag OFF, so the proxy never dereferences the repo; a resume/incremental unit test
@@ -160,6 +182,24 @@ class FakeRunsRepo:
         # ADR-066 §3: the CLIENT stop path only. Recorded so a test can assert the internal
         # pause-at-zero interrupt never routes through it.
         self.mark_stopped_calls: list[tuple[str, uuid.UUID]] = []
+        # ADR-067: every runId route now asserts ownership EXPLICITLY via `get(run_id)` before
+        # doing anything (_assert_run_owner) — the implicit ensure_running guarantee disappeared
+        # when /events changed executor, so it is no longer relied on anywhere. By default the
+        # double answers "owned by whoever is asking", which keeps the pre-existing tests testing
+        # what they were written to test; `owner_user_id` / `get_returns_none` script the refusals.
+        self.get_calls: list[str] = []
+        self.owner_user_id: uuid.UUID | None = None
+        self.get_returns_none = False
+
+    async def get(self, run_id: str) -> Any:
+        self.get_calls.append(run_id)
+        if self.get_returns_none:
+            return None
+        return SimpleNamespace(
+            run_id=run_id,
+            user_id=self.owner_user_id if self.owner_user_id is not None else _ANY_OWNER,
+            status="running",
+        )
 
     async def create_running(
         self,

@@ -14,6 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 
+from app.agent_proxy.consumer import ConsumerRegistry
 from app.api_gateway.middleware import (
     CorrelationIdMiddleware,
     SecurityHeadersMiddleware,
@@ -68,9 +69,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # TD-013: the auth refresh-token cleanup reaper runs on every instance (auth is universal; no
     # Docker dependency). State lives in auth_refresh_tokens → survives restart.
     cleanup_task: asyncio.Task[None] = asyncio.create_task(run_cleanup_reaper(settings))
+    # ADR-067 §6.1.1: the registry of live agent-run consumers. APP-scoped — a consumer outlives
+    # the request that asked for it by up to AGENT_RUN_MAX_DURATION_SECONDS — and the only thing
+    # able to cancel them at shutdown, which §6.4 lists as a self-termination trigger.
+    app.state.agent_run_consumers = ConsumerRegistry()
     try:
         yield
     finally:
+        # ⚠️ ORDER IS LOAD-BEARING: drain the consumers BEFORE the DB pool and Redis are closed.
+        # Reversed, the §6.4 procedure of every live consumer would find both gone — no final
+        # snapshot flush, no lease release, no audit — and every ORDERLY restart would degrade into
+        # the abrupt case, leaving each run to wait out LEASE_TTL + ORPHAN_TIMEOUT before the
+        # reaper could finalize it. Deploys are routine, so this is the common path, not an edge.
+        await app.state.agent_run_consumers.drain(settings.agent_run_shutdown_drain_seconds)
         for task in (reaper_task, cleanup_task):
             if task is not None:
                 task.cancel()

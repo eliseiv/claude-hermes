@@ -44,7 +44,7 @@ from app.agent_proxy.service import AgentProxyService
 from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository
 from app.audit.service import AuditService
 from app.config import Settings
-from app.errors import RunNotResumableError
+from app.errors import NotFoundError, RunNotResumableError
 from app.wallet.service import WalletService
 from tests.conftest import seed_user
 
@@ -791,18 +791,26 @@ async def test_stop_with_foreign_run_id_updates_no_rows(
     # Hermes answers 2xx for an unknown/foreign run (idempotent-stop semantics), and run_id comes
     # straight from the request path — so without `AND user_id = :uid` in the UPDATE itself, user A
     # could cancel user B's run. RBAC must be a property of the STATEMENT, not only of a preceding
-    # check. A foreign id simply updates 0 rows; no 403 is surfaced.
+    # check; that statement-level guarantee is asserted directly in the test below and still holds.
+    #
+    # ⚠️ REVISED for ADR-067. This test used to assert that a foreign stop was PASSED THROUGH to
+    # Hermes and merely updated 0 rows. That is no longer the behaviour and should not be: the
+    # ownership check now runs BEFORE ensure_running (`_assert_run_owner`), so a foreign runId is
+    # refused with 404 without waking our instance or reaching upstream at all. Letting an attacker
+    # trigger an upstream call on someone else's run — even an idempotent one — was a side effect
+    # worth removing. The defence in depth is unchanged: both layers are still tested.
     victim_run = "run_victim"
     victim = await _seed_run(db_sessionmaker, victim_run)
     async with db_sessionmaker() as s:
         attacker = await seed_user(s, subscription="active", balance=100)
     assert attacker != victim
 
-    _stop_route(victim_run)
+    stop_call = _stop_route(victim_run)
     async with db_sessionmaker() as s:
-        out = await _proxy(s).stop(user_id=attacker, run_id=victim_run)
+        with pytest.raises(NotFoundError):
+            await _proxy(s).stop(user_id=attacker, run_id=victim_run)
         await s.commit()
-    assert out == {"stopped": True}  # the passthrough result is still returned (no 403)
+    assert not stop_call.called, "a foreign runId must not reach Hermes at all"
 
     # The victim's run is untouched, and the victim still reads `running` from /state.
     assert (await _run_status(db_sessionmaker, victim_run))[0] == "running"

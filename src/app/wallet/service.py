@@ -60,11 +60,16 @@ class ConsumeResult:
     new_balance: int
     ledger_tx_id: uuid.UUID
     idempotent_replay: bool
-    # ADR-064 §4: credits ACTUALLY decremented by this call. Equals the requested amount on the
-    # standard debit path; on the incremental self-clamp path it is the real balance delta
-    # (< amount in a concurrent-chat-debit race, 0 on replay / drained balance). Read by the agent
-    # per-step biller so ``charged`` / the agent_runs mirror stay consistent with the ledger. Other
-    # callers ignore it (default 0).
+    # ADR-064 §4: credits ACTUALLY decremented by this call, and the ONLY field a caller may report
+    # as "what I charged". Equals the requested amount on the standard debit path; the partial sum
+    # on
+    # the ADR-051 debt path (the rest became debt); the real balance delta on the incremental
+    # self-clamp path (< amount in a concurrent-chat-debit race). ``0`` on every idempotent replay —
+    # THIS call took nothing, whatever an earlier one did.
+    #
+    # ⚠️ The default is 0 and each path must set it explicitly; two paths used to leave it at the
+    # default while genuinely charging, so the field silently under-reported on exactly the paths a
+    # caller would quote it from.
     charged_amount: int = 0
 
 
@@ -309,7 +314,14 @@ class WalletService:
             )
         )
         return ConsumeResult(
-            new_balance=new_balance, ledger_tx_id=inserted_id, idempotent_replay=False
+            new_balance=new_balance,
+            ledger_tx_id=inserted_id,
+            idempotent_replay=False,
+            # The full amount was decremented on this path, and saying so is what makes the field
+            # match its own contract ("equals the requested amount on the standard debit path").
+            # It used to be left at 0 here, so a caller that reported what it ACTUALLY charged had
+            # nothing truthful to read and had to assume the request had gone through in full.
+            charged_amount=amount,
         )
 
     @staticmethod
@@ -434,7 +446,14 @@ class WalletService:
                 },
             )
         )
-        return ConsumeResult(new_balance=0, ledger_tx_id=inserted_id, idempotent_replay=False)
+        # ``charged_amount`` is the PARTIAL sum, not ``amount``: the rest became debt (ADR-051), and
+        # a caller reporting how much it took must not report the shortfall as charged.
+        return ConsumeResult(
+            new_balance=0,
+            ledger_tx_id=inserted_id,
+            idempotent_replay=False,
+            charged_amount=partial,
+        )
 
     async def _consume_incremental_clamp(
         self,

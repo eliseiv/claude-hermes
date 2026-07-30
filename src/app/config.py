@@ -8,11 +8,30 @@ from __future__ import annotations
 
 import ipaddress
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
+
+def _redis_url_db(url: str) -> int | None:
+    """Logical DB number encoded in a Redis URL path, or None when it cannot be determined.
+
+    ``redis://host:6379/2`` → 2; a URL with no path → 0 (the Redis default). Returns None for
+    anything unparseable or non-numeric (``unix://``, a ``?db=`` query form, a service-discovery
+    scheme) so the isolation check that uses it can SKIP rather than reject a configuration it
+    simply failed to read — a validator must not turn "I could not tell" into "you are wrong".
+    """
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return None
+    segment = path.lstrip("/")
+    if not segment:
+        return 0
+    return int(segment) if segment.isdigit() else None
 
 
 class Settings(BaseSettings):
@@ -480,6 +499,182 @@ class Settings(BaseSettings):
     # user-content cleanup of the agent contour. Not a secret.
     agent_run_snapshot_ttl_days: int = Field(default=14, alias="AGENT_RUN_SNAPSHOT_TTL_DAYS")
 
+    # --- Agent-run background consumer + broker /events (ADR-067, 07-deployment.md) -------------
+    # Kill-switch of the broker model (ADR-067 §7). true: ONLY our background consumer subscribes to
+    # Hermes (it bills, writes the snapshot and the terminal status), and the client's GET /events
+    # reads downstream from Redis. false: the previous direct client→Hermes relay with billing on
+    # that path — which means a run nobody subscribes to is again neither billed nor ever finalized
+    # (TD-037), so false is an emergency rollback only. The /events contract is identical either
+    # way. Temporary dual path — TD-038. Not a secret.
+    agent_run_consumer_enabled: bool = Field(default=True, alias="AGENT_RUN_CONSUMER_ENABLED")
+    # TTL of the Redis lease that owns the upstream subscription (agent:run:{runId}:lease) across
+    # gunicorn workers (ADR-067 §4). Too low ⇒ needless takeovers; too high ⇒ a long pause before
+    # another worker picks a dropped run up. A takeover cannot double-charge (ledger idempotency
+    # runId:step / runId). Not a secret.
+    agent_run_consumer_lease_ttl_seconds: int = Field(
+        default=30, alias="AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS"
+    )
+    # How often a live consumer renews its lease (ADR-067 §4). Must be well below the TTL (the doc's
+    # guidance is about a third); the validator enforces only the correctness boundary — at or above
+    # the TTL the lease would always expire before it is renewed. Not a secret.
+    agent_run_consumer_lease_renew_seconds: int = Field(
+        default=10, alias="AGENT_RUN_CONSUMER_LEASE_RENEW_SECONDS"
+    )
+    # Liveness stamp period written by the consumer's SUPERVISOR into
+    # agent_run_snapshots.consumer_heartbeat_at (migration 0020). Stamped ONLY on confirmed progress
+    # of the worker task (ADR-067 §6.1), never on a bare schedule — otherwise liveness would be the
+    # consumer's own say-so. MUST stay well below AGENT_RUN_ORPHAN_TIMEOUT_SECONDS (validated): a
+    # heartbeat slower than the orphan threshold would have the sweep finalize live runs.
+    # ⚠️ Written as a SEPARATE single-column UPDATE — the snapshot upsert is forbidden here (it
+    # writes updated_at unconditionally, which is the client's staleness detector). Not a secret.
+    agent_run_consumer_heartbeat_seconds: int = Field(
+        default=30, alias="AGENT_RUN_CONSUMER_HEARTBEAT_SECONDS"
+    )
+    # TCP keep-alive of the upstream subscription socket (ADR-067 §6.2): idle before the first
+    # probe / interval between probes / probe count ⇒ a dead peer is detected in ≈90s at defaults.
+    # ⚠️ httpx has no "enable keep-alive" knob — these must be passed as explicit socket_options
+    # (SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT); without that the Linux default
+    # tcp_keepalive_time=7200s applies and the detector is fictional (a lost peer would surface only
+    # after AGENT_RUN_MAX_DURATION_SECONDS). Not secrets.
+    agent_run_upstream_tcp_keepidle_seconds: int = Field(
+        default=60, alias="AGENT_RUN_UPSTREAM_TCP_KEEPIDLE_SECONDS"
+    )
+    agent_run_upstream_tcp_keepintvl_seconds: int = Field(
+        default=10, alias="AGENT_RUN_UPSTREAM_TCP_KEEPINTVL_SECONDS"
+    )
+    agent_run_upstream_tcp_keepcnt: int = Field(default=3, alias="AGENT_RUN_UPSTREAM_TCP_KEEPCNT")
+    # Stall threshold of OUR OWN processing (ADR-067 §6.1): the worker sitting in the `processing`
+    # beacon state longer than this makes the supervisor stop the heartbeat, drop the lease and
+    # CANCEL the worker. ⚠️ Distinct from upstream silence: waiting for events (`awaiting_upstream`)
+    # is not a liveness violation and may last hours — this threshold addresses a wedged DB write /
+    # deadlock / a hang inside consume. Without it liveness would be self-declared: independent
+    # lease and heartbeat loops would keep stamping while processing was hung, and the MAX_DURATION
+    # timer inside the same coroutine would never fire. Not a secret.
+    agent_run_processing_stall_seconds: int = Field(
+        default=120, alias="AGENT_RUN_PROCESSING_STALL_SECONDS"
+    )
+    # How long the upstream subscription may hold with ZERO bytes read (ADR-067 §6.4.2 inert-
+    # subscription guard); the beacon stays `connecting` for that whole time. Exceeded ⇒ supervisor
+    # drops lease/heartbeat and cancels the worker.
+    # ⚠️ The value is NOT derived from the measured 0.184s first-content latency: the captures show
+    # the image emits no structural run.queued/run.running, so the first event is already content
+    # (after the first LLM call), and the WORST case (long reasoning, large context, a tool first)
+    # is UNMEASURED — Q-067-14. Chosen with margin (×27 of the 6.7s cold start) because the error
+    # costs are asymmetric: a false positive kills a WORKING run, a false negative only lets an
+    # inert subscription live longer. ⚠️ Not a silence threshold: past the first byte the guard is
+    # inert (bytes_read > 0), so the retracted idle-timeout does not return this way. Not a secret.
+    agent_run_first_byte_stall_seconds: int = Field(
+        default=180, alias="AGENT_RUN_FIRST_BYTE_STALL_SECONDS"
+    )
+    # Ceiling on a run's lifetime from create_running, applied by the SUPERVISOR through cancelling
+    # the worker (ADR-067 §6.3) — not by an internal timer, which would not fire inside a hung
+    # coroutine; the reaper then finalizes the run.
+    # ⚠️ A PRODUCT-VISIBLE limit ("a run longer than 2h is terminated, the completed part is
+    # charged, status failed") and, after the idle-timeout was retracted, the ONLY time bound that
+    # exists: the whole upper bound on the life of `running` is derived from it. Hence the fail-fast
+    # `> 0` validation — 0 would silently remove that last guarantee. Value + telling iOS: Q-067-8.
+    agent_run_max_duration_seconds: int = Field(
+        default=7200, alias="AGENT_RUN_MAX_DURATION_SECONDS"
+    )
+    # Ring caps of one run's events in Redis (ADR-067 §3/§3.1). LTRIM fires on EITHER ceiling: an
+    # event count alone is not enough (a single Hermes event has no size limit, so 5000 large
+    # tool.completed blocks would be hundreds of MB for one run), and bytes alone would let a flood
+    # of tiny events grow the list unboundedly. Overflow drops the HEAD of the stream; the client
+    # then recovers the accumulated text via GET /state and is told so by run.truncated (Q-067-3).
+    # Not secrets.
+    agent_run_event_buffer_max: int = Field(default=5000, alias="AGENT_RUN_EVENT_BUFFER_MAX")
+    agent_run_event_buffer_max_bytes: int = Field(
+        default=8388608, alias="AGENT_RUN_EVENT_BUFFER_MAX_BYTES"
+    )
+    # TTL of the ring and the run's related keys (ADR-067 §3). RE-APPLIED on every event pipeline,
+    # so it bounds IDLE time, not total run length — which is why 3600 legitimately sits below the
+    # 7200 run ceiling (a run emitting events at least hourly keeps its ring alive). The keys are
+    # ephemeral: losing them costs only the live stream — billing, status and /state live in
+    # Postgres. Not a secret.
+    agent_run_event_buffer_ttl_seconds: int = Field(
+        default=3600, alias="AGENT_RUN_EVENT_BUFFER_TTL_SECONDS"
+    )
+    # Per-subscriber queue cap on the client /events stream (ADR-067 §3). Overflow DISCONNECTS the
+    # slow subscriber (it reconnects and gets a replay); the consumer is never stopped — the
+    # invariant is "a downstream failure must not affect upstream". Not a secret.
+    agent_run_subscriber_queue_max: int = Field(default=500, alias="AGENT_RUN_SUBSCRIBER_QUEUE_MAX")
+    # Max time a CLIENT /events stream may go without events while no live lease exists, after
+    # which the stream is closed (ADR-067 §3.3). One of the five downstream close rules: a terminal
+    # event may never appear in Redis at all (the consumer never started or died, the ring TTL
+    # expired, Redis restarted), and the stream used to be closed by Hermes itself — under the
+    # broker model we must close it, or the client hangs forever. Not a secret.
+    agent_run_downstream_idle_timeout_seconds: int = Field(
+        default=300, alias="AGENT_RUN_DOWNSTREAM_IDLE_TIMEOUT_SECONDS"
+    )
+    # Heartbeat staleness after which a run is considered orphaned (ADR-067 §5). A candidate must
+    # satisfy ALL THREE conditions (no live lease; COALESCE(consumer_heartbeat_at, created_at) older
+    # than this; Redis uptime >= the grace below, fail-closed). Not a secret.
+    agent_run_orphan_timeout_seconds: int = Field(
+        default=900, alias="AGENT_RUN_ORPHAN_TIMEOUT_SECONDS"
+    )
+    # Max runs finalized by one orphan sweep tick, PER WORKER (ADR-067 §5) — the reaper lives in
+    # every worker's lifespan (4 of them), so the effective ceiling is 4 × this. A safety valve
+    # against mass finalization; a tick that hits the cap is logged as an anomaly. Not a secret.
+    agent_run_orphan_max_per_tick: int = Field(default=20, alias="AGENT_RUN_ORPHAN_MAX_PER_TICK")
+    # Minimum Redis uptime_in_seconds (INFO server) that allows the orphan sweep to run at all
+    # (ADR-067 §5). ⚠️ MANDATORY: a Redis restart wipes every lease at once, and without this the
+    # sweep would take all active runs for orphans — charging early and marking WORKING runs failed
+    # (after which the real _mark_terminal('completed') is a no-op, the transition being
+    # conditional). FAIL-CLOSED: an INFO error or unreachable Redis means the sweep does not run.
+    # Checked on server uptime rather than "age of the current connection" — redis.asyncio pools
+    # connections, so there is no such thing as "the current" one. Must exceed the lease renew
+    # period (validated), or the sweep could fire before live consumers re-took their leases. Not a
+    # secret.
+    agent_run_orphan_redis_grace_seconds: int = Field(
+        default=120, alias="AGENT_RUN_ORPHAN_REDIS_GRACE_SECONDS"
+    )
+    # Logical Redis DB for agent-run keys (ring / channel / lease / seq / epoch), ADR-067 §3.5 —
+    # operational isolation from rate limiting and idempotency marks, so that a FLUSHDB or a SCAN
+    # sweep of one contour cannot touch the other. Validated to DIFFER from the DB in REDIS_URL:
+    # equal values silently void exactly the isolation this setting exists for.
+    # ⚠️ The default is DERIVED, not quoted: 07-deployment.md states the requirement (a separate
+    # logical DB) but no number, and 1 is the only value consistent with the REDIS_URL default
+    # (…/0). Pending architect confirmation. Not a secret.
+    agent_run_redis_db: int = Field(default=1, alias="AGENT_RUN_REDIS_DB")
+    # Budget for draining live consumers at worker shutdown (ADR-067 §6.1.1). The lifespan cancels
+    # every registered consumer and waits this long for their §6.4 procedures (final flush, lease
+    # release, audit) BEFORE the DB pool and Redis are closed — in the opposite order §6.4 could
+    # neither flush nor release, and an orderly stop would degrade into an abrupt one.
+    # NOT summed over the number of runs: the §6.4 procedures run concurrently, so this is a wall
+    # clock bound for all of them together and fits inside gunicorn's --graceful-timeout 30.
+    agent_run_shutdown_drain_seconds: float = Field(
+        default=10.0, alias="AGENT_RUN_SHUTDOWN_DRAIN_SECONDS"
+    )
+    # How long POST /v1/agent/run waits for the consumer to report its upstream subscription before
+    # answering 202 (ADR-067 §3, §6.1.1). Deliberately its OWN knob and deliberately SMALL — not
+    # AGENT_RUN_FIRST_BYTE_STALL_SECONDS: the events stream has NO read timeout by §6.2, so a peer
+    # that accepts the connection and never sends headers would otherwise hold the request open
+    # indefinitely, and committing before the wait does not help with that.
+    # ⚠️ Expiry is NOT fatal and NOT a correctness gate: under the broker model the client's
+    # /events never reaches Hermes, so there is no race for the one-shot stream to lose. "Someone
+    # is consuming this run" is guaranteed by the task registry (§6.1.1) and the reaper (§5); this
+    # wait buys OBSERVABILITY — a failed subscription shows up now instead of after
+    # AGENT_RUN_ORPHAN_TIMEOUT. On expiry the handler answers 202 and the consumer keeps going.
+    agent_run_handshake_timeout_seconds: float = Field(
+        default=15.0, alias="AGENT_RUN_HANDSHAKE_TIMEOUT_SECONDS"
+    )
+    # Budget for handing queued blocks to a client on the /events stream (ADR-067 §3.2.2). The
+    # per-subscriber queue above measures HOW FAR BEHIND a client is; this measures HOW LONG we are
+    # prepared to wait for it, which is the criterion the replay phase needs: the ring holds ten
+    # times what the queue does (5000 against 500), so the reader hands the replay over waiting for
+    # room rather than by depth, and a client too slow for that is dropped on TIME.
+    # ⚠️ ONE value, TWO independent deadlines — the replay phase counts its own in the reader and
+    # the normal drain counts its own in the writer, each locally, with no deadline shared between
+    # tasks. A single shared counter was rejected for a reason worth keeping: a slow replay would
+    # spend all of it and leave the drain nothing, discarding the terminal event exactly where
+    # §3.2.2 gives the normal path priority. Honest cost of two: up to 2x the value in the worst
+    # case ("slow replay, then slow drain"). Each deadline bounds ONE WAIT — progress resets it — so
+    # a client that keeps draining is never cut off for merely having more to receive than the
+    # budget covers in wall-clock terms.
+    agent_run_subscriber_drain_seconds: float = Field(
+        default=120.0, alias="AGENT_RUN_SUBSCRIBER_DRAIN_SECONDS"
+    )
+
     # --- Observability ---
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     otel_exporter_otlp_endpoint: str = Field(default="", alias="OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -531,6 +726,132 @@ class Settings(BaseSettings):
                 f"HERMES_LAUNCH_BUDGET_SECONDS ({self.hermes_launch_budget_seconds}) must be >= "
                 "HERMES_PROVISION_READY_TIMEOUT_SECONDS + 2 × HERMES_PROXY_TIMEOUT_SECONDS "
                 f"({minimum}) so a cold start plus the two /resume upstream calls always fit"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_agent_run_consumer_invariants(self) -> Settings:
+        """Fail-fast on the ADR-067 settings that are only correct in relation to each other.
+
+        Every check below has a failure mode that is SILENT at runtime — a misconfiguration does not
+        error, it quietly finalizes live runs, charges them, or removes a guarantee. Startup is the
+        only place these knobs are visible together (07-deployment.md documents them one row at a
+        time, and each row looks reasonable alone), which is exactly the argument that produced the
+        ADR-056 §3 and TD-040 invariants above.
+        """
+        # (1) MAX_DURATION > 0 — explicitly required fail-fast (ADR-067 §6.3). After the idle
+        # timeout was retracted this is the ONLY bound on the life of `running`; 0 would silently
+        # mean "no limit", which is admissible only as a deliberate Q-067-8 decision, not as a typo.
+        if self.agent_run_max_duration_seconds <= 0:
+            raise ValueError(
+                "AGENT_RUN_MAX_DURATION_SECONDS must be > 0 — it is the only upper bound on the "
+                "lifetime of a running agent run (ADR-067 §6.3)"
+            )
+        # (2) Every other knob is a period, a size or a count: non-positive values do not degrade
+        # the contour, they disable the mechanism the setting names (a 0 ring cap keeps no events, a
+        # 0 heartbeat period spins, a 0 per-tick cap sweeps nothing) while the config still reads as
+        # if the feature were on.
+        positive: dict[str, int] = {
+            "AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS": self.agent_run_consumer_lease_ttl_seconds,
+            "AGENT_RUN_CONSUMER_LEASE_RENEW_SECONDS": self.agent_run_consumer_lease_renew_seconds,
+            "AGENT_RUN_CONSUMER_HEARTBEAT_SECONDS": self.agent_run_consumer_heartbeat_seconds,
+            "AGENT_RUN_UPSTREAM_TCP_KEEPIDLE_SECONDS": (
+                self.agent_run_upstream_tcp_keepidle_seconds
+            ),
+            "AGENT_RUN_UPSTREAM_TCP_KEEPINTVL_SECONDS": (
+                self.agent_run_upstream_tcp_keepintvl_seconds
+            ),
+            "AGENT_RUN_UPSTREAM_TCP_KEEPCNT": self.agent_run_upstream_tcp_keepcnt,
+            "AGENT_RUN_PROCESSING_STALL_SECONDS": self.agent_run_processing_stall_seconds,
+            "AGENT_RUN_FIRST_BYTE_STALL_SECONDS": self.agent_run_first_byte_stall_seconds,
+            "AGENT_RUN_EVENT_BUFFER_MAX": self.agent_run_event_buffer_max,
+            "AGENT_RUN_EVENT_BUFFER_MAX_BYTES": self.agent_run_event_buffer_max_bytes,
+            "AGENT_RUN_EVENT_BUFFER_TTL_SECONDS": self.agent_run_event_buffer_ttl_seconds,
+            "AGENT_RUN_SUBSCRIBER_QUEUE_MAX": self.agent_run_subscriber_queue_max,
+            "AGENT_RUN_DOWNSTREAM_IDLE_TIMEOUT_SECONDS": (
+                self.agent_run_downstream_idle_timeout_seconds
+            ),
+            "AGENT_RUN_ORPHAN_TIMEOUT_SECONDS": self.agent_run_orphan_timeout_seconds,
+            "AGENT_RUN_ORPHAN_MAX_PER_TICK": self.agent_run_orphan_max_per_tick,
+            # Grace 0 would mean "any uptime is fine", i.e. the Redis-restart protection this
+            # setting exists for would be off while still appearing configured (ADR-067 §5).
+            "AGENT_RUN_ORPHAN_REDIS_GRACE_SECONDS": self.agent_run_orphan_redis_grace_seconds,
+        }
+        # A zero drain budget does not "skip waiting" — it cancels every consumer and closes the
+        # pool underneath their §6.4 procedures, so no run gets a final flush, a released lease or
+        # an audit record on an ORDERLY restart. Deploys are routine; this must not be a no-op.
+        if self.agent_run_handshake_timeout_seconds <= 0:
+            raise ValueError(
+                "AGENT_RUN_HANDSHAKE_TIMEOUT_SECONDS must be > 0 "
+                f"(got {self.agent_run_handshake_timeout_seconds}) — 0 would answer 202 without "
+                "ever observing whether the consumer subscribed (ADR-067 §3)"
+            )
+        if self.agent_run_shutdown_drain_seconds <= 0:
+            raise ValueError(
+                "AGENT_RUN_SHUTDOWN_DRAIN_SECONDS must be > 0 "
+                f"(got {self.agent_run_shutdown_drain_seconds}) — a zero budget closes the DB pool "
+                "under the §6.4 shutdown procedures of live consumers (ADR-067 §6.1.1)"
+            )
+        if self.agent_run_subscriber_drain_seconds <= 0:
+            raise ValueError(
+                "AGENT_RUN_SUBSCRIBER_DRAIN_SECONDS must be > 0 "
+                f"(got {self.agent_run_subscriber_drain_seconds}) — a zero budget gives a client "
+                "no time to take what is already queued for it, so every stream would end by "
+                "timing out on its own replay (ADR-067 §3.2.2)"
+            )
+        for name, value in positive.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be > 0 (got {value}) — ADR-067")
+        # (3) The lease must be renewed strictly before it expires (ADR-067 §4: "well below the
+        # TTL, roughly a third"). At or above the TTL the lease lapses between renewals, so the run
+        # is perpetually up for takeover and the "single upstream subscriber" property — on which
+        # the ONE-SHOT Hermes stream depends — is lost.
+        if self.agent_run_consumer_lease_renew_seconds >= self.agent_run_consumer_lease_ttl_seconds:
+            raise ValueError(
+                "AGENT_RUN_CONSUMER_LEASE_RENEW_SECONDS "
+                f"({self.agent_run_consumer_lease_renew_seconds}) must be < "
+                "AGENT_RUN_CONSUMER_LEASE_TTL_SECONDS "
+                f"({self.agent_run_consumer_lease_ttl_seconds}) — a lease renewed no sooner than "
+                "it expires is never held (ADR-067 §4)"
+            )
+        # (4) A live consumer must be able to stamp several heartbeats within the orphan window.
+        # Otherwise the sweep finalizes runs that are working: it charges them from the snapshot
+        # cumulative and marks them failed, and the real terminal transition afterwards is a no-op
+        # (conditional UPDATE) — money and status both wrong, with nothing logged as an error.
+        if self.agent_run_consumer_heartbeat_seconds >= self.agent_run_orphan_timeout_seconds:
+            raise ValueError(
+                "AGENT_RUN_CONSUMER_HEARTBEAT_SECONDS "
+                f"({self.agent_run_consumer_heartbeat_seconds}) must be < "
+                "AGENT_RUN_ORPHAN_TIMEOUT_SECONDS "
+                f"({self.agent_run_orphan_timeout_seconds}) — otherwise the orphan sweep finalizes "
+                "runs whose consumer is alive (ADR-067 §5)"
+            )
+        # (5) After a Redis restart every lease is gone at once and live consumers re-take theirs
+        # within one renew period. A grace no longer than that lets the sweep run in the window
+        # where nobody holds a lease yet — precisely the mass false finalization the grace exists to
+        # prevent (ADR-067 §5).
+        if self.agent_run_orphan_redis_grace_seconds <= self.agent_run_consumer_lease_renew_seconds:
+            raise ValueError(
+                "AGENT_RUN_ORPHAN_REDIS_GRACE_SECONDS "
+                f"({self.agent_run_orphan_redis_grace_seconds}) must be > "
+                "AGENT_RUN_CONSUMER_LEASE_RENEW_SECONDS "
+                f"({self.agent_run_consumer_lease_renew_seconds}) — live consumers need at least "
+                "one renew period to re-take their leases after a Redis restart (ADR-067 §5)"
+            )
+        # (6) The agent-run keys must not share a logical DB with rate limiting / idempotency
+        # (ADR-067 §3.5). Equal values do not fail anywhere at runtime — they just mean a FLUSHDB
+        # or SCAN sweep of one contour silently takes the other with it.
+        if self.agent_run_redis_db < 0:
+            raise ValueError(
+                f"AGENT_RUN_REDIS_DB must be >= 0 (got {self.agent_run_redis_db}) — ADR-067 §3.5"
+            )
+        main_db = _redis_url_db(self.redis_url)
+        if main_db is not None and main_db == self.agent_run_redis_db:
+            raise ValueError(
+                f"AGENT_RUN_REDIS_DB ({self.agent_run_redis_db}) must differ from the logical DB "
+                f"of REDIS_URL ({main_db}) — the agent-run ring shares Redis with rate limiting "
+                "and idempotency marks, and the whole point of the setting is that a FLUSHDB or "
+                "SCAN of one contour cannot touch the other (ADR-067 §3.5)"
             )
         return self
 

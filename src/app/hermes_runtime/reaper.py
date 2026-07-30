@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
+from app.agent_proxy.consumer import sweep_orphan_runs
+from app.agent_proxy.service import AgentProxyService
 from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository
+from app.agent_proxy.transport import AgentRunEventBus, get_event_bus_redis
 from app.config import Settings
-from app.db import session_scope
-from app.deps import get_hermes_backend
+from app.db import get_sessionmaker, session_scope
+from app.deps import get_agent_proxy_service_for, get_hermes_backend
 from app.hermes_runtime.manager import HermesInstanceManager
 from app.hermes_runtime.registry import HermesInstanceRegistry
 
@@ -44,6 +49,33 @@ async def _run_one_tick(settings: Settings) -> None:
         )
         if cleared:
             logger.info("agent run snapshots swept rows=%d", cleared)
+    # ADR-067 §5: finalize runs whose background consumer disappeared (restart/deploy, crashed
+    # worker, a subscription that never came up). Runs OUTSIDE the session above because it opens
+    # one short session per candidate — a long-lived session would hold a connection across the
+    # Redis probes between candidates.
+    #
+    # Deliberately NOT gated on hermes_image like the hibernation reaper: orphaned runs are rows in
+    # OUR database, and they must be finalized on any instance that serves the agent contour.
+    if settings.agent_run_consumer_enabled:
+        finalized = await sweep_orphan_runs(
+            services=_background_services,
+            bus=AgentRunEventBus(get_event_bus_redis(settings), settings),
+            settings=settings,
+        )
+        if finalized:
+            logger.info("agent runs finalized as orphaned count=%d", finalized)
+
+
+@asynccontextmanager
+async def _background_services() -> AsyncIterator[AgentProxyService]:
+    """One short session per orphan-sweep operation (ADR-067 §6.1.1 — same rule as the consumer)."""
+    maker = get_sessionmaker()
+    async with maker() as session:
+        try:
+            yield get_agent_proxy_service_for(session)
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def run_reaper(settings: Settings) -> None:

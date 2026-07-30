@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, Request
@@ -12,9 +13,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.service import AdminService
+from app.agent_proxy.broker import AgentRunBroker
+from app.agent_proxy.consumer import ConsumerLauncher
 from app.agent_proxy.runs_repo import AgentRunsRepository
 from app.agent_proxy.service import AgentProxyService
 from app.agent_proxy.snapshots_repo import AgentRunSnapshotsRepository
+from app.agent_proxy.transport import AgentRunEventBus, get_event_bus_redis
 from app.api_gateway.auth import AuthenticatedUser, get_jwt_verifier, verify_client_api_key
 from app.api_gateway.openapi_security import client_api_key_scheme, user_id_scheme
 from app.audit.service import AuditService
@@ -31,7 +35,7 @@ from app.chat.repository import ChatRepository
 from app.chats.repository import ChatsRepository
 from app.chats.service import ChatsService
 from app.config import get_settings
-from app.db import session_scope
+from app.db import get_sessionmaker, session_scope
 from app.errors import UnauthorizedError
 from app.hermes_runtime.docker_backend import DockerBackend, RuntimeBackend
 from app.hermes_runtime.manager import HermesInstanceManager
@@ -296,7 +300,92 @@ def get_hermes_manager(session: DbSession) -> HermesInstanceManager:
     )
 
 
-def get_agent_proxy_service(session: DbSession) -> AgentProxyService:
+def _agent_consumer_launcher(request: Request) -> ConsumerLauncher | None:
+    """Wire the ADR-067 consumer launcher, or None when the contour is off.
+
+    None on the kill-switch (``AGENT_RUN_CONSUMER_ENABLED=false``) — the launch path then behaves
+    exactly as before ADR-067 — and None when the app has no consumer registry (the registry is
+    created by the lifespan, so a test client built without it simply does not start consumers).
+
+    The session factory handed to the consumer is NOT the request's session: the consumer outlives
+    the request by up to two hours. It opens ONE SHORT SESSION PER OPERATION (ADR-067 §6.1.1), which
+    is why this is a factory and not a session.
+    """
+    settings = get_settings()
+    registry = getattr(request.app.state, "agent_run_consumers", None)
+    if not settings.agent_run_consumer_enabled or registry is None:
+        return None
+
+    @asynccontextmanager
+    async def services() -> AsyncIterator[AgentProxyService]:
+        maker = get_sessionmaker()
+        async with maker() as background_session:
+            try:
+                yield get_agent_proxy_service_for(background_session)
+            except Exception:
+                await background_session.rollback()
+                raise
+
+    return ConsumerLauncher(
+        registry=registry,
+        services=services,
+        bus=AgentRunEventBus(get_event_bus_redis(settings), settings),
+        settings=settings,
+    )
+
+
+def _agent_broker() -> AgentRunBroker | None:
+    """Wire the downstream broker, or None when AGENT_RUN_CONSUMER_ENABLED is false.
+
+    Independent of the consumer registry on purpose: reading the ring needs no background task, so
+    a worker whose lifespan did not run can still SERVE /events for runs another worker consumes.
+
+    ⛔ It takes NO session, by the same rule as the consumer and the orphan sweep: a client stream
+    outlives its request by up to two hours, and a repository bound to the request session would
+    keep one pooled connection ``idle in transaction`` for all of it (the broker never commits,
+    because it never writes). Fifteen such streams exhaust a worker's pool and take every other
+    endpoint of that worker down with them. The factory below gives each probe its own session.
+    """
+    settings = get_settings()
+    if not settings.agent_run_consumer_enabled:
+        return None
+
+    @asynccontextmanager
+    async def runs() -> AsyncIterator[AgentRunsRepository]:
+        maker = get_sessionmaker()
+        async with maker() as probe_session:
+            try:
+                yield AgentRunsRepository(probe_session)
+            except Exception:
+                await probe_session.rollback()
+                raise
+
+    return AgentRunBroker(
+        bus=AgentRunEventBus(get_event_bus_redis(settings), settings),
+        runs=runs,
+        settings=settings,
+    )
+
+
+def get_agent_proxy_service_for(session: AsyncSession) -> AgentProxyService:
+    """Build the service on an arbitrary session — used by the background consumer per operation.
+
+    Deliberately WITHOUT a consumer launcher: a consumer must never start another consumer, and the
+    domain rules it runs (snapshot, status, billing) need none of that wiring.
+    """
+    audit = AuditService(session)
+    return AgentProxyService(
+        session=session,
+        manager=get_hermes_manager(session),
+        wallet=WalletService(session, audit),
+        audit=audit,
+        settings=get_settings(),
+        runs=AgentRunsRepository(session),
+        snapshots=AgentRunSnapshotsRepository(session),
+    )
+
+
+def get_agent_proxy_service(session: DbSession, request: Request) -> AgentProxyService:
     """Wire the agent-proxy service (ADR-045/047): manager + wallet + audit + settings.
 
     Per-session like the other service factories so the policy read, the wallet debit (on
@@ -315,6 +404,11 @@ def get_agent_proxy_service(session: DbSession) -> AgentProxyService:
         # ADR-066: agent_run_snapshots repository — the relay-side state writer and the source of
         # GET /v1/agent/runs/{runId}/state (per-session, same transaction).
         snapshots=AgentRunSnapshotsRepository(session),
+        # ADR-067: starts the background consumer after a launch; None when the contour is off.
+        consumers=_agent_consumer_launcher(request),
+        # ADR-067: serves the client /events from Redis instead of proxying Hermes. None on the
+        # kill-switch => stream_events keeps the pre-ADR-067 relay, billing and all.
+        broker=_agent_broker(),
     )
 
 

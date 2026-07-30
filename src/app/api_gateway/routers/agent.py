@@ -12,9 +12,10 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, Depends, Response, status
+from fastapi import APIRouter, Body, Depends, Header, Query, Response, status
 from fastapi.responses import StreamingResponse
 
+from app.agent_proxy.broker import parse_cursor
 from app.agent_proxy.service import AgentProxyService
 from app.api_gateway.rate_limit import enforce_other_limits
 from app.deps import CurrentUser, get_agent_proxy_service
@@ -140,7 +141,9 @@ async def agent_run(
             "description": "Поток событий (text/event-stream).",
             "content": {"text/event-stream": {}},
         },
+        400: {"description": "Невалидный `?afterSeq=` (не целое / отрицательное)."},
         401: {"description": "Нет/неверный `X-API-Key` или нет/невалидный `X-User-Id`."},
+        404: {"description": "Прогон не найден или принадлежит другому пользователю (RBAC)."},
         502: {"description": "Инстанс недоступен / поток событий Hermes недоступен."},
     },
 )
@@ -148,8 +151,21 @@ async def agent_run_events(
     run_id: str,
     current: CurrentUser,
     service: _AgentService,
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
+    after_seq: Annotated[str | None, Query(alias="afterSeq")] = None,
 ) -> StreamingResponse:
-    stream = service.stream_events(user_id=current.user_id, run_id=run_id)
+    # ADR-067 §3.2: resolve the reconnect cursor BEFORE the stream starts, so an invalid ?afterSeq=
+    # is a plain 400 instead of an error inside an already-open text/event-stream response, where
+    # the client would see a truncated stream rather than a status code. `after_seq` is typed as a
+    # STRING and validated here rather than declared `int`: FastAPI would answer 422 for a
+    # non-integer, and the contract says 400.
+    cursor = parse_cursor(last_event_id=last_event_id, after_seq=after_seq)
+    # RBAC BEFORE the response starts, for exactly the reason the cursor is parsed here: Starlette
+    # commits `http.response.start` (status 200) before the first item is pulled from the generator,
+    # so a NotFoundError raised inside it can never become a 404 — it becomes a RuntimeError over an
+    # already-started response, and under BaseHTTPMiddleware it wedges the connection.
+    await service.assert_run_owner(user_id=current.user_id, run_id=run_id)
+    stream = service.stream_events(user_id=current.user_id, run_id=run_id, cursor=cursor)
     return StreamingResponse(
         stream,
         media_type="text/event-stream",
