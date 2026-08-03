@@ -1012,7 +1012,16 @@ class AgentRunBroker:
         this channel, or an unordered hand-off, breaks that silently — false ``run.truncated`` on
         reordered messages, and a real reset possibly unnoticed.
         """
-        check_every = self._settings.agent_run_consumer_lease_ttl_seconds
+        # ⛔ The RENEW period, not the lease TTL (TD-051). What this cadence chases is a generation
+        # change, and a generation is re-established by the consumer's supervisor on a RENEWAL tick
+        # (``ensure_epoch`` on every renewal, §3.3.1b measure 1) — never when a TTL lapses. Reading
+        # the TTL was a substitution, and not a harmless one: 30 s against 10 s is a threefold lag,
+        # so a quiet run's stream could stay silent for up to 30 s instead of 10 before the change
+        # was noticed. ⚠️ The reference is named here on purpose: the previous default is exactly
+        # what the next reader reaches for, which is how the substitution appeared in the first
+        # place. And it needs no knob of its own — the quantity IS the renewal period, and inventing
+        # a second setting would let the two drift apart silently.
+        check_every = self._settings.agent_run_consumer_lease_renew_seconds
         last_check_at = time.monotonic()
         current_generation = generation
         # The two counters of §3.2.1, and they cannot be merged — that is the whole point:
