@@ -44,6 +44,12 @@ class CrmRequestRow:
     sent_at: datetime.datetime
 
 
+@dataclass(frozen=True)
+class CrmSubscriptionGrantEvent:
+    plan: str
+    expires_at: datetime.datetime
+
+
 _PAYMENT_CREDIT_FILTER = (
     "(lt.meta->>'source' = 'token_purchase' "
     "OR lt.meta ? 'adaptyEventId' "
@@ -237,6 +243,21 @@ class CrmAdminRepository:
             payments_count=int(one.payments_count),
             renewals_count=int(one.renewals_count),
         )
+
+    async def get_subscription_grant_event(
+        self, user_id: uuid.UUID, idempotency_key: str
+    ) -> CrmSubscriptionGrantEvent | None:
+        result = await self._session.execute(
+            text(
+                "SELECT plan, expires_at FROM subscription_grant_events "
+                "WHERE user_id = :uid AND idempotency_key = :key"
+            ),
+            {"uid": str(user_id), "key": idempotency_key},
+        )
+        one = result.one_or_none()
+        if one is None:
+            return None
+        return CrmSubscriptionGrantEvent(plan=one.plan, expires_at=one.expires_at)
 
     async def ledger_totals(self, user_id: uuid.UUID) -> tuple[int, int]:
         row = await self._session.execute(

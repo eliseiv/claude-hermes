@@ -74,12 +74,12 @@ async def test_crm_users_list_and_detail(
     assert r.status_code == 200
     body = r.json()
     assert body["total"] >= 1
-    assert any(item["id"] == uid for item in body["items"])
+    assert any(item["id"] == str(uid) for item in body["items"])
 
     detail = await crm_client.get(f"/v1/admin/users/{uid}", headers=_ADMIN_HEADERS)
     assert detail.status_code == 200
     d = detail.json()
-    assert d["id"] == uid
+    assert d["id"] == str(uid)
     assert d["balance"]["tokens"] >= 0
     assert d["revenue"] is None
     assert d["media_stats"] is None

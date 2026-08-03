@@ -164,6 +164,31 @@ class CrmAdminService:
             raise UserNotFoundError("user not found")
 
         now = datetime.datetime.now(tz=datetime.UTC)
+        idempotency_key = f"crm-subscription:{grant_id}"
+
+        existing_grant = await self._repo.get_subscription_grant_event(user_id, idempotency_key)
+        if existing_grant is not None:
+            try:
+                result = await self._admin.subscription_grant(
+                    user_id=user_id,
+                    plan=existing_grant.plan,
+                    expires_at=existing_grant.expires_at,
+                    grant_credits=False,
+                    idempotency_key=idempotency_key,
+                    reason="crm_admin_subscription",
+                )
+            except ConflictError as exc:
+                raise BadRequestError("subscription grant conflict") from exc
+            balance_row = await self._repo.get_user_row(user_id)
+            balance = balance_row.balance if balance_row else row.balance
+            active = _subscription_active("active", result.expires_at, now)
+            return CrmSubscriptionOutcome(
+                tokens=balance,
+                subscription_active=active,
+                subscription_expires_at=result.expires_at,
+                applied=False,
+            )
+
         base = now
         if row.subscription_status == "active" and row.subscription_expires_at is not None:
             exp = row.subscription_expires_at
@@ -173,7 +198,6 @@ class CrmAdminService:
                 base = exp
 
         expires_at = base + datetime.timedelta(days=expires_in_days)
-        idempotency_key = f"crm-subscription:{grant_id}"
 
         try:
             result = await self._admin.subscription_grant(
