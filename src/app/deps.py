@@ -12,6 +12,7 @@ from fastapi import Depends, Request
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.admin.crm_service import CrmAdminService
 from app.admin.service import AdminService
 from app.agent_proxy.broker import AgentRunBroker
 from app.agent_proxy.consumer import ConsumerLauncher
@@ -222,6 +223,19 @@ def get_admin_service(session: DbSession) -> AdminService:
     wallet = WalletService(session, audit)
     subscription = SubscriptionService(session, wallet, audit)
     return AdminService(session, wallet, audit, subscription)
+
+
+def get_crm_admin_service(
+    session: DbSession,
+    admin: Annotated[AdminService, Depends(get_admin_service)],
+) -> CrmAdminService:
+    from app.admin.crm_repo import CrmAdminRepository
+
+    return CrmAdminService(
+        CrmAdminRepository(session),
+        admin,
+        get_settings(),
+    )
 
 
 def get_chats_service(session: DbSession) -> ChatsService:

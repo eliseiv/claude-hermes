@@ -507,12 +507,12 @@ async def test_debit_rate_limit_returns_429(
 
 
 @pytest.mark.asyncio
-async def test_debit_no_admin_token_401(admin_client: AsyncClient) -> None:
+async def test_debit_no_admin_token_403(admin_client: AsyncClient) -> None:
     r = await admin_client.post(
         "/v1/admin/wallet/debit",
         json={"userId": str(uuid.uuid4()), "amount": 5, "idempotencyKey": "d-na", "reason": "x"},
     )
-    assert r.status_code == 401
+    assert r.status_code == 403
 
 
 @pytest.mark.asyncio

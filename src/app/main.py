@@ -28,6 +28,7 @@ from app.api_gateway.routers import (
     byok,
     chat,
     chats,
+    crm_admin,
     health,
     models,
     policy,
@@ -296,11 +297,16 @@ def create_app() -> FastAPI:
     app.add_middleware(SizeLimitMiddleware)
 
     @app.exception_handler(AppError)
-    async def _app_error_handler(_request: Request, exc: AppError) -> JSONResponse:
+    async def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+        # broad-crm universal contract: admin surface returns FastAPI-style {"detail": "..."}.
+        if request.url.path.startswith("/v1/admin"):
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
         return _error_response(exc.status_code, exc.code, exc.message)
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    async def _validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        if request.url.path.startswith("/v1/admin"):
+            return JSONResponse(status_code=422, content={"detail": "request validation failed"})
         return _error_response(422, "validation_error", "request validation failed")
 
     @app.exception_handler(Exception)
@@ -320,6 +326,7 @@ def create_app() -> FastAPI:
         token_purchase,
         byok,
         admin,
+        crm_admin,
         billing_adapty,
         chat,
         chats,

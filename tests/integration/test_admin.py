@@ -246,12 +246,13 @@ async def test_wallet_view_unknown_user_404(admin_client: AsyncClient) -> None:
 
 # --------------------------- security / authorization ---------------------------
 @pytest.mark.asyncio
-async def test_no_admin_token_401(admin_client: AsyncClient) -> None:
+async def test_no_admin_token_403(admin_client: AsyncClient) -> None:
     r = await admin_client.post(
         "/v1/admin/wallet/grant",
         json={"userId": str(uuid.uuid4()), "amount": 5, "idempotencyKey": "g", "reason": "x"},
     )
-    assert r.status_code == 401
+    assert r.status_code == 403
+    assert r.json()["detail"]
 
 
 @pytest.mark.asyncio

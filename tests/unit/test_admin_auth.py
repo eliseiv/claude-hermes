@@ -12,7 +12,7 @@ import pytest
 
 from app.api_gateway.auth import _admin_token_matches, require_admin
 from app.config import get_settings
-from app.errors import UnauthorizedError
+from app.errors import ForbiddenError, UnauthorizedError
 
 _SECRET = "admin-secret-current-0123456789abcdef0123456789ab"
 _PREV = "admin-secret-previous-0123456789abcdef0123456789"
@@ -66,8 +66,8 @@ async def test_require_admin_passes_with_valid_token(admin_secrets: None) -> Non
 
 
 @pytest.mark.asyncio
-async def test_require_admin_missing_token_401(admin_secrets: None) -> None:
-    with pytest.raises(UnauthorizedError):
+async def test_require_admin_missing_token_403(admin_secrets: None) -> None:
+    with pytest.raises(ForbiddenError):
         await require_admin(x_admin_token=None)
 
 

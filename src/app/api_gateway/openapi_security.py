@@ -79,6 +79,17 @@ admin_scheme = APIKeyHeader(
     ),
 )
 
+# CRM (broad-crm) uses X-Admin-Key — same secret(s), alternate header name.
+admin_key_scheme = APIKeyHeader(
+    name="X-Admin-Key",
+    scheme_name="adminKey",
+    auto_error=False,
+    description=(
+        "Алиас admin-секрета для broad-crm (`ADMIN_API_SECRET` / `ADMIN_API_KEY`). "
+        "Эквивалент `X-Admin-Token`."
+    ),
+)
+
 # scheme_name fixes the OpenAPI components.securitySchemes key to `adaptyWebhook`.
 # HTTP Bearer documents the static webhook secret; the real constant-time check stays in
 # require_adapty_webhook (ADR-029). Separate from the client contour and adminToken.

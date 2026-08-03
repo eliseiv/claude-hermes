@@ -1,9 +1,30 @@
 # Admin — API Contracts
 
-Все admin-эндпоинты под префиксом `/v1/admin/*`. Авторизация — заголовок `X-Admin-Token` (изолированный
-admin-секрет, [ADR-009](../../adr/ADR-009-admin-token-auth.md)), зависимость `require_admin`. **Пользовательский
-JWT не авторизует admin-действия.** Отсутствие/несовпадение токена → `401`. Отдельный rate limit (дефолт 10 req/min
-per source IP, конфигурируемо), `extra='forbid'`, тело ≤ 8 KB.
+Все admin-эндпоинты под префиксом `/v1/admin/*`. Авторизация — заголовок `X-Admin-Token` или `X-Admin-Key`
+(изолированный admin-секрет, env `ADMIN_API_SECRET` / `ADMIN_API_KEY`, [ADR-009](../../adr/ADR-009-admin-token-auth.md)),
+зависимость `require_admin`. **Пользовательский JWT не авторизует admin-действия.** Отсутствие заголовка → `403`
+`{"detail": "..."}` (CRM-контракт); неверный ключ → `401`. Пустой секрет в env → fail-closed (`401`). Отдельный rate
+limit (дефолт 10 req/min per source IP, конфигурируемо), `extra='forbid'`, тело ≤ 8 KB.
+
+## CRM admin API (broad-crm universal contract v1)
+
+Префикс `{P}` = `/v1/admin`. Эндпоинты для панели «Пользователи бэков» в broad-crm. Ошибки — JSON `{"detail": "..."}`
+(не `{error: ...}`). Даты — ISO 8601 UTC (`2026-07-20T12:31:00Z`). Списки — пагинация `limit` (≤100) / `offset`.
+
+| Метод | Путь | Назначение |
+|-------|------|------------|
+| GET | `/users` | Список пользователей (`search`, `date_from`, `date_to`, `is_paid`) |
+| GET | `/users/{id}` | Карточка (`balance`, `subscription`, `revenue=null`, `media_stats=null`) |
+| GET | `/users/{id}/payments` | История оплат (ledger credits; `currency=CREDITS`) |
+| GET | `/users/{id}/requests` | История запросов (`agent_runs` + `chat_sessions`) |
+| GET | `/stats` | `users_total`, `paid_users`, `payments_sum_usd=0` |
+| GET | `/products` | Тарифы из `ADAPTY_PRODUCT_TOKENS` + `TOKEN_PRODUCTS` |
+| POST | `/users/{id}/tokens` | Начисление/списание (`amount` int; не идемпотентно; минус → 400) |
+| POST | `/users/{id}/subscription` | Продление подписки (идемпотентно по `grant_id`) |
+
+Маппинг: `tokens` = `wallets.balance`; `external_id` = `null`; `is_paid` / `payments_count` — ledger credits с
+`token_purchase` или Adapty; `renewals_count` — `adapty_webhook_events.subscription_renewed`. Активная подписка при
+продлении **добавляет** `expires_in_days` к текущему `expires_at`. Тесты: `tests/integration/test_crm_admin.py`.
 
 ## POST /v1/admin/credits/grant
 Начисление кредитов пользователю (саппорт/компенсация). Канонический путь ([ADR-048 §1](../../adr/ADR-048-admin-credits-and-subscription-grant.md)).

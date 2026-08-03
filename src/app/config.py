@@ -205,6 +205,8 @@ class Settings(BaseSettings):
     # (grace period); both compared constant-time. Empty (unset) secrets never match.
     admin_api_secret: str = Field(default="", alias="ADMIN_API_SECRET")
     admin_api_secret_prev: str = Field(default="", alias="ADMIN_API_SECRET_PREV")
+    # CRM (broad-crm) documents ADMIN_API_KEY; if set, accepted alongside ADMIN_API_SECRET.
+    admin_api_key: str = Field(default="", alias="ADMIN_API_KEY")
     admin_rate_limit_per_min: int = Field(default=10, alias="ADMIN_RATE_LIMIT_PER_MIN")
     # Body size limit for admin endpoints (<= 8 KB, ADR-009 §6).
     admin_size_limit_body: int = Field(default=8 * 1024, alias="ADMIN_SIZE_LIMIT_BODY")

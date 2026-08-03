@@ -686,11 +686,11 @@ async def test_subgrant_makes_user_pass_policy_gate(
 
 
 # ============================================================================
-# A8. Security: no admin token → 401; OpenAPI security == [{adminToken:[]}] (see also
+# A8. Security: no admin token → 403; OpenAPI security == [{adminToken:[]}] (see also
 #     tests/integration/test_api_documentation.py enumerated _ADMIN_PATHS for the direct assert)
 # ============================================================================
 @pytest.mark.asyncio
-async def test_subgrant_no_admin_token_401(admin_client: AsyncClient) -> None:
+async def test_subgrant_no_admin_token_403(admin_client: AsyncClient) -> None:
     r = await admin_client.post(
         "/v1/admin/subscription/grant",
         json={
@@ -701,7 +701,7 @@ async def test_subgrant_no_admin_token_401(admin_client: AsyncClient) -> None:
             "reason": "x",
         },
     )
-    assert r.status_code == 401
+    assert r.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -892,12 +892,12 @@ async def test_credits_grant_and_wallet_alias_identical_behaviour(
 
 
 @pytest.mark.asyncio
-async def test_credits_grant_no_admin_token_401(admin_client: AsyncClient) -> None:
+async def test_credits_grant_no_admin_token_403(admin_client: AsyncClient) -> None:
     r = await admin_client.post(
         "/v1/admin/credits/grant",
         json={"userId": str(uuid.uuid4()), "amount": 5, "idempotencyKey": "cg-na", "reason": "x"},
     )
-    assert r.status_code == 401
+    assert r.status_code == 403
 
 
 @pytest.mark.asyncio

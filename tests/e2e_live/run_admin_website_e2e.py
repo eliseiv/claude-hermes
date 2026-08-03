@@ -83,17 +83,17 @@ def main() -> None:  # noqa: C901
         blame=None if (replay and bal2 == "42" and credits == "1") else "code",
     )
 
-    # ADM-LIVE-3: no token → 401.
+    # ADM-LIVE-3: no token → 403 (broad-crm contract).
     r3 = c.post(
         "/v1/admin/wallet/grant",
         headers={"Content-Type": "application/json"},
         content=json.dumps({"userId": uid, "amount": 1, "idempotencyKey": "x", "reason": "x"}),
     )
     rec(
-        "ADM-LIVE-3 no token 401",
-        r3.status_code == 401,
+        "ADM-LIVE-3 no token 403",
+        r3.status_code == 403,
         f"status={r3.status_code}",
-        blame=None if r3.status_code == 401 else "code",
+        blame=None if r3.status_code == 403 else "code",
     )
 
     # ADM-LIVE-4: user JWT (no X-Admin-Token) → 401/403.
