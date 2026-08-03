@@ -16,10 +16,10 @@ from typing import Annotated
 
 import httpx
 import jwt
-from fastapi import Depends
+from fastapi import Depends, Header
 from jwt import PyJWKClient
 
-from app.api_gateway.openapi_security import admin_key_scheme, admin_scheme
+from app.api_gateway.openapi_security import admin_scheme
 from app.config import get_settings
 from app.errors import ForbiddenError, UnauthorizedError
 
@@ -153,7 +153,7 @@ def _admin_token_matches(presented: str) -> bool:
 
 async def require_admin(
     x_admin_token: Annotated[str | None, Depends(admin_scheme)] = None,
-    x_admin_key: Annotated[str | None, Depends(admin_key_scheme)] = None,
+    x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
 ) -> None:
     """Authorize an admin request via X-Admin-Token or X-Admin-Key (CRM alias).
 

@@ -80,16 +80,12 @@ class CrmAdminRepository:
         if is_paid is True:
             clauses.append(
                 "EXISTS (SELECT 1 FROM ledger_transactions lt "
-                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND "
-                + _PAYMENT_CREDIT_FILTER
-                + ")"
+                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND " + _PAYMENT_CREDIT_FILTER + ")"
             )
         if is_paid is False:
             clauses.append(
                 "NOT EXISTS (SELECT 1 FROM ledger_transactions lt "
-                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND "
-                + _PAYMENT_CREDIT_FILTER
-                + ")"
+                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND " + _PAYMENT_CREDIT_FILTER + ")"
             )
         where = " AND ".join(clauses)
         row = await self._session.scalar(
@@ -123,16 +119,12 @@ class CrmAdminRepository:
         if is_paid is True:
             clauses.append(
                 "EXISTS (SELECT 1 FROM ledger_transactions lt "
-                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND "
-                + _PAYMENT_CREDIT_FILTER
-                + ")"
+                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND " + _PAYMENT_CREDIT_FILTER + ")"
             )
         if is_paid is False:
             clauses.append(
                 "NOT EXISTS (SELECT 1 FROM ledger_transactions lt "
-                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND "
-                + _PAYMENT_CREDIT_FILTER
-                + ")"
+                "WHERE lt.user_id = u.id AND lt.type = 'credit' AND " + _PAYMENT_CREDIT_FILTER + ")"
             )
         where = " AND ".join(clauses)
         rows = await self._session.execute(

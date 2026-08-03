@@ -68,7 +68,8 @@ async def crm_client(
 async def test_crm_users_list_and_detail(
     crm_client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    uid = await seed_user(db_sessionmaker)
+    async with db_sessionmaker() as session:
+        uid = await seed_user(session)
     r = await crm_client.get("/v1/admin/users", headers=_ADMIN_HEADERS)
     assert r.status_code == 200
     body = r.json()
@@ -88,7 +89,8 @@ async def test_crm_users_list_and_detail(
 async def test_crm_tokens_and_subscription(
     crm_client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    uid = await seed_user(db_sessionmaker)
+    async with db_sessionmaker() as session:
+        uid = await seed_user(session)
     grant = await crm_client.post(
         f"/v1/admin/users/{uid}/tokens",
         headers=_ADMIN_HEADERS,
@@ -128,7 +130,8 @@ async def test_crm_tokens_and_subscription(
 async def test_crm_stats_products_empty_requests(
     crm_client: AsyncClient, db_sessionmaker: async_sessionmaker[AsyncSession]
 ) -> None:
-    uid = await seed_user(db_sessionmaker)
+    async with db_sessionmaker() as session:
+        uid = await seed_user(session)
     stats = await crm_client.get("/v1/admin/stats", headers=_ADMIN_HEADERS)
     assert stats.status_code == 200
     assert stats.json()["users_total"] >= 1
@@ -137,14 +140,10 @@ async def test_crm_stats_products_empty_requests(
     assert products.status_code == 200
     assert "items" in products.json()
 
-    payments = await crm_client.get(
-        f"/v1/admin/users/{uid}/payments", headers=_ADMIN_HEADERS
-    )
+    payments = await crm_client.get(f"/v1/admin/users/{uid}/payments", headers=_ADMIN_HEADERS)
     assert payments.status_code == 200
 
-    requests = await crm_client.get(
-        f"/v1/admin/users/{uid}/requests", headers=_ADMIN_HEADERS
-    )
+    requests = await crm_client.get(f"/v1/admin/users/{uid}/requests", headers=_ADMIN_HEADERS)
     assert requests.status_code == 200
     assert "items" in requests.json()
 
