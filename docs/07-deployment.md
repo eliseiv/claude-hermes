@@ -258,9 +258,9 @@ redis-server --save "" --appendonly no \
 
 ## Phase 9 (ADR-067) — состояние выкатки и порядок включения контура
 
-**Целевое значение на момент этого деплоя: `AGENT_RUN_CONSUMER_ENABLED=false`.** Это **зафиксированное состояние**, а не подразумеваемое: контур выкатывается выключенным, код едет на прод «спящим», включение — отдельный осознанный шаг по чек-листу ниже.
+**Действующее состояние на `.156` (avorelio, 2026-08-03): `AGENT_RUN_CONSUMER_ENABLED=true`.** Контур включён по чек-листу ниже; прод-E2E без SSE подтверждён (`run_82c9bb03…`, `scripts/e2e_adr067_prod.sh`). [TD-037](100-known-tech-debt.md) закрыт. [TD-038](100-known-tech-debt.md): первый из двух зелёных прод-циклов пройден.
 
-**Почему так.** Дефолт кода — `true`, строка в `.env.prod.example` была закомментирована, и ни один compose/workflow/скрипт переменную не задавал: то есть выкатка «как есть» **включала бы** весь контур (фоновый consumer + downstream broker + orphan-свип) — при том, что обязательные предпосылки Redis ([§3.5](adr/ADR-067-agent-run-background-consumer.md)) на проде выполнены не были. Kill-switch, чьё действующее значение зависит от того, есть ли строка в руками заполняемом серверном `.env`, — не выключатель. Поэтому дефолт выкатки запинен в `docker-compose.prod.yml` как `false` (см. строку `AGENT_RUN_CONSUMER_ENABLED` в [§Конфигурация](#конфигурация-env)).
+**Исторически:** первый деплой Phase 9 выкатывался с `false` (compose-пин `${AGENT_RUN_CONSUMER_ENABLED:-false}`), чтобы Redis-предпосылки были выполнены до включения.
 
 **Как прочитать действующее значение — без доступа к контейнеру** (read-only, по конфигу, а не по догадке):
 
@@ -274,13 +274,13 @@ docker compose -f docker-compose.prod.yml -f docker-compose.avorelio.yml --env-f
 
 ### Чек-лист включения контура (`false` → `true`)
 
-- [ ] Настройки Redis применены и **проверены на живом контейнере**: `docker compose … exec redis redis-cli config get save appendonly maxmemory maxmemory-policy client-output-buffer-limit` → `save` пуст, `appendonly no`, `maxmemory` ≠ `0`, `maxmemory-policy noeviction`, `pubsub 8388608 2097152 180` (см. [§Redis](#redis--настройки-контейнера-персистенция-память-выходной-буфер-подписки-adr-067-35)).
-- [ ] Остаточный том `claude-hermes_redisdata` удалён (там же).
-- [ ] Запас ОЗУ хоста под выбранный `REDIS_MAXMEMORY` проверен (`free -m`).
-- [ ] Инварианты конфигурации agent-consumer сверены (см. [§Prod-readiness checklist](#prod-readiness-checklist-must-configure-before-launch)).
-- [ ] `AGENT_RUN_CONSUMER_ENABLED=true` внесён в `/opt/claude-hermes/.env`.
-- [ ] Выполнено пересоздание `api` (см. процедуру флипа ниже) — **без него значение не применится**.
-- [ ] После включения: всплеск `agent_run_orphan_finalized` **не** ожидается на пустой базе; если он есть — значит в `agent_runs` остались мёртвые `running`-строки от прежнего прямого пути, и свип их добирает (это штатно, но проверить объём).
+- [x] Настройки Redis применены и **проверены на живом контейнере** (`.156`, 2026-08-03).
+- [x] Остаточный том `claude-hermes_redisdata` удалён.
+- [x] Запас ОЗУ хоста под выбранный `REDIS_MAXMEMORY` проверен (`free -m`).
+- [x] Инварианты конфигурации agent-consumer сверены.
+- [x] `AGENT_RUN_CONSUMER_ENABLED=true` в `/opt/claude-hermes/.env`.
+- [x] Пересоздание `api` (`--force-recreate`).
+- [x] Прод-E2E: прогон без SSE → `completed`, списание, `/state` с текстом, replay `/events`.
 
 ### Процедура флипа в любую сторону — только пересоздание контейнера
 
