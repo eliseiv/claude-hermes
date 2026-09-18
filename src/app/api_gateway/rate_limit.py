@@ -108,6 +108,23 @@ async def enforce_auth_limits(*, ip: str | None) -> bool:
         return True
 
 
+async def enforce_cloudpayments_webhook_limits(*, ip: str | None) -> bool:
+    """Per-source-IP rate limit on the PUBLIC CloudPayments webhook (anti-amplification)."""
+    settings = get_settings()
+    client = get_redis()
+    bucket = ip or "unknown"
+    try:
+        return await _allow(
+            client,
+            f"rl:cpwh:{bucket}",
+            settings.cloudpayments_webhook_rate_limit_per_ip,
+            settings.rate_limit_window_seconds,
+        )
+    except redis.RedisError as exc:
+        log_event(logger, logging.WARNING, "rate_limit_redis_unavailable", error=str(exc))
+        return True
+
+
 async def enforce_other_limits(*, user_id: uuid.UUID) -> bool:
     settings = get_settings()
     client = get_redis()

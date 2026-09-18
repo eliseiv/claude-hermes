@@ -102,3 +102,15 @@ adapty_webhook_scheme = HTTPBearer(
         "и НЕ admin-токен. Реальная constant-time проверка — на сервере."
     ),
 )
+
+# Decorative scheme for the PUBLIC CloudPayments webhook (ADR-068). broadapps sends no auth;
+# the lock icon stays for Swagger. The real trust anchor is the outgoing verification GET.
+cloudpayments_webhook_scheme = HTTPBearer(
+    scheme_name="cloudPaymentsWebhook",
+    auto_error=False,
+    description=(
+        "Декоративная схема публичного вебхука CloudPayments. Агрегатор шлёт колбэк без "
+        "авторизации; начисление идёт только после исходящей проверки платежа. "
+        "НЕ клиентский ключ и НЕ admin-токен."
+    ),
+)

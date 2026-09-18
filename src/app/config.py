@@ -10,10 +10,11 @@ import ipaddress
 from functools import lru_cache
 from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+_CLOUDPAYMENTS_DEFAULT_FRESHNESS_HOURS = 72
 
 
 def _redis_url_db(url: str) -> int | None:
@@ -190,6 +191,40 @@ class Settings(BaseSettings):
     adapty_subscription_tokens_grant: int = Field(
         default=1000, alias="ADAPTY_SUBSCRIPTION_TOKENS_GRANT"
     )
+
+    # --- CloudPayments (broadapps/YooKassa) RU billing (ADR-068) ---
+    cloudpayments_webhook_token: str = Field(default="", alias="CLOUDPAYMENTS_WEBHOOK_TOKEN")
+    cloudpayments_product_tokens_raw: str = Field(
+        default="{}", alias="CLOUDPAYMENTS_PRODUCT_TOKENS"
+    )
+    cloudpayments_subscription_tokens_grant: int = Field(
+        default=1000, alias="CLOUDPAYMENTS_SUBSCRIPTION_TOKENS_GRANT"
+    )
+    cloudpayments_paid_statuses_raw: str = Field(
+        default="succeeded", alias="CLOUDPAYMENTS_PAID_STATUSES"
+    )
+    cloudpayments_payment_freshness_hours: int = Field(
+        default=_CLOUDPAYMENTS_DEFAULT_FRESHNESS_HOURS,
+        alias="CLOUDPAYMENTS_PAYMENT_FRESHNESS_HOURS",
+    )
+    cloudpayments_webhook_rate_limit_per_ip: int = Field(
+        default=120, alias="CLOUDPAYMENTS_WEBHOOK_RATE_LIMIT_PER_IP"
+    )
+    cloudpayments_api_base: str = Field(
+        default="https://pay.broadapps.dev/api/v1", alias="CLOUDPAYMENTS_API_BASE"
+    )
+    cloudpayments_app_id: str = Field(default="", alias="CLOUDPAYMENTS_APP_ID")
+    cloudpayments_api_token: str = Field(default="", alias="CLOUDPAYMENTS_API_TOKEN")
+
+    # Optional STATIC display catalog for GET /v1/tokens/products (subs + tokens).
+    products_catalog_raw: str = Field(default="[]", alias="PRODUCTS_CATALOG")
+    token_products_price_minor_units: bool = Field(
+        default=False, alias="TOKEN_PRODUCTS_PRICE_MINOR_UNITS"
+    )
+    token_products_default_raw: str = Field(default="", alias="TOKEN_PRODUCTS_DEFAULT")
+
+    # Per-instance default locale for GET /v1/presets (ADR-069). Invalid value → "en".
+    presets_default_locale: str = Field(default="en", alias="PRESETS_DEFAULT_LOCALE")
 
     # --- Token purchase (ADR-015, token-purchase/03) ---
     # Server-side mapping consumable productId -> credits (JSON object). Source of truth for
@@ -946,6 +981,104 @@ class Settings(BaseSettings):
                 continue
             products[key] = value
         return products
+
+    def cloudpayments_product_tokens(self) -> dict[str, int]:
+        """Parse CLOUDPAYMENTS_PRODUCT_TOKENS (JSON object productId->credits)."""
+        import json
+
+        try:
+            parsed = json.loads(self.cloudpayments_product_tokens_raw or "{}")
+        except (ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        products: dict[str, int] = {}
+        for key, value in parsed.items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            if value <= 0:
+                continue
+            products[key] = value
+        return products
+
+    @field_validator("cloudpayments_payment_freshness_hours")
+    @classmethod
+    def _clamp_freshness_hours(cls, value: int) -> int:
+        if value <= 0:
+            return _CLOUDPAYMENTS_DEFAULT_FRESHNESS_HOURS
+        return value
+
+    def cloudpayments_paid_statuses(self) -> frozenset[str]:
+        """Parse CLOUDPAYMENTS_PAID_STATUSES (JSON array or CSV) into a lower-cased set."""
+        import json
+
+        raw = (self.cloudpayments_paid_statuses_raw or "").strip()
+        if not raw:
+            return frozenset({"succeeded"})
+        statuses: set[str] = set()
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, str) and item.strip():
+                        statuses.add(item.strip().lower())
+        else:
+            for part in raw.split(","):
+                token = part.strip().lower()
+                if token:
+                    statuses.add(token)
+        return frozenset(statuses) if statuses else frozenset({"succeeded"})
+
+    def cloudpayments_checkout_configured(self) -> bool:
+        return bool(self.cloudpayments_app_id and self.cloudpayments_api_token)
+
+    def token_products_default(self) -> frozenset[str]:
+        """Product ids that GET /v1/tokens/products marks as ``isDefault``."""
+        import json
+
+        text = (self.token_products_default_raw or "").strip()
+        if not text:
+            return frozenset()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except (ValueError, json.JSONDecodeError):
+                parsed = []
+            if isinstance(parsed, list):
+                return frozenset(x.strip() for x in parsed if isinstance(x, str) and x.strip())
+            return frozenset()
+        return frozenset(x.strip() for x in text.split(",") if x.strip())
+
+    def products_catalog(self) -> list[dict[str, object]]:
+        """Parse PRODUCTS_CATALOG (JSON array) into display product dicts."""
+        import json
+
+        try:
+            parsed = json.loads(self.products_catalog_raw or "[]")
+        except (ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        out: list[dict[str, object]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            pid = item.get("productId")
+            if isinstance(pid, str) and pid:
+                out.append(item)
+        return out
+
+    def resolved_presets_default_locale(self) -> str:
+        """Per-instance default locale for GET /v1/presets; unsupported → ``en``."""
+        from app.chat.presets import DEFAULT_PRESET_LOCALE, canonicalize_preset_locale
+
+        resolved = canonicalize_preset_locale(self.presets_default_locale)
+        return resolved if resolved is not None else DEFAULT_PRESET_LOCALE
 
     def hermes_default_toolset(self) -> list[str]:
         """Parse HERMES_DEFAULT_TOOLSET (comma-separated) into a clean toolset list (ADR-046 §6).

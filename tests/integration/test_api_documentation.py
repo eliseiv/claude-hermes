@@ -76,6 +76,7 @@ _TAG_ORDER = [
     "Tokens",
     "BYOK",
     "Billing (Adapty)",
+    "Billing (CloudPayments)",
     "Admin",
     "Preview",
     "Chats",
@@ -118,6 +119,8 @@ _ENDPOINT_TAG = {
     # Adapty webhook (ADR-029): visible under its own contour (adaptyWebhook), NOT the client
     # contour — excluded from _CLIENT_V1_OPERATIONS below and asserted by its own security test.
     ("/v1/billing/adapty/webhook", "post"): "Billing (Adapty)",
+    ("/v1/billing/cloudpayments/webhook", "post"): "Billing (CloudPayments)",
+    ("/v1/billing/cloudpayments/checkout", "post"): "Billing (CloudPayments)",
     # Admin (ADR-009/048/061): 5 endpoints, all tag=Admin, authorized by adminToken only (see
     # _ADMIN_PATHS) — excluded from the client-contour AND checks.
     ("/v1/admin/credits/grant", "post"): "Admin",
@@ -159,6 +162,7 @@ _PUBLIC_PATHS = {"/health", "/ready", "/metrics"}
 # The Adapty webhook is visible but authorized by adaptyWebhook (not the client contour); it is
 # excluded from the client-contour AND assertions and checked by test_adapty_webhook_* instead.
 _ADAPTY_WEBHOOK = ("/v1/billing/adapty/webhook", "post")
+_CLOUDPAYMENTS_WEBHOOK = ("/v1/billing/cloudpayments/webhook", "post")
 
 # The public preview endpoint (ADR-059 §7) is a /v1/* path but carries NO security (authorization is
 # in the signed URL). It MUST be excluded from the client-contour AND assertions — including it
@@ -231,6 +235,7 @@ _CLIENT_V1_OPERATIONS = [
     if p.startswith("/v1/")
     and (p, m) not in _ADMIN_PATHS
     and (p, m) != _ADAPTY_WEBHOOK
+    and (p, m) != _CLOUDPAYMENTS_WEBHOOK
     and (p, m) not in _PUBLIC_PREVIEW
 ]
 
@@ -437,6 +442,11 @@ def test_adapty_webhook_requires_adapty_scheme(openapi_schema: dict[str, Any]) -
     # ADR-029/ADR-044 R2.4: the Adapty webhook carries [{adaptyWebhook:[]}] only.
     op = _operation(openapi_schema, "/v1/billing/adapty/webhook", "post")
     assert op.get("security") == [{"adaptyWebhook": []}], op.get("security")
+
+
+def test_cloudpayments_webhook_requires_cp_scheme(openapi_schema: dict[str, Any]) -> None:
+    op = _operation(openapi_schema, "/v1/billing/cloudpayments/webhook", "post")
+    assert op.get("security") == [{"cloudPaymentsWebhook": []}], op.get("security")
 
 
 def test_public_preview_has_no_security(openapi_schema: dict[str, Any]) -> None:

@@ -25,6 +25,7 @@ from app.api_gateway.routers import (
     admin,
     agent,
     billing_adapty,
+    billing_cloudpayments,
     byok,
     chat,
     chats,
@@ -172,6 +173,14 @@ _OPENAPI_TAGS = [
         "description": (
             "Вебхук Adapty: активация/продление/отмена подписки. Вызывает Adapty, не клиент; "
             "изолированный bearer-секрет (ADR-029)."
+        ),
+    },
+    {
+        "name": "Billing (CloudPayments)",
+        "description": (
+            "RU-оплата через агрегатор broadapps (формат CloudPayments): публичный вебхук "
+            "и создание ссылки на оплату (`POST /checkout`). Начисление — только после "
+            "исходящей верификации платежа (ADR-068)."
         ),
     },
     {
@@ -328,6 +337,7 @@ def create_app() -> FastAPI:
         admin,
         crm_admin,
         billing_adapty,
+        billing_cloudpayments,
         chat,
         chats,
         workspaces,

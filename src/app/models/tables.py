@@ -415,6 +415,30 @@ class AdaptyWebhookEvent(Base):
     __table_args__ = (Index("ix_adapty_webhook_events_user_id", "user_id"),)
 
 
+class CloudPaymentsWebhookEvent(Base):
+    """Processed RU (broadapps/CloudPayments) payment events (ADR-068, migration 0021).
+
+    Single deduplication point: ``transaction_id`` holds the broadapps ``payment_id`` (PRIMARY
+    KEY), enabling ``INSERT ... ON CONFLICT (transaction_id) DO NOTHING RETURNING``. ``payload``
+    stores only a sanitized allowlist projection (no card data / bearer).
+    """
+
+    __tablename__ = "cloudpayments_webhook_events"
+
+    transaction_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    product_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    processed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=_now
+    )
+
+    __table_args__ = (Index("ix_cloudpayments_webhook_events_user_id", "user_id"),)
+
+
 class SubscriptionGrantEvent(Base):
     """Durable idempotency anchor for admin subscription-grant (ADR-052, migration 0015, §23).
 

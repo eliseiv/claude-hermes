@@ -74,6 +74,15 @@ _TEST_CLIENT_API_KEY = "test-client-api-key-0123456789abcdef0123456789abcdef"  #
 os.environ["CLIENT_API_KEY"] = _TEST_CLIENT_API_KEY
 os.environ["CLIENT_API_KEY_PREV"] = ""
 
+# CloudPayments / catalog (ADR-068, ADR-069): force unset so a root .env with live broadapps
+# credentials or PRODUCTS_CATALOG cannot change GET /v1/tokens/products or preset locale.
+# Per-test fixtures (cp_client) override via monkeypatch.setenv.
+os.environ["CLOUDPAYMENTS_APP_ID"] = ""
+os.environ["CLOUDPAYMENTS_API_TOKEN"] = ""
+os.environ["CLOUDPAYMENTS_WEBHOOK_TOKEN"] = ""
+os.environ["PRODUCTS_CATALOG"] = "[]"
+os.environ["PRESETS_DEFAULT_LOCALE"] = "en"
+
 import jwt as pyjwt  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 from cryptography.hazmat.primitives.serialization import (  # noqa: E402

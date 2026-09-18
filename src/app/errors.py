@@ -182,3 +182,38 @@ class ServiceUnavailableError(AppError):
 
     status_code = 503
     code = "service_unavailable"
+
+
+class CloudPaymentsWebhookMisconfiguredError(ServiceUnavailableError):
+    """The RU webhook cannot verify payments because ``CLOUDPAYMENTS_API_TOKEN`` is unset.
+
+    500 with code=cloudpayments_webhook_misconfigured. Without the outgoing API token no payment
+    can be confirmed, so ``handle()`` raises this BEFORE any parsing and the aggregator retries.
+    Overrides ``status_code`` to 500 (not the 503 of the base) so the aggregator treats it as a
+    transient server fault to retry.
+    """
+
+    status_code = 500
+    code = "cloudpayments_webhook_misconfigured"
+
+
+class CloudPaymentsVerificationUnavailableError(AppError):
+    """broadapps payment-verification GET failed transiently — credit deferred, retriable.
+
+    500 with code=cloudpayments_verification_unavailable. A timeout / connect error / 5xx / a
+    malformed response must not silently drop a real payment. A broadapps ``404`` is NOT this
+    error — it means "no payments" (permanent).
+    """
+
+    status_code = 500
+    code = "cloudpayments_verification_unavailable"
+
+
+class CloudPaymentsCheckoutNotConfiguredError(ServiceUnavailableError):
+    """RU checkout is not configured on this instance.
+
+    503 with code=cloudpayments_checkout_not_configured: CLOUDPAYMENTS_APP_ID /
+    CLOUDPAYMENTS_API_TOKEN are unset. Distinct from a broadapps outage (502).
+    """
+
+    code = "cloudpayments_checkout_not_configured"

@@ -30,6 +30,13 @@ class PresetInfo(StrictModel):
 
 
 class PresetsResponse(StrictModel):
+    locale: str = Field(
+        description=(
+            "Язык каталога, фактически применённый к текстам `title` и `prompt` "
+            "(из числа поддерживаемых, например `en` или `ru`)."
+        ),
+        examples=["en"],
+    )
     presets: list[PresetInfo] = Field(
         description=(
             "Каталог пресетов промтов для чипов на главном экране чата (порядок = порядок чипов)."
