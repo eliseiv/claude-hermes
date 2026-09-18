@@ -133,17 +133,21 @@ def migrated(isolated_pg: str) -> Iterator[tuple[Any, str]]:
 
 
 def test_single_head_and_linear_chain() -> None:
-    """0020 must be the ONLY head and must sit directly on 0019.
+    """0020 sits on the single linear chain and revises the full 0019 id.
 
-    A second head is not a style problem: alembic refuses to upgrade at all, so a deploy fails after
-    the image is already rolled out.
+    The invariant is NO FORK (a single head), NOT "0020 is the tip" — a later migration (0021+)
+    legitimately moves the tip forward. A second head is not a style problem: alembic refuses to
+    upgrade at all, so a deploy fails after the image is already rolled out.
     """
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
     script = ScriptDirectory.from_config(Config("alembic.ini"))
     heads = list(script.get_heads())
-    assert heads == [_THIS_REV], f"expected a single head {_THIS_REV}, got {heads}"
+    assert len(heads) == 1, f"expected a single migration head (no fork), got {heads}"
+    ancestry = {rev.revision for rev in script.walk_revisions("base", heads[0])}
+    assert _THIS_REV in ancestry
+    assert _PREV_REV in ancestry
 
     revision = script.get_revision(_THIS_REV)
     assert revision.down_revision == _PREV_REV, "0020 must chain directly onto the full 0019 id"
